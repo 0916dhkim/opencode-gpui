@@ -156,6 +156,14 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == draft-return-after-send ]]; the
   sleep 1
   xdotool mousemove --window "$win" 92 110 click 1
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == load-earlier ]]; then
+  xdotool mousemove --window "$win" 400 76 click 1
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool type --clearmodifiers --delay 30 'RACE_MARKER_KEEP_THIS'
+  xdotool key Return
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == copy-code ]]; then
   xdotool mousemove --window "$win" 720 392 click 1
   sleep 0.2
@@ -234,6 +242,10 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == apply-settings ]]; then
 fi
 xdotool mousemove 1100 850
 sleep 6
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
+  xdotool mousemove --window "$win" 710 350 click --repeat 30 --delay 20 5
+  sleep 1
+fi
 if [[ "$CLIENT" == gpui ]]; then
   import -window "$win" "$OUTPUT"
 else

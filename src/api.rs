@@ -350,7 +350,11 @@ impl ApiHandle {
         let lifetime = Arc::new(ApiLifetime {
             alive: alive.clone(),
         });
-        let state = Arc::new(Mutex::new(crate::preview::State::new()));
+        let mut preview = crate::preview::State::new();
+        if std::env::var("OPENCODE_PREVIEW_HISTORY_PAGES").as_deref() == Ok("1") {
+            preview.enable_paged_history();
+        }
+        let state = Arc::new(Mutex::new(preview));
         spawn_preview_worker(refresh_receiver, ui_sender.clone(), state.clone());
         spawn_preview_worker(interaction_receiver, ui_sender.clone(), state.clone());
         spawn_preview_worker(abort_receiver, ui_sender.clone(), state.clone());
@@ -1087,11 +1091,22 @@ fn spawn_preview_worker(
 ) {
     thread::spawn(move || {
         while let Ok(command) = commands.recv_blocking() {
+            let history_delay = if matches!(&command, Command::LoadMessages { cursor: None, .. }) {
+                std::env::var("OPENCODE_PREVIEW_HISTORY_DELAY_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let (event, server_events) = {
                 let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                 let event = state.handle(command);
                 (event, state.take_server_events())
             };
+            if history_delay > 0 {
+                thread::sleep(Duration::from_millis(history_delay));
+            }
             if std::iter::once(event)
                 .chain(server_events)
                 .any(|event| ui.send_blocking(event).is_err())

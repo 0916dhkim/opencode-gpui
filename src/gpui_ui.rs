@@ -10,7 +10,7 @@ use gpui_kit::component::text::markdown;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
-    api::{ApiConfig, ApiHandle, Command, InboxRequest, UiEvent},
+    api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, UiEvent},
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
     jobs::{self, JobRow, Jobs},
     model::{
@@ -35,6 +35,10 @@ struct Client {
     disconnected: bool,
     server_version: Option<String>,
     conversations: HashMap<String, Conversation>,
+    loading_messages: HashMap<String, Option<String>>,
+    message_events_during_load: HashMap<String, Vec<protocol::Event>>,
+    reload_after_load: HashSet<String>,
+    preserve_scroll: Option<(Point<Pixels>, Point<Pixels>)>,
     catalogs: HashMap<String, ModelCatalog>,
     running_jobs: Jobs,
     sessions: Vec<Session>,
@@ -401,6 +405,10 @@ impl Client {
             disconnected: false,
             server_version: None,
             conversations: HashMap::new(),
+            loading_messages: HashMap::new(),
+            message_events_during_load: HashMap::new(),
+            reload_after_load: HashSet::new(),
+            preserve_scroll: None,
             catalogs: HashMap::new(),
             running_jobs: Jobs::default(),
             sessions: Vec::new(),
@@ -531,32 +539,64 @@ impl Client {
         self.unread.remove(&id);
         self.scroll.scroll_to_bottom();
         self.jobs = self.running_jobs.rows(Some(&id));
-        if let Some(api) = &self.api {
-            if !self
-                .conversations
-                .get(&id)
-                .is_some_and(|conversation| conversation.loaded)
-            {
-                api.send(Command::LoadMessages {
-                    session_id: id.clone(),
-                    cursor: None,
+        if !self
+            .conversations
+            .get(&id)
+            .is_some_and(|conversation| conversation.loaded)
+        {
+            self.request_newest(&id);
+        }
+        if let Some(api) = &self.api
+            && let Some(session) = self.sessions.iter().find(|session| session.id == id)
+        {
+            self.catalog = self
+                .catalogs
+                .get(&session.directory)
+                .cloned()
+                .unwrap_or_default();
+            if !self.catalogs.contains_key(&session.directory) {
+                api.send(Command::LoadModels {
+                    directory: session.directory.clone(),
                 });
-            }
-            if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
-                self.catalog = self
-                    .catalogs
-                    .get(&session.directory)
-                    .cloned()
-                    .unwrap_or_default();
-                if !self.catalogs.contains_key(&session.directory) {
-                    api.send(Command::LoadModels {
-                        directory: session.directory.clone(),
-                    });
-                }
             }
         }
         if self.bootstrapped {
             self.persist_tabs();
+        }
+    }
+
+    fn request_newest(&mut self, id: &str) {
+        if self.loading_messages.contains_key(id) {
+            self.reload_after_load.insert(id.to_owned());
+            return;
+        }
+        if let Some(api) = &self.api {
+            self.loading_messages.insert(id.to_owned(), None);
+            api.send(Command::LoadMessages {
+                session_id: id.to_owned(),
+                cursor: None,
+            });
+        }
+    }
+
+    fn load_earlier(&mut self, id: &str, cursor: &str, cx: &mut Context<Self>) {
+        if self.loading_messages.contains_key(id)
+            || self
+                .conversations
+                .get(id)
+                .and_then(|conversation| conversation.next_cursor.as_deref())
+                != Some(cursor)
+        {
+            return;
+        }
+        if let Some(api) = &self.api {
+            self.loading_messages
+                .insert(id.to_owned(), Some(cursor.to_owned()));
+            api.send(Command::LoadMessages {
+                session_id: id.to_owned(),
+                cursor: Some(cursor.to_owned()),
+            });
+            cx.notify();
         }
     }
 
@@ -592,6 +632,9 @@ impl Client {
         let index = self.open_tabs.iter().position(|tab| tab == id);
         self.open_tabs.retain(|tab| tab != id);
         self.conversations.remove(id);
+        self.loading_messages.remove(id);
+        self.message_events_during_load.remove(id);
+        self.reload_after_load.remove(id);
         self.transcript.remove(id);
         self.unread.remove(id);
         if self.active == id {
@@ -863,6 +906,10 @@ impl Client {
         self.clear_accepted_drafts.clear();
         self.transcript.clear();
         self.conversations.clear();
+        self.loading_messages.clear();
+        self.message_events_during_load.clear();
+        self.reload_after_load.clear();
+        self.preserve_scroll = None;
         self.catalogs.clear();
         self.statuses.clear();
         self.forms.clear();
@@ -1481,22 +1528,59 @@ impl Client {
             UiEvent::Bootstrap(Err(_)) => self.connection_status = "Refresh failed".into(),
             UiEvent::MessagesLoaded {
                 session_id,
-                cursor: None,
-                result: Ok(page),
+                cursor,
+                result,
             } => {
-                let conversation = self.conversations.entry(session_id.clone()).or_default();
-                conversation.replace_from_api(&page.messages, page.next_cursor);
-                if let Some(queued) = page.queued {
-                    conversation.sync_queued(&queued);
+                if self.loading_messages.get(&session_id) == Some(&cursor) {
+                    self.loading_messages.remove(&session_id);
+                    let reload = self.reload_after_load.remove(&session_id);
+                    if self.open_tabs.contains(&session_id) {
+                        match result {
+                            Ok(page) => {
+                                let conversation =
+                                    self.conversations.entry(session_id.clone()).or_default();
+                                if cursor.is_some() {
+                                    if self.active == session_id {
+                                        self.preserve_scroll =
+                                            Some((self.scroll.offset(), self.scroll.max_offset()));
+                                    }
+                                    conversation.prepend_from_api(&page.messages, page.next_cursor);
+                                } else {
+                                    conversation.replace_from_api(&page.messages, page.next_cursor);
+                                    if let Some(queued) = page.queued {
+                                        conversation.sync_queued(&queued);
+                                    }
+                                }
+                                if cursor.is_none() {
+                                    for event in self
+                                        .message_events_during_load
+                                        .remove(&session_id)
+                                        .unwrap_or_default()
+                                    {
+                                        let kind = protocol::decode_event(&event);
+                                        conversation.apply(&event, &kind);
+                                    }
+                                } else if !reload {
+                                    self.message_events_during_load.remove(&session_id);
+                                }
+                                self.update_transcript(&session_id);
+                            }
+                            Err(MessageLoadError::SessionNotFound) => {
+                                self.close_tab(&session_id, cx);
+                            }
+                            Err(error) => {
+                                self.connection_status =
+                                    format!("History failed ({session_id}): {error}");
+                                if !reload {
+                                    self.message_events_during_load.remove(&session_id);
+                                }
+                            }
+                        }
+                        if reload {
+                            self.request_newest(&session_id);
+                        }
+                    }
                 }
-                self.update_transcript(&session_id);
-            }
-            UiEvent::MessagesLoaded {
-                session_id,
-                result: Err(error),
-                ..
-            } => {
-                self.connection_status = format!("History failed ({session_id}): {error}");
             }
             UiEvent::ModelsLoaded {
                 directory,
@@ -1596,12 +1680,7 @@ impl Client {
                 match tray::settlement(request, result) {
                     tray::Settlement::Done => {}
                     tray::Settlement::Reconcile => {
-                        if let Some(api) = &self.api {
-                            api.send(Command::LoadMessages {
-                                session_id,
-                                cursor: None,
-                            });
-                        }
+                        self.request_newest(&session_id);
                     }
                     tray::Settlement::Failed(error) => self.connection_status = error,
                 }
@@ -1680,6 +1759,14 @@ impl Client {
                                 .retain(|(session, _, _)| session != &id);
                             self.unread.remove(&id);
                         }
+                    }
+                    if let Some(id) = kind.session_id()
+                        && self.loading_messages.contains_key(id)
+                    {
+                        self.message_events_during_load
+                            .entry(id.to_owned())
+                            .or_default()
+                            .push(event.clone());
                     }
                     if let Some(id) = kind.session_id()
                         && self
@@ -1870,6 +1957,10 @@ impl Client {
             disconnected: false,
             server_version: None,
             conversations,
+            loading_messages: HashMap::new(),
+            message_events_during_load: HashMap::new(),
+            reload_after_load: HashSet::new(),
+            preserve_scroll: None,
             catalogs: HashMap::new(),
             running_jobs,
             sessions,
@@ -1981,6 +2072,8 @@ impl Client {
         client.sessions.clear();
         client.transcript.clear();
         client.conversations.clear();
+        client.loading_messages.clear();
+        client.message_events_during_load.clear();
         client.forms.clear();
         client.permissions.clear();
         api.send(Command::Bootstrap {
@@ -2507,6 +2600,39 @@ impl Client {
     fn chat(&self, cx: &Context<Self>) -> AnyElement {
         // GTK reserves a permanent 14px gutter for the transcript scrollbar.
         let mut rows = div().w_full().pr(px(14.)).flex().flex_col();
+        if let Some(cursor) = self
+            .conversations
+            .get(&self.active)
+            .and_then(|conversation| conversation.next_cursor.clone())
+        {
+            let id = self.active.clone();
+            let loading = self.loading_messages.contains_key(&id);
+            rows = rows.child(
+                div()
+                    .id("load-earlier")
+                    .mx(px(28.))
+                    .my(px(12.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .bg(rgb(0xfffdfa))
+                    .text_color(rgb(0x555b5c))
+                    .when(!loading, |button| {
+                        button
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.load_earlier(&id, &cursor, cx);
+                            }))
+                    })
+                    .child(if loading {
+                        "Loading earlier messages…"
+                    } else {
+                        "Load earlier messages"
+                    }),
+            );
+        }
         let sticky = self
             .transcript
             .get(&self.active)
@@ -3635,6 +3761,14 @@ impl Client {
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_composer(window, cx);
+        if let Some((old_offset, old_max)) = self.preserve_scroll.take() {
+            let scroll = self.scroll.clone();
+            window.on_next_frame(move |window, _| {
+                let new_max = scroll.max_offset();
+                scroll.set_offset(point(old_offset.x, old_offset.y - (new_max.y - old_max.y)));
+                window.refresh();
+            });
+        }
         let mut deferred = Vec::new();
         for (id, text, attachments) in std::mem::take(&mut self.clear_accepted_drafts) {
             if self.active == id {

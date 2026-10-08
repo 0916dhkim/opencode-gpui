@@ -82,6 +82,7 @@ pub struct State {
     inbox: HashMap<String, Vec<Waiting>>,
     /// Sessions with a (canned, never ending) run.
     busy: HashSet<String>,
+    paged_history: bool,
 }
 
 /// One undelivered prompt.
@@ -185,7 +186,13 @@ impl State {
             pending: canned_pending(),
             inbox,
             busy: HashSet::from([RUNNING_ID.to_owned()]),
+            paged_history: false,
         }
+    }
+
+    /// Exercise older-history loading without changing the normal screenshot fixture.
+    pub fn enable_paged_history(&mut self) {
+        self.paged_history = true;
     }
 
     pub fn handle(&mut self, command: Command) -> UiEvent {
@@ -352,6 +359,23 @@ impl State {
     /// History as the client presents it: the whole canned transcript is one
     /// chronological page, so there is never an older page.
     fn message_page(&self, session_id: &str, cursor: Option<&str>) -> MessagePage {
+        if self.paged_history && session_id == ACTIVE_ID {
+            let messages = self.messages.get(session_id).cloned().unwrap_or_default();
+            let midpoint = messages.len() / 2;
+            let (messages, next_cursor) = match cursor {
+                None => (
+                    messages[midpoint..].to_vec(),
+                    Some("older-preview".to_owned()),
+                ),
+                Some("older-preview") => (messages[..midpoint].to_vec(), None),
+                Some(_) => (Vec::new(), None),
+            };
+            return MessagePage {
+                messages,
+                next_cursor,
+                queued: cursor.is_none().then_some(Vec::new()),
+            };
+        }
         if cursor.is_some() {
             return MessagePage {
                 messages: Vec::new(),
@@ -1096,6 +1120,26 @@ mod tests {
                 .starts_with("The background subagent")
         );
         assert_eq!(rows[3]["body"], "AI_APICallError: Not Found (404)");
+    }
+
+    #[test]
+    fn paged_preview_reconstructs_the_full_transcript() {
+        let mut state = State::new();
+        state.enable_paged_history();
+        let newest = state.message_page(ACTIVE_ID, None);
+        assert_eq!(newest.next_cursor.as_deref(), Some("older-preview"));
+        let older = state.message_page(ACTIVE_ID, Some("older-preview"));
+        assert_eq!(older.next_cursor, None);
+        let mut conversation = Conversation::default();
+        conversation.replace_from_api(&newest.messages, newest.next_cursor);
+        conversation.prepend_from_api(&older.messages, older.next_cursor);
+        let full = render(&active_messages());
+        let paged: Vec<Value> = conversation
+            .transcript_rows()
+            .iter()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+        assert_eq!(paged, full);
     }
 
     #[test]
