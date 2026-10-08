@@ -1,4 +1,6 @@
 //! GPUI Kit shell backed by the v2 transport, or its deterministic preview fixture.
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +77,8 @@ struct Client {
     projects: Vec<Project>,
     active: String,
     transcript: HashMap<String, Vec<TranscriptRow>>,
+    #[cfg(test)]
+    measurement_probe: Option<(Pixels, std::rc::Rc<RefCell<Vec<Pixels>>>)>,
     attachments: HashMap<(String, usize, usize), Arc<Image>>,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
@@ -200,6 +204,93 @@ enum MarkdownBlock {
     Paragraph(String),
     List(Vec<String>),
     Code(String, String),
+}
+
+/// A detached layout probe: rows are laid out at a definite width but are
+/// never prepainted, painted, or inserted into the transcript scroll area.
+/// GPUI only permits layout_as_root during its layout/prepaint/paint phases.
+#[cfg(test)]
+struct TranscriptMeasurementProbe {
+    rows: Vec<AnyElement>,
+    width: Pixels,
+    heights: std::rc::Rc<RefCell<Vec<Pixels>>>,
+    spacer: Div,
+}
+
+#[cfg(test)]
+impl IntoElement for TranscriptMeasurementProbe {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+#[cfg(test)]
+impl Element for TranscriptMeasurementProbe {
+    type RequestLayoutState = <Div as Element>::RequestLayoutState;
+    type PrepaintState = <Div as Element>::PrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        *self.heights.borrow_mut() = self
+            .rows
+            .iter_mut()
+            .map(|row| {
+                row.layout_as_root(
+                    size(
+                        AvailableSpace::Definite(self.width),
+                        AvailableSpace::MinContent,
+                    ),
+                    window,
+                    cx,
+                )
+                .height
+            })
+            .collect();
+        self.spacer
+            .request_layout(global_id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.spacer
+            .prepaint(global_id, inspector_id, bounds, layout, window, cx)
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        paint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.spacer
+            .paint(global_id, inspector_id, bounds, layout, paint, window, cx);
+    }
 }
 
 fn timestamp(time: u64) -> String {
@@ -491,6 +582,8 @@ impl Client {
             projects: Vec::new(),
             active: String::new(),
             transcript: HashMap::new(),
+            #[cfg(test)]
+            measurement_probe: None,
             attachments: HashMap::new(),
             catalog: ModelCatalog::default(),
             composer: cx.new(|cx| {
@@ -2225,6 +2318,8 @@ impl Client {
             projects,
             active,
             transcript,
+            #[cfg(test)]
+            measurement_probe: None,
             attachments,
             catalog,
             composer: cx.new(|cx| {
@@ -2669,7 +2764,9 @@ impl Client {
             .into_any_element()
     }
 
-    fn message(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> AnyElement {
+    // Keep the actual row and the detached measurement probe on this same
+    // renderer. A text-length estimate cannot model GPUI's Markdown wrapping.
+    fn message_row(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> Stateful<Div> {
         let user = row.role.label() == "YOU";
         let shade = if user {
             self.tone(0xe4ddd0, 0x1c242b)
@@ -2727,6 +2824,10 @@ impl Client {
         div()
             .id(("message", index))
             .w_full()
+            // The transcript inherits these from app-root. Make them explicit
+            // so a detached root gets the same text metrics as a mounted row.
+            .font_family("Noto Sans")
+            .text_size(px(13.))
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -2758,7 +2859,38 @@ impl Client {
                     ),
             )
             .child(body)
-            .into_any_element()
+    }
+
+    fn message(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> AnyElement {
+        let element = self.message_row(row, index, cx);
+        #[cfg(test)]
+        {
+            use gpui_kit::base::TestSupportExt as _;
+            element.test_support().into_any_element()
+        }
+        #[cfg(not(test))]
+        {
+            element.into_any_element()
+        }
+    }
+
+    /// Prepare detached copies of the exact rendered rows for the layout-phase
+    /// probe. Its width comes from a previously completed viewport layout.
+    #[cfg(test)]
+    fn row_measurement_probe(&self, cx: &Context<Self>) -> Option<TranscriptMeasurementProbe> {
+        let (width, heights) = self.measurement_probe.as_ref()?;
+        Some(TranscriptMeasurementProbe {
+            rows: self
+                .transcript
+                .get(&self.active)?
+                .iter()
+                .enumerate()
+                .map(|(index, row)| self.message_row(row, index, cx).into_any_element())
+                .collect(),
+            width: *width,
+            heights: heights.clone(),
+            spacer: div().size(px(0.)),
+        })
     }
 
     fn form_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -4400,6 +4532,8 @@ impl Render for Client {
             }
         }
         self.clear_accepted_drafts = deferred;
+        #[cfg(test)]
+        let row_probe = self.row_measurement_probe(cx);
         let permission_visible = self.modal.is_none() && self.visible_permission().is_some();
         if permission_visible && !self.permission_presented {
             self.permission_presented = true;
@@ -4415,7 +4549,7 @@ impl Render for Client {
         let composer_slot = self
             .permission_card(cx)
             .unwrap_or_else(|| self.composer(cx));
-        div()
+        let root = div()
             .id("app-root")
             .size_full()
             .relative()
@@ -4489,7 +4623,10 @@ impl Render for Client {
                             .child(composer_slot),
                     ),
             )
-            .when_some(self.modal_view(cx), |view, modal| view.child(modal))
+            .when_some(self.modal_view(cx), |view, modal| view.child(modal));
+        #[cfg(test)]
+        let root = root.when_some(row_probe, |view, probe| view.child(probe));
+        root
     }
 }
 
@@ -4528,10 +4665,109 @@ pub fn run(args: Args) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, MarkdownBlock, Modal, markdown_blocks, sticky_user_index, tab_number_key};
+    use std::{cell::RefCell, rc::Rc};
+
+    use super::{
+        Client, MarkdownBlock, Modal, inline_image, markdown_blocks, model, sticky_user_index,
+        tab_number_key,
+    };
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext, Focusable, Role, TestAppContext, WindowOptions, px};
+    use gpui_kit::{
+        AppContext, Bounds, Focusable, Role, TestAppContext, WindowBounds, WindowOptions, point,
+        px, size,
+    };
     use opencode_gpui::model::RunStatus;
+
+    #[gpui_kit::test]
+    fn detached_row_layout_matches_mounted_bounds_at_two_widths(cx: &mut TestAppContext) {
+        let rows = [
+            model::TranscriptRow {
+                role: model::Role::Assistant,
+                body: "A wrapped paragraph with **emphasis**, `inline code`, and enough words to change line breaks between narrow and wide transcript viewports. The same Markdown element must determine both the offscreen height and the mounted height. This continuation makes the narrow case wrap another time.".into(),
+                images: vec![],
+                time: 1,
+                kind: model::TranscriptRowKind::Normal,
+            },
+            model::TranscriptRow {
+                role: model::Role::Assistant,
+                body: "# Code example\n\n```rust\nfn example() {\n    println!(\"a line of code longer than the available space in the narrow transcript\");\n}\n```\n\n- First list item with enough text to wrap when the viewport is narrow.\n- Second item".into(),
+                images: vec![],
+                time: 2,
+                kind: model::TranscriptRowKind::Normal,
+            },
+            model::TranscriptRow {
+                role: model::Role::User,
+                body: "This user message includes an image and text that wraps at the narrower width, making the thumbnail part of a variable-height row.".into(),
+                images: vec!["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==".into()],
+                time: 3,
+                kind: model::TranscriptRowKind::Normal,
+            },
+        ];
+        cx.update(gpui_kit::init);
+        let mut prose_heights = Vec::new();
+        for width in [760., 1130.] {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(width), px(900.)),
+                ))),
+                ..Default::default()
+            };
+            let (handle, client) = cx.update(|cx| {
+                gpui_kit::open_window(options, cx, |window, cx| {
+                    cx.new(|cx| Client::from_preview(window, cx, None))
+                })
+                .expect("headless transcript window")
+            });
+            cx.update(|cx| {
+                client.update(cx, |client, cx| {
+                    client
+                        .transcript
+                        .insert(client.active.clone(), rows.to_vec());
+                    client
+                        .attachments
+                        .retain(|(session, _, _), _| session != &client.active);
+                    client.attachments.insert(
+                        (client.active.clone(), 2, 0),
+                        inline_image(&rows[2].images[0]).expect("fixture image decodes"),
+                    );
+                    cx.notify();
+                });
+            });
+            let actual = cx
+                .update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let content_width = client.read(cx).scroll.bounds().size.width - px(14.);
+                    assert!(content_width > px(0.), "viewport must be laid out before measuring");
+                    let detached_heights = Rc::new(RefCell::new(Vec::new()));
+                    client.update(cx, |client, cx| {
+                        client.measurement_probe = Some((content_width, detached_heights.clone()));
+                        cx.notify();
+                    });
+                    window.render_frame(cx);
+                    let detached_heights = detached_heights.borrow();
+                    assert_eq!(detached_heights.len(), rows.len());
+                    rows.iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            let mounted = window.find(("message", index)).bounds();
+                            assert_eq!(mounted.size.width, content_width);
+                            assert_eq!(
+                                detached_heights[index], mounted.size.height,
+                                "row {index} at window width {width} (content width {content_width:?})"
+                            );
+                            mounted.size.height
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .expect("headless window stays open");
+            prose_heights.push(actual[0]);
+        }
+        assert!(
+            prose_heights[0] > prose_heights[1],
+            "prose must wrap differently at the two widths"
+        );
+    }
 
     #[gpui_kit::test]
     fn permission_action_exposes_role_name_and_updates_state(cx: &mut TestAppContext) {
