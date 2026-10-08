@@ -159,6 +159,24 @@ fn needs_new_connection(current: &ApiConfig, candidate: &ApiConfig, connected: b
     !connected || current != candidate
 }
 
+fn safe_connection_error(error: Option<&str>) -> &'static str {
+    let Some(error) = error else {
+        return "Connection lost";
+    };
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("401") || lower.contains("unauthorized") {
+        "Authentication failed (401)"
+    } else if lower.contains("403") || lower.contains("forbidden") {
+        "Access denied (403)"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "Connection timed out"
+    } else if lower.contains("refused") {
+        "Connection refused"
+    } else {
+        "Connection failed"
+    }
+}
+
 fn filter_models<'a>(models: &'a [model::ModelOption], query: &str) -> Vec<&'a model::ModelOption> {
     let query = query.trim();
     let mut scored: Vec<_> = models
@@ -433,6 +451,7 @@ struct SettingsFields {
     tab: SettingsTab,
     remember_password: bool,
     error: Option<String>,
+    warning: Option<String>,
 }
 
 impl SettingsFields {
@@ -520,6 +539,7 @@ impl SettingsFields {
             persisted,
             current,
             error: None,
+            warning: None,
         }
     }
 }
@@ -1406,6 +1426,7 @@ impl Client {
         }
         if !warnings.is_empty() {
             log::warn!("GPUI connection setup: {}", warnings.join("; "));
+            client.settings.warning = Some(warnings.join("; "));
             if client.api.is_some() {
                 client.connection_status = format!("Connecting · {}", warnings.join("; "));
             }
@@ -1842,6 +1863,7 @@ impl Client {
         }
         let (stored, warning) =
             credentials::apply_password_change(&SystemKeyring, &server, &username, &password_plan);
+        self.settings.warning = warning.clone();
         if let Some(warning) = &warning {
             log::warn!("{warning}");
         }
@@ -2726,10 +2748,13 @@ impl Client {
             }
             UiEvent::Connection {
                 connected: false,
-                error: _,
+                error,
             } => {
                 self.disconnected = true;
-                self.connection_status = "Disconnected · reconnecting".into();
+                self.connection_status = format!(
+                    "Disconnected · {} · retrying",
+                    safe_connection_error(error.as_deref())
+                );
             }
             UiEvent::Bootstrap(Ok(data)) => {
                 let retry_needed = data.retry_needed;
@@ -5549,6 +5574,14 @@ impl Client {
                             .child(error.clone()),
                     );
                 }
+                if let Some(warning) = &self.settings.warning {
+                    content = content.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(self.tone(0x995b18, 0xe9ad68))
+                            .child(warning.clone()),
+                    );
+                }
                 let content = if self.settings.tab == SettingsTab::Connection {
                     div()
                         .flex_1()
@@ -6209,8 +6242,9 @@ mod tests {
         TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, VirtualListScrollHandle,
         filter_all_sessions, filter_levels, filter_models, filter_new_session_projects,
         filter_tab_sessions, fuzzy_score, markdown_blocks, model, needs_new_connection,
-        new_session_choice, picker_list_height, reorder_tab_ids, splice_transcript,
-        sticky_user_index, tab_indicator, tab_number_key, update_session_projection,
+        new_session_choice, picker_list_height, reorder_tab_ids, safe_connection_error,
+        splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
+        update_session_projection,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -7608,6 +7642,58 @@ mod tests {
         let mut changed = current.clone();
         changed.password = Some("another local test".into());
         assert!(needs_new_connection(&current, &changed, true));
+        assert_eq!(
+            safe_connection_error(Some("HTTP 401: bearer local-test-value")),
+            "Authentication failed (401)"
+        );
+        assert_eq!(
+            safe_connection_error(Some("network timed out")),
+            "Connection timed out"
+        );
+        assert_eq!(
+            safe_connection_error(Some("server echoed private body")),
+            "Connection failed"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn connection_events_do_not_erase_keyring_warning(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.settings.warning = Some("Keyring unavailable".into());
+                client.handle_live_event(
+                    super::UiEvent::Connection {
+                        connected: false,
+                        error: Some("HTTP 401: private echoed value".into()),
+                    },
+                    cx,
+                );
+                assert!(
+                    client
+                        .connection_status
+                        .contains("Authentication failed (401)")
+                );
+                assert!(!client.connection_status.contains("private echoed value"));
+                client.handle_live_event(
+                    super::UiEvent::Connection {
+                        connected: true,
+                        error: None,
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    client.settings.warning.as_deref(),
+                    Some("Keyring unavailable")
+                );
+            });
+        });
     }
 
     #[gpui_kit::test]
