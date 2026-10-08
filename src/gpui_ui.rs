@@ -172,6 +172,55 @@ fn filter_levels(variants: &[String], query: &str) -> Vec<Option<String>> {
     scored.into_iter().map(|(_, _, variant)| variant).collect()
 }
 
+fn filter_new_session_projects(
+    projects: &[Project],
+    sessions: &[Session],
+    active_directory: Option<&str>,
+    query: &str,
+) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let query = query.trim();
+    let mut scored: Vec<_> = projects
+        .iter()
+        .map(|project| &project.worktree)
+        .chain(sessions.iter().map(|session| &session.directory))
+        .filter(|path| !path.is_empty() && seen.insert((*path).clone()))
+        .filter_map(|path| {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(path)
+                .to_owned();
+            let score = if query.is_empty() {
+                Some(if active_directory == Some(path.as_str()) {
+                    1000
+                } else {
+                    0
+                })
+            } else {
+                match (fuzzy_score(query, &name), fuzzy_score(query, path)) {
+                    (Some(name), Some(path)) => Some(name.max(path)),
+                    (name, path) => name.or(path),
+                }
+            };
+            score.map(|score| (score, name, path.clone()))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .map(|(_, name, path)| (name, path))
+        .collect()
+}
+
+fn new_session_choice(choices: &[(String, String)], index: usize, query: &str) -> Option<String> {
+    choices
+        .get(index)
+        .or_else(|| choices.first())
+        .map(|(_, path)| path.clone())
+        .or_else(|| (!query.trim().is_empty()).then(|| query.trim().to_owned()))
+}
+
 fn picker_list_height(model: bool, count: usize) -> f32 {
     let (row, minimum, maximum) = if model {
         (52., 100., 280.)
@@ -295,6 +344,7 @@ struct Client {
     scroll: ScrollHandle,
     sessions_picker_scroll: ScrollHandle,
     picker_list_scroll: ScrollHandle,
+    projects_picker_scroll: ScrollHandle,
     unread: HashSet<String>,
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
@@ -313,6 +363,8 @@ struct Client {
     clear_accepted_drafts: Vec<(String, String, Vec<PathBuf>)>,
     modal: Option<Modal>,
     rename_target: Option<String>,
+    rename_pending: Option<u64>,
+    rename_error: Option<String>,
     picker_highlight: Option<usize>,
     search: Entity<InputState>,
     rename: Entity<InputState>,
@@ -884,6 +936,7 @@ impl Client {
             scroll,
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
+            projects_picker_scroll: ScrollHandle::new(),
             unread: HashSet::new(),
             statuses: HashMap::new(),
             jobs: Vec::new(),
@@ -902,6 +955,8 @@ impl Client {
             clear_accepted_drafts: Vec::new(),
             modal: None,
             rename_target: None,
+            rename_pending: None,
+            rename_error: None,
             picker_highlight: None,
             search: cx.new(|cx| InputState::new(window, cx).placeholder("Search models (fuzzy)…")),
             rename: cx.new(|cx| InputState::new(window, cx)),
@@ -922,6 +977,9 @@ impl Client {
                     if this.modal == Some(Modal::Sessions) {
                         this.sessions_picker_scroll
                             .set_offset(point(px(0.), px(0.)));
+                    } else if this.modal == Some(Modal::NewSession) {
+                        this.projects_picker_scroll
+                            .set_offset(point(px(0.), px(0.)));
                     } else if matches!(this.modal, Some(Modal::Model | Modal::Level)) {
                         this.picker_list_scroll.set_offset(point(px(0.), px(0.)));
                     }
@@ -931,6 +989,15 @@ impl Client {
                 _ => {}
             },
         )
+        .detach();
+        cx.subscribe(&client.rename, |this, _, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Change => this.rename_error = None,
+                InputEvent::PressEnter { .. } => this.rename_session(cx),
+                _ => {}
+            }
+            cx.notify();
+        })
         .detach();
         cx.subscribe(
             &client.settings.session_search,
@@ -1245,13 +1312,35 @@ impl Client {
     }
 
     fn rename_session(&mut self, cx: &mut Context<Self>) {
+        if self.modal != Some(Modal::Rename) || self.rename_pending.is_some() {
+            return;
+        }
         let title = self.rename.read(cx).value().trim().to_owned();
         let id = self.rename_target.as_deref().unwrap_or(&self.active);
-        if title.is_empty() || id.is_empty() {
+        if title.is_empty() {
+            self.rename_error = Some("Enter a session title".into());
+            cx.notify();
+            return;
+        }
+        if id.is_empty() {
+            return;
+        }
+        let unchanged = self
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .is_some_and(|session| session.title == title);
+        if unchanged {
+            self.rename_target = None;
+            self.rename_error = None;
+            self.modal = None;
+            cx.notify();
             return;
         }
         if let Some(api) = &self.api {
             self.next_session_request_id += 1;
+            self.rename_pending = Some(self.next_session_request_id);
+            self.rename_error = None;
             api.send(Command::RenameSession {
                 request_id: self.next_session_request_id,
                 session_id: id.to_owned(),
@@ -1259,9 +1348,9 @@ impl Client {
             });
         } else if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
             session.title = title;
+            self.rename_target = None;
+            self.modal = None;
         }
-        self.rename_target = None;
-        self.modal = None;
         cx.notify();
     }
 
@@ -1460,6 +1549,9 @@ impl Client {
                 if modal == Modal::Sessions {
                     self.sessions_picker_scroll
                         .set_offset(point(px(0.), px(0.)));
+                } else if modal == Modal::NewSession {
+                    self.projects_picker_scroll
+                        .set_offset(point(px(0.), px(0.)));
                 } else if matches!(modal, Modal::Model | Modal::Level) {
                     self.picker_list_scroll.set_offset(point(px(0.), px(0.)));
                 }
@@ -1477,6 +1569,8 @@ impl Client {
                 self.search.focus_handle(cx).focus(window, cx);
             }
             Modal::Rename => {
+                self.rename_pending = None;
+                self.rename_error = None;
                 let target = self.rename_target.as_deref().unwrap_or(&self.active);
                 let title = self
                     .sessions
@@ -1504,19 +1598,16 @@ impl Client {
         let query = self.search.read(cx).value().to_lowercase();
         match self.modal {
             Some(Modal::Sessions) => filter_tab_sessions(&self.sessions, &query).len(),
-            Some(Modal::NewSession) => self
-                .projects
-                .iter()
-                .filter(|project| {
-                    project.worktree.to_lowercase().contains(&query)
-                        || project
-                            .name
-                            .as_deref()
-                            .unwrap_or_default()
-                            .to_lowercase()
-                            .contains(&query)
-                })
-                .count(),
+            Some(Modal::NewSession) => filter_new_session_projects(
+                &self.projects,
+                &self.sessions,
+                self.sessions
+                    .iter()
+                    .find(|session| session.id == self.active)
+                    .map(|session| session.directory.as_str()),
+                &query,
+            )
+            .len(),
             Some(Modal::Model) => filter_models(&self.catalog.models, &query).len(),
             Some(Modal::Level) => {
                 let variants = self
@@ -1545,20 +1636,16 @@ impl Client {
                 }
             }
             Some(Modal::NewSession) => {
-                let directory = self
-                    .projects
-                    .iter()
-                    .filter(|project| {
-                        project.worktree.to_lowercase().contains(&query)
-                            || project
-                                .name
-                                .as_deref()
-                                .unwrap_or_default()
-                                .to_lowercase()
-                                .contains(&query)
-                    })
-                    .nth(index)
-                    .map(|project| project.worktree.clone());
+                let filtered = filter_new_session_projects(
+                    &self.projects,
+                    &self.sessions,
+                    self.sessions
+                        .iter()
+                        .find(|session| session.id == self.active)
+                        .map(|session| session.directory.as_str()),
+                    &query,
+                );
+                let directory = new_session_choice(&filtered, index, &query);
                 if let Some(directory) = directory {
                     self.create_session(directory, cx);
                 }
@@ -1620,6 +1707,10 @@ impl Client {
             && !modifiers.platform
             && !modifiers.shift
         {
+            if self.modal == Some(Modal::Rename) && self.rename_pending.is_some() {
+                cx.stop_propagation();
+                return;
+            }
             if self.modal.take().is_some() {
                 self.rename_target = None;
                 self.composer.focus_handle(cx).focus(window, cx);
@@ -1653,6 +1744,17 @@ impl Client {
             cx.stop_propagation();
             return;
         }
+        if matches!(key.as_str(), "enter" | "return")
+            && self.modal == Some(Modal::Rename)
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.shift
+        {
+            self.rename_session(cx);
+            cx.stop_propagation();
+            return;
+        }
         if matches!(key.as_str(), "up" | "down") && self.modal_choice_count(cx) > 0 {
             let len = self.modal_choice_count(cx);
             let current = self.picker_highlight.unwrap_or_default();
@@ -1663,6 +1765,9 @@ impl Client {
             });
             if self.modal == Some(Modal::Sessions) {
                 self.sessions_picker_scroll
+                    .scroll_to_item(self.picker_highlight.unwrap_or_default());
+            } else if self.modal == Some(Modal::NewSession) {
+                self.projects_picker_scroll
                     .scroll_to_item(self.picker_highlight.unwrap_or_default());
             } else if matches!(self.modal, Some(Modal::Model | Modal::Level)) {
                 self.picker_list_scroll
@@ -2239,15 +2344,31 @@ impl Client {
                 Err(error) => self.connection_status = format!("Create failed: {error}"),
             },
             UiEvent::SessionRenamed {
-                session_id, result, ..
+                request_id,
+                session_id,
+                result,
             } => match result {
                 Ok(session) => {
                     if let Some(existing) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         *existing = session;
                     }
                     self.persist_tabs();
+                    if self.rename_pending == Some(request_id) {
+                        self.rename_pending = None;
+                        self.rename_target = None;
+                        self.rename_error = None;
+                        if self.modal == Some(Modal::Rename) {
+                            self.modal = None;
+                        }
+                    }
                 }
-                Err(error) => self.connection_status = format!("Rename failed: {error}"),
+                Err(error) => {
+                    self.connection_status = format!("Rename failed: {error}");
+                    if self.rename_pending == Some(request_id) {
+                        self.rename_pending = None;
+                        self.rename_error = Some(error);
+                    }
+                }
             },
             UiEvent::ModelSelected {
                 session_id,
@@ -2633,6 +2754,7 @@ impl Client {
             scroll,
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
+            projects_picker_scroll: ScrollHandle::new(),
             unread: server.unread,
             statuses: bootstrap.statuses,
             jobs,
@@ -2651,6 +2773,8 @@ impl Client {
             clear_accepted_drafts: Vec::new(),
             modal,
             rename_target: None,
+            rename_pending: None,
+            rename_error: None,
             picker_highlight: None,
             search: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(match modal {
@@ -2672,6 +2796,9 @@ impl Client {
                     if this.modal == Some(Modal::Sessions) {
                         this.sessions_picker_scroll
                             .set_offset(point(px(0.), px(0.)));
+                    } else if this.modal == Some(Modal::NewSession) {
+                        this.projects_picker_scroll
+                            .set_offset(point(px(0.), px(0.)));
                     } else if matches!(this.modal, Some(Modal::Model | Modal::Level)) {
                         this.picker_list_scroll.set_offset(point(px(0.), px(0.)));
                     }
@@ -2681,6 +2808,15 @@ impl Client {
                 _ => {}
             },
         )
+        .detach();
+        cx.subscribe(&client.rename, |this, _, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Change => this.rename_error = None,
+                InputEvent::PressEnter { .. } => this.rename_session(cx),
+                _ => {}
+            }
+            cx.notify();
+        })
         .detach();
         if settings_sessions {
             client.settings.tab = SettingsTab::Sessions;
@@ -4222,9 +4358,17 @@ impl Client {
             .justify_center()
             .bg(rgba(if self.dark { 0x000000a6 } else { 0x00000066 }))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.modal = None;
-                cx.notify();
+                if !(this.modal == Some(Modal::Rename) && this.rename_pending.is_some()) {
+                    this.modal = None;
+                    this.rename_target = None;
+                    this.rename_error = None;
+                    cx.notify();
+                }
             }));
+        let rename_id = self
+            .rename_target
+            .clone()
+            .unwrap_or_else(|| self.active.clone());
         let panel: AnyElement = match modal {
             Modal::Sessions | Modal::NewSession => {
                 let sessions = modal == Modal::Sessions;
@@ -4378,38 +4522,43 @@ impl Client {
                             ),
                     );
                 } else {
-                    let query = self.search.read(cx).value().to_lowercase();
-                    for (index, project) in self
-                        .projects
-                        .iter()
-                        .filter(|project| {
-                            project.worktree.to_lowercase().contains(&query)
-                                || project
-                                    .name
-                                    .as_deref()
-                                    .unwrap_or("")
-                                    .to_lowercase()
-                                    .contains(&query)
-                        })
-                        .enumerate()
-                    {
-                        let directory = project.worktree.clone();
-                        let label = project.name.clone().unwrap_or_else(|| {
-                            project
-                                .worktree
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or("repo")
-                                .to_owned()
-                        });
-                        card = card.child(
+                    let query = self.search.read(cx).value();
+                    let choices = filter_new_session_projects(
+                        &self.projects,
+                        &self.sessions,
+                        self.sessions
+                            .iter()
+                            .find(|session| session.id == self.active)
+                            .map(|session| session.directory.as_str()),
+                        &query,
+                    );
+                    let mut list = div()
+                        .id("new-session-picker-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.projects_picker_scroll)
+                        .flex()
+                        .flex_col();
+                    if choices.is_empty() {
+                        list = list.child(
                             div()
-                                .id(format!("project-choice-{}", project.worktree))
+                                .my(px(16.))
+                                .text_color(self.tone(0x758080, 0x7d8590))
+                                .child("No matching projects"),
+                        );
+                    }
+                    for (index, (label, directory)) in choices.into_iter().enumerate() {
+                        let path = directory.clone();
+                        list = list.child(
+                            div()
+                                .id(format!("project-choice-{directory}"))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.create_session(directory.clone(), cx);
                                 }))
                                 .h(px(44.))
+                                .flex_shrink_0()
                                 .m(px(4.))
                                 .px(px(18.))
                                 .flex()
@@ -4434,10 +4583,11 @@ impl Client {
                                         .text_size(px(11.))
                                         .font_weight(FontWeight::NORMAL)
                                         .text_color(self.tone(0x758080, 0x7d8590))
-                                        .child(project.worktree.clone()),
+                                        .child(path),
                                 ),
                         );
                     }
+                    card = card.child(list);
                 }
                 card.into_any_element()
             }
@@ -4462,6 +4612,14 @@ impl Client {
                         .rounded(px(5.))
                         .child(Input::new(&self.rename).appearance(false)),
                 )
+                .when_some(self.rename_error.clone(), |card, error| {
+                    card.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(self.tone(0xa12720, 0xf87171))
+                            .child(error),
+                    )
+                })
                 .child("Session ID")
                 .child(
                     div()
@@ -4476,9 +4634,19 @@ impl Client {
                             div()
                                 .flex_1()
                                 .font_family("monospace")
-                                .child(self.active.clone()),
+                                .child(rename_id.clone()),
                         )
-                        .child("▣"),
+                        .child(
+                            div()
+                                .id("rename-copy-id")
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        rename_id.clone(),
+                                    ));
+                                }))
+                                .child("▣"),
+                        ),
                 )
                 .child(div().flex_1())
                 .child(
@@ -4491,8 +4659,12 @@ impl Client {
                                 .id("rename-cancel")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.modal = None;
-                                    cx.notify();
+                                    if this.rename_pending.is_none() {
+                                        this.modal = None;
+                                        this.rename_target = None;
+                                        this.rename_error = None;
+                                        cx.notify();
+                                    }
                                 }))
                                 .px(px(14.))
                                 .py(px(7.))
@@ -5259,8 +5431,9 @@ mod tests {
     use super::{
         Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
         TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, filter_levels,
-        filter_models, filter_tab_sessions, fuzzy_score, inline_image, markdown_blocks, model,
-        picker_list_height, reorder_tab_ids, sticky_user_index, tab_indicator, tab_number_key,
+        filter_models, filter_new_session_projects, filter_tab_sessions, fuzzy_score, inline_image,
+        markdown_blocks, model, new_session_choice, picker_list_height, reorder_tab_ids,
+        sticky_user_index, tab_indicator, tab_number_key,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -5853,6 +6026,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_session_picker_includes_session_paths_and_custom_directory() {
+        let projects = vec![
+            model::Project {
+                worktree: "/code/alpha".into(),
+                name: Some("Named Alpha".into()),
+            },
+            model::Project {
+                worktree: "/code/bee".into(),
+                name: None,
+            },
+        ];
+        let sessions = vec![
+            model::Session {
+                id: "active".into(),
+                directory: "/code/zeta".into(),
+                title: "Zeta".into(),
+                time: model::SessionTime {
+                    created: 0,
+                    updated: 0,
+                    archived: None,
+                },
+                parent_id: None,
+                model: None,
+            },
+            model::Session {
+                id: "other".into(),
+                directory: "/code/bee".into(),
+                title: "Bee".into(),
+                time: model::SessionTime {
+                    created: 0,
+                    updated: 0,
+                    archived: None,
+                },
+                parent_id: None,
+                model: None,
+            },
+        ];
+        let all = filter_new_session_projects(&projects, &sessions, Some("/code/zeta"), "");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0], ("zeta".into(), "/code/zeta".into()));
+        assert_eq!(
+            filter_new_session_projects(&projects, &sessions, None, "zt")[0].1,
+            "/code/zeta"
+        );
+        assert_eq!(new_session_choice(&all, 99, ""), Some(all[0].1.clone()));
+        assert_eq!(
+            new_session_choice(&[], 0, " /custom/project "),
+            Some("/custom/project".into())
+        );
+        assert_eq!(new_session_choice(&[], 0, "  "), None);
+    }
+
+    #[gpui_kit::test]
+    fn new_session_picker_keyboard_reaches_scrolled_projects(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                for index in 0..15 {
+                    client.projects.push(model::Project {
+                        worktree: format!("/code/extra-{index:02}"),
+                        name: None,
+                    });
+                }
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::NewSession, window, cx)
+            });
+            window.render_frame(cx);
+            assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
+            for _ in 0..12 {
+                window.press("down", cx);
+            }
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).picker_highlight, Some(12));
+            assert!(client.read(cx).projects_picker_scroll.offset().y < px(0.));
+            window.press("enter", cx);
+            assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn model_picker_keyboard_reaches_scrolled_results(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -6235,6 +6499,84 @@ mod tests {
             assert_eq!(client.read(cx).active, original);
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn rename_enter_validates_and_updates_the_target_session(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("rename-ses_other", cx);
+            window.render_frame(cx);
+            assert!(client.read(cx).rename.focus_handle(cx).is_focused(window));
+            client.update(cx, |client, cx| {
+                client
+                    .rename
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+            });
+            window.press("enter", cx);
+            assert_eq!(
+                client.read(cx).rename_error.as_deref(),
+                Some("Enter a session title")
+            );
+            assert!(client.read(cx).modal == Some(Modal::Rename));
+            client.update(cx, |client, cx| {
+                client.rename.update(cx, |input, cx| {
+                    input.set_value("Renamed through Enter", window, cx)
+                });
+            });
+            window.press("enter", cx);
+            assert!(client.read(cx).modal.is_none());
+            assert_eq!(
+                client
+                    .read(cx)
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == "ses_other")
+                    .unwrap()
+                    .title,
+                "Renamed through Enter"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn rename_failure_keeps_the_editor_open_for_retry(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.modal = Some(Modal::Rename);
+                client.rename_target = Some("ses_other".into());
+                client.rename_pending = Some(42);
+                client.handle_live_event(
+                    super::UiEvent::SessionRenamed {
+                        request_id: 42,
+                        session_id: "ses_other".into(),
+                        result: Err("server rejected the title".into()),
+                    },
+                    cx,
+                );
+                assert!(client.modal == Some(Modal::Rename));
+                assert!(client.rename_pending.is_none());
+                assert_eq!(
+                    client.rename_error.as_deref(),
+                    Some("server rejected the title")
+                );
+            });
+        });
     }
 
     #[gpui_kit::test]
