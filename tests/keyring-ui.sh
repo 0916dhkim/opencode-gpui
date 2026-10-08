@@ -116,6 +116,27 @@ state_flag() {
   python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["connection"].get("basic_auth_in_keyring")).lower())' "${state}"
 }
 
+wait_state_flag() {
+  local expected="$1" attempt
+  # A fresh ApiHandle can authenticate before the synchronous Settings Apply
+  # callback finishes writing state. Never kill that client immediately on
+  # the first successful server request.
+  for ((attempt = 0; attempt < timeout_s * 10; attempt++)); do
+    if [[ -s "${state}" ]] && [[ "$(state_flag)" == "${expected}" ]]; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_keyring_removed() {
+  local attempt
+  for ((attempt = 0; attempt < timeout_s * 10; attempt++)); do
+    [[ -z "$(stored_entry)" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 # launch [ENV=VALUE...] -- starts the client (no password unless given) and waits for its window.
 launch() {
   mark_now
@@ -193,7 +214,7 @@ mark_now
 type_text "${password}"
 gpui_click 760 727
 expect "save.connects" "http and r['auth'] == 'ok'"
-check "save.state-flag" '[[ "$(state_flag)" == true ]]'
+check "save.state-flag" 'wait_state_flag true'
 check "save.keyring-entry" '[[ "$(stored_entry)" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
 quit
 
@@ -213,8 +234,8 @@ gpui_click 310 404
 mark_now
 gpui_click 760 727
 sleep 1
-check "forget.keyring-entry-removed" '[[ -z "$(stored_entry)" ]]'
-check "forget.state-flag" '[[ "$(state_flag)" == false ]]'
+check "forget.keyring-entry-removed" 'wait_keyring_removed'
+check "forget.state-flag" 'wait_state_flag false'
 check "forget.still-connected" app_alive
 quit
 launch OPENCODE_SERVER_URL="${address}"
