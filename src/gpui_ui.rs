@@ -3818,10 +3818,65 @@ impl Client {
                                 ),
                         );
                     }
-                    card = card.child(div().flex_1()).child(div().h(px(28.))
-                        .border_t_1().border_color(self.tone(0xded8cb, 0x27272a)).px(px(12.))
-                        .text_size(px(11.)).text_color(self.tone(0x87908d, 0xa1a1aa))
-                        .child("↑ ↓ navigate     ↵ switch                                      esc close"));
+                    let key_chip = |label| {
+                        div()
+                            .h(px(14.))
+                            .px(px(2.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(self.tone(0xded8cb, 0x3f3f46))
+                            .bg(self.tone(0xf1efec, 0x27272a))
+                            .text_color(self.tone(0x666b70, 0xd4d4d8))
+                            .font_family("monospace")
+                            .text_size(px(9.))
+                            .child(label)
+                    };
+                    card = card.child(div().flex_1()).child(
+                        div()
+                            .h(px(28.))
+                            .border_t_1()
+                            .border_color(self.tone(0xded8cb, 0x27272a))
+                            .px(px(12.))
+                            .flex()
+                            .items_center()
+                            .text_size(px(11.))
+                            .text_color(self.tone(0x87908d, 0xa1a1aa))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(4.))
+                                            .child(key_chip("↑"))
+                                            .child(key_chip("↓"))
+                                            .child("navigate"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(4.))
+                                            .child(key_chip("↵"))
+                                            .child("switch"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(key_chip("esc"))
+                                    .child("close"),
+                            ),
+                    );
                 } else {
                     let query = self.search.read(cx).value().to_lowercase();
                     for (index, project) in self
@@ -4280,6 +4335,8 @@ impl Client {
                                         .border_1()
                                         .border_color(self.tone(0xd3cec5, 0x30353a))
                                         .rounded(px(5.))
+                                        .bg(self.tone(0xf1efec, 0x393939))
+                                        .text_color(self.tone(0x252829, 0xf8f7f7))
                                         .child(if self.settings.tab == SettingsTab::Connection {
                                             "Cancel"
                                         } else {
@@ -4298,6 +4355,8 @@ impl Client {
                                             .py(px(7.))
                                             .rounded(px(5.))
                                             .bg(self.tone(0xc59535, 0xd29b52))
+                                            .text_color(self.tone(0x17130e, 0x17130e))
+                                            .font_weight(FontWeight::BOLD)
                                             .child("Apply"),
                                     )
                                 }),
