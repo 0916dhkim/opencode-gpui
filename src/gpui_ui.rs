@@ -373,7 +373,8 @@ struct Client {
     measurement_probe: Option<(Pixels, Rc<RefCell<Vec<Pixels>>>)>,
     #[cfg(test)]
     rendered_rows: Rc<RefCell<Vec<usize>>>,
-    attachments: HashMap<(String, usize, usize), Arc<Image>>,
+    transcript_spans: HashMap<String, Vec<MessageSpan>>,
+    attachments: ImageCache,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
     composer_placeholder_focused: bool,
@@ -573,6 +574,170 @@ struct TranscriptAnchor {
     key: TranscriptRowKey,
     within: Pixels,
     offset: Point<Pixels>,
+}
+
+/// One entry for every message, including undelivered prompts with zero rows.
+/// The epoch prevents an unrelated replacement snapshot with colliding IDs
+/// and revision counters from reusing an old projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessageSpan {
+    id: String,
+    revision: u64,
+    in_tray: bool,
+    row_count: usize,
+    epoch: u64,
+}
+
+impl MessageSpan {
+    fn matches(&self, message: &model::ChatMessage, epoch: u64) -> bool {
+        self.id == message.id
+            && self.revision == message.render_revision()
+            && self.in_tray == message.in_tray()
+            && self.epoch == epoch
+    }
+}
+
+struct ProjectionChange {
+    range: std::ops::Range<usize>,
+    removed_images: Vec<(TranscriptRowKey, usize)>,
+}
+
+/// Keep the unchanged message prefix and suffix intact. Their row indices may
+/// shift after a prepend, but row identity and decoded image ownership do not.
+fn splice_transcript(
+    conversation: &Conversation,
+    rows: &mut Vec<TranscriptRow>,
+    spans: &mut Vec<MessageSpan>,
+) -> Option<ProjectionChange> {
+    let messages = &conversation.messages;
+    let epoch = conversation.cache_epoch();
+    let prefix = spans
+        .iter()
+        .zip(messages)
+        .take_while(|(span, message)| span.matches(message, epoch))
+        .count();
+    let suffix = spans[prefix..]
+        .iter()
+        .rev()
+        .zip(messages[prefix..].iter().rev())
+        .take_while(|(span, message)| span.matches(message, epoch))
+        .count();
+    if prefix == spans.len() && prefix == messages.len() {
+        return None;
+    }
+    let start: usize = spans[..prefix].iter().map(|span| span.row_count).sum();
+    let end = rows.len()
+        - spans[spans.len() - suffix..]
+            .iter()
+            .map(|span| span.row_count)
+            .sum::<usize>();
+    let mut replacements = Vec::new();
+    let new_spans = messages[prefix..messages.len() - suffix]
+        .iter()
+        .map(|message| {
+            let in_tray = message.in_tray();
+            let projected = if in_tray { Vec::new() } else { message.rows() };
+            let row_count = projected.len();
+            replacements.extend(projected);
+            MessageSpan {
+                id: message.id.clone(),
+                revision: message.render_revision(),
+                in_tray,
+                row_count,
+                epoch,
+            }
+        })
+        .collect::<Vec<_>>();
+    let new_end = start + replacements.len();
+    let removed_images = rows[start..end]
+        .iter()
+        .flat_map(|row| (0..row.images.len()).map(|index| (row.key.clone(), index)))
+        .collect();
+    rows.splice(start..end, replacements);
+    spans.splice(prefix..spans.len() - suffix, new_spans);
+    Some(ProjectionChange {
+        range: start..new_end,
+        removed_images,
+    })
+}
+
+struct CachedImage {
+    url: String,
+    image: Option<Arc<Image>>,
+}
+
+#[derive(Default)]
+struct ImageCache {
+    entries: HashMap<(String, TranscriptRowKey, usize), CachedImage>,
+    #[cfg(test)]
+    decodes: usize,
+}
+
+impl ImageCache {
+    fn get(&self, session: &str, row: &TranscriptRow, index: usize) -> Option<&Arc<Image>> {
+        self.entries
+            .get(&(session.to_owned(), row.key.clone(), index))
+            .filter(|entry| row.images.get(index) == Some(&entry.url))
+            .and_then(|entry| entry.image.as_ref())
+    }
+
+    fn update(&mut self, session: &str, rows: &[TranscriptRow], change: &ProjectionChange) {
+        let present: HashSet<_> = rows[change.range.clone()]
+            .iter()
+            .flat_map(|row| (0..row.images.len()).map(|index| (&row.key, index)))
+            .collect();
+        for (key, index) in &change.removed_images {
+            if !present.contains(&(key, *index)) {
+                self.entries
+                    .remove(&(session.to_owned(), key.clone(), *index));
+            }
+        }
+        for row in &rows[change.range.clone()] {
+            for (index, url) in row.images.iter().enumerate() {
+                let key = (session.to_owned(), row.key.clone(), index);
+                if self
+                    .entries
+                    .get(&key)
+                    .is_some_and(|entry| entry.url == *url)
+                {
+                    continue;
+                }
+                #[cfg(test)]
+                {
+                    self.decodes += 1;
+                }
+                self.entries.insert(
+                    key,
+                    CachedImage {
+                        url: url.clone(),
+                        image: inline_image(url),
+                    },
+                );
+            }
+        }
+    }
+
+    fn remove_session(&mut self, session: &str) {
+        self.entries.retain(|(id, _, _), _| id != session);
+    }
+}
+
+fn update_session_projection(
+    session: &str,
+    conversation: &Conversation,
+    rows: &mut Vec<TranscriptRow>,
+    spans: &mut Vec<MessageSpan>,
+    images: &mut ImageCache,
+) {
+    if spans
+        .first()
+        .is_some_and(|span| span.epoch != conversation.cache_epoch())
+    {
+        images.remove_session(session);
+    }
+    if let Some(change) = splice_transcript(conversation, rows, spans) {
+        images.update(session, rows, &change);
+    }
 }
 
 #[derive(Default)]
@@ -1106,13 +1271,14 @@ impl Client {
             projects: Vec::new(),
             active: String::new(),
             transcript: HashMap::new(),
+            transcript_spans: HashMap::new(),
             row_heights: HashMap::new(),
             virtual_scrolls: HashMap::new(),
             #[cfg(test)]
             measurement_probe: None,
             #[cfg(test)]
             rendered_rows: Rc::new(RefCell::new(Vec::new())),
-            attachments: HashMap::new(),
+            attachments: ImageCache::default(),
             catalog: ModelCatalog::default(),
             composer: cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -1397,6 +1563,8 @@ impl Client {
         self.message_events_during_load.remove(id);
         self.reload_after_load.remove(id);
         self.transcript.remove(id);
+        self.transcript_spans.remove(id);
+        self.attachments.remove_session(id);
         self.row_heights.remove(id);
         self.virtual_scrolls.remove(id);
         self.unread.remove(id);
@@ -1725,6 +1893,8 @@ impl Client {
         self.pending_prompts.clear();
         self.clear_accepted_drafts.clear();
         self.transcript.clear();
+        self.transcript_spans.clear();
+        self.attachments = ImageCache::default();
         self.row_heights.clear();
         self.virtual_scrolls.clear();
         self.scroll = VirtualListScrollHandle::new();
@@ -2437,22 +2607,12 @@ impl Client {
         let Some(conversation) = self.conversations.get(session_id) else {
             return;
         };
-        let rows: Vec<TranscriptRow> = conversation
-            .messages
-            .iter()
-            .filter(|message| !message.in_tray())
-            .flat_map(|message| message.rows())
-            .collect();
-        self.attachments.retain(|(id, _, _), _| id != session_id);
-        for (row_index, row) in rows.iter().enumerate() {
-            for (image_index, url) in row.images.iter().enumerate() {
-                if let Some(image) = inline_image(url) {
-                    self.attachments
-                        .insert((session_id.to_owned(), row_index, image_index), image);
-                }
-            }
-        }
-        self.transcript.insert(session_id.to_owned(), rows);
+        let spans = self
+            .transcript_spans
+            .entry(session_id.to_owned())
+            .or_default();
+        let rows = self.transcript.entry(session_id.to_owned()).or_default();
+        update_session_projection(session_id, conversation, rows, spans, &mut self.attachments);
     }
 
     fn prepare_follow_bottom(&mut self, session_id: &str) {
@@ -2927,6 +3087,8 @@ impl Client {
                             self.open_tabs.retain(|tab| tab != &id);
                             self.conversations.remove(&id);
                             self.transcript.remove(&id);
+                            self.transcript_spans.remove(&id);
+                            self.attachments.remove_session(&id);
                             self.row_heights.remove(&id);
                             self.virtual_scrolls.remove(&id);
                             self.composers.remove(&id);
@@ -3059,6 +3221,8 @@ impl Client {
         }
         let jobs = running_jobs.rows(Some(&active));
         let mut transcript: HashMap<String, Vec<TranscriptRow>> = HashMap::new();
+        let mut transcript_spans = HashMap::new();
+        let mut attachments = ImageCache::default();
         let mut conversations = HashMap::new();
         for session in &sessions {
             if let UiEvent::MessagesLoaded {
@@ -3072,32 +3236,20 @@ impl Client {
                 if let Some(queued) = page.queued {
                     conversation.sync_queued(&queued);
                 }
-                transcript.insert(
-                    session.id.clone(),
-                    conversation
-                        .messages
-                        .iter()
-                        .filter(|message| !message.in_tray())
-                        .flat_map(|message| message.rows())
-                        .collect(),
+                let mut rows = Vec::new();
+                let mut spans = Vec::new();
+                update_session_projection(
+                    &session.id,
+                    &conversation,
+                    &mut rows,
+                    &mut spans,
+                    &mut attachments,
                 );
+                transcript.insert(session.id.clone(), rows);
+                transcript_spans.insert(session.id.clone(), spans);
                 conversations.insert(session.id.clone(), conversation);
             }
         }
-        let attachments = transcript
-            .iter()
-            .flat_map(|(session_id, rows)| {
-                rows.iter().enumerate().flat_map(move |(row_index, row)| {
-                    row.images
-                        .iter()
-                        .enumerate()
-                        .filter_map(move |(image_index, url)| {
-                            inline_image(url)
-                                .map(|image| ((session_id.clone(), row_index, image_index), image))
-                        })
-                })
-            })
-            .collect();
         let catalog = match fixture.handle(Command::LoadModels {
             directory: "/repo".into(),
         }) {
@@ -3152,6 +3304,7 @@ impl Client {
             projects,
             active: active.clone(),
             transcript,
+            transcript_spans,
             row_heights: HashMap::new(),
             virtual_scrolls: HashMap::from([(active, scroll.clone())]),
             #[cfg(test)]
@@ -3294,6 +3447,8 @@ impl Client {
         client.saved_active = Some(client.active.clone());
         client.sessions.clear();
         client.transcript.clear();
+        client.transcript_spans.clear();
+        client.attachments = ImageCache::default();
         client.conversations.clear();
         client.loading_messages.clear();
         client.message_events_during_load.clear();
@@ -3784,9 +3939,7 @@ impl Client {
             _ => body = body.child(row.body.clone()),
         }
         for (image_index, image) in row.images.iter().enumerate() {
-            let source = self
-                .attachments
-                .get(&(self.active.clone(), index, image_index));
+            let source = self.attachments.get(&self.active, row, image_index);
             let thumbnail = div()
                 .h(px(120.))
                 .w(px(200.))
@@ -6055,9 +6208,9 @@ mod tests {
         Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
         TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, VirtualListScrollHandle,
         filter_all_sessions, filter_levels, filter_models, filter_new_session_projects,
-        filter_tab_sessions, fuzzy_score, inline_image, markdown_blocks, model,
-        needs_new_connection, new_session_choice, picker_list_height, reorder_tab_ids,
-        sticky_user_index, tab_indicator, tab_number_key,
+        filter_tab_sessions, fuzzy_score, markdown_blocks, model, needs_new_connection,
+        new_session_choice, picker_list_height, reorder_tab_ids, splice_transcript,
+        sticky_user_index, tab_indicator, tab_number_key, update_session_projection,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -6066,6 +6219,227 @@ mod tests {
     };
     use opencode_gpui::model::RunStatus;
     use opencode_gpui::persist::PersistedState;
+    use opencode_gpui::protocol;
+    use serde_json::json;
+
+    fn snapshot(conversation: &mut model::Conversation, values: Vec<serde_json::Value>) {
+        conversation.replace_from_api(
+            &values
+                .into_iter()
+                .map(protocol::SessionMessage::from_value)
+                .collect::<Vec<_>>(),
+            None,
+        );
+    }
+
+    fn full_rows(conversation: &model::Conversation) -> Vec<model::TranscriptRow> {
+        conversation
+            .messages
+            .iter()
+            .filter(|message| !message.in_tray())
+            .flat_map(|message| message.rows())
+            .collect()
+    }
+
+    #[test]
+    fn spliced_projection_matches_full_rows_for_prepend_stream_snapshot_and_queue() {
+        let mut conversation = model::Conversation::default();
+        let entry = |id: &str, text: &str| {
+            json!({
+                "id": id, "type": "user", "time": { "created": 1 }, "text": text
+            })
+        };
+        snapshot(
+            &mut conversation,
+            vec![entry("middle", "middle"), entry("tail", "tail")],
+        );
+        let mut rows = Vec::new();
+        let mut spans = Vec::new();
+        let first = splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert_eq!(first.range, 0..2);
+        assert_eq!(rows, full_rows(&conversation));
+        assert!(splice_transcript(&conversation, &mut rows, &mut spans).is_none());
+
+        conversation.prepend_from_api(
+            &[protocol::SessionMessage::from_value(entry(
+                "earlier", "earlier",
+            ))],
+            None,
+        );
+        let prepend = splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert_eq!(prepend.range, 0..1);
+        assert_eq!(rows, full_rows(&conversation));
+
+        let event = |id: &str, kind: &str, data| {
+            json!({
+                "id": id, "created": 2000, "type": kind, "data": data
+            })
+        };
+        assert!(conversation.apply_event(&event(
+            "evt_00000000000000000000000001", "session.text.delta",
+            json!({ "sessionID": "ses_a", "assistantMessageID": "assistant", "ordinal": 0, "delta": "hello" }),
+        )));
+        let stream = splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert_eq!(stream.range, 3..4);
+        assert_eq!(rows, full_rows(&conversation));
+        assert!(conversation.apply_event(&event(
+            "evt_00000000000000000000000002", "session.inbox.enqueued",
+            json!({ "sessionID": "ses_a", "inboxID": "queued", "item": { "type": "user", "payload": { "text": "later" }, "delivery": "queue" } }),
+        )));
+        assert!(splice_transcript(&conversation, &mut rows, &mut spans).is_some());
+        assert_eq!(rows, full_rows(&conversation));
+        assert_eq!(spans.last().unwrap().row_count, 0);
+        assert!(conversation.apply_event(&event(
+            "evt_00000000000000000000000003",
+            "session.inbox.delivered",
+            json!({ "sessionID": "ses_a", "inboxID": "queued" }),
+        )));
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert_eq!(rows, full_rows(&conversation));
+
+        assert!(conversation.apply_event(&event(
+            "evt_00000000000000000000000004",
+            "session.text.delta",
+            json!({ "sessionID": "ses_a", "assistantMessageID": "assistant", "ordinal": 0, "delta": "!" }),
+        )));
+        let middle = splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert_eq!(
+            middle.range,
+            3..4,
+            "the delivered user row stays in the suffix"
+        );
+        assert_eq!(rows, full_rows(&conversation));
+
+        let old_epoch = conversation.cache_epoch();
+        snapshot(
+            &mut conversation,
+            vec![entry("middle", "replacement"), entry("tail", "tail")],
+        );
+        assert_ne!(conversation.cache_epoch(), old_epoch);
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert_eq!(rows, full_rows(&conversation));
+        assert_eq!(rows[0].body, "replacement");
+    }
+
+    #[test]
+    fn image_cache_reuses_arc_across_index_shift_and_revision_but_replaces_exact_url() {
+        let mut cache = super::ImageCache::default();
+        let mut image = cache_row("image", "caption");
+        image.images = vec!["data:image/png;base64,aGVsbG8=".into()];
+        let mut rows = vec![image.clone()];
+        let change = super::ProjectionChange {
+            range: 0..1,
+            removed_images: Vec::new(),
+        };
+        cache.update("ses_a", &rows, &change);
+        let original = cache.get("ses_a", &image, 0).unwrap().clone();
+        assert_eq!(cache.decodes, 1);
+        rows.insert(0, cache_row("earlier", "first"));
+        image.render_revision += 1;
+        rows[1] = image.clone();
+        cache.update(
+            "ses_a",
+            &rows,
+            &super::ProjectionChange {
+                range: 1..2,
+                removed_images: vec![(image.key.clone(), 0)],
+            },
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &original,
+            cache.get("ses_a", &image, 0).unwrap()
+        ));
+        assert_eq!(cache.decodes, 1);
+        image.images[0] = "data:image/png;base64,d29ybGQ=".into();
+        rows[1] = image.clone();
+        cache.update(
+            "ses_a",
+            &rows,
+            &super::ProjectionChange {
+                range: 1..2,
+                removed_images: vec![(image.key.clone(), 0)],
+            },
+        );
+        assert!(!std::sync::Arc::ptr_eq(
+            &original,
+            cache.get("ses_a", &image, 0).unwrap()
+        ));
+        assert_eq!(cache.decodes, 2);
+
+        cache.update("ses_b", &[image.clone()], &change);
+        assert_eq!(cache.decodes, 3);
+        assert!(!std::sync::Arc::ptr_eq(
+            cache.get("ses_a", &image, 0).unwrap(),
+            cache.get("ses_b", &image, 0).unwrap()
+        ));
+        cache.remove_session("ses_a");
+        assert!(cache.get("ses_a", &image, 0).is_none());
+        assert!(cache.get("ses_b", &image, 0).is_some());
+    }
+
+    #[test]
+    fn image_cache_remembers_invalid_urls_and_cleans_removed_image_slots() {
+        let mut cache = super::ImageCache::default();
+        let mut row = cache_row("image", "caption");
+        row.images = vec![
+            "data:image/png;base64,%%%".into(),
+            "data:image/png;base64,aGVsbG8=".into(),
+        ];
+        let change = super::ProjectionChange {
+            range: 0..1,
+            removed_images: Vec::new(),
+        };
+        cache.update("ses_a", &[row.clone()], &change);
+        cache.update("ses_a", &[row.clone()], &change);
+        assert_eq!(cache.decodes, 2);
+        assert!(cache.get("ses_a", &row, 0).is_none());
+        row.images.truncate(1);
+        cache.update(
+            "ses_a",
+            &[row.clone()],
+            &super::ProjectionChange {
+                range: 0..1,
+                removed_images: vec![(row.key.clone(), 0), (row.key.clone(), 1)],
+            },
+        );
+        assert_eq!(cache.entries.len(), 1);
+        cache.update(
+            "ses_a",
+            &[],
+            &super::ProjectionChange {
+                range: 0..0,
+                removed_images: vec![(row.key.clone(), 0)],
+            },
+        );
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn replacement_snapshot_clears_colliding_image_identity() {
+        let mut conversation = model::Conversation::default();
+        let entry = |encoded: &str| {
+            json!({
+                "id": "msg_same", "type": "user", "time": { "created": 1 },
+                "files": [{ "data": encoded, "mime": "image/png", "source": { "type": "inline" } }]
+            })
+        };
+        let encoded = "aGVsbG8=";
+        snapshot(&mut conversation, vec![entry(encoded)]);
+        let mut rows = Vec::new();
+        let mut spans = Vec::new();
+        let mut images = super::ImageCache::default();
+        update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
+        assert_eq!(rows, full_rows(&conversation));
+        let before = images.get("ses_a", &rows[0], 0).unwrap().clone();
+        snapshot(&mut conversation, vec![entry(encoded)]);
+        update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
+        assert_eq!(rows, full_rows(&conversation));
+        assert!(!std::sync::Arc::ptr_eq(
+            &before,
+            images.get("ses_a", &rows[0], 0).unwrap()
+        ));
+        assert_eq!(images.entries.len(), 1);
+    }
 
     fn cache_row(id: &str, body: &str) -> model::TranscriptRow {
         model::TranscriptRow {
@@ -6899,12 +7273,14 @@ mod tests {
                     client
                         .transcript
                         .insert(client.active.clone(), rows.to_vec());
-                    client
-                        .attachments
-                        .retain(|(session, _, _), _| session != &client.active);
-                    client.attachments.insert(
-                        (client.active.clone(), 2, 0),
-                        inline_image(&rows[2].images[0]).expect("fixture image decodes"),
+                    client.attachments.remove_session(&client.active);
+                    client.attachments.update(
+                        &client.active,
+                        &rows,
+                        &super::ProjectionChange {
+                            range: 0..rows.len(),
+                            removed_images: Vec::new(),
+                        },
                     );
                     cx.notify();
                 });

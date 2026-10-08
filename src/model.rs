@@ -460,6 +460,10 @@ impl ChatMessage {
         self.queued && self.role == Role::User
     }
 
+    pub fn render_revision(&self) -> u64 {
+        self.render_revision
+    }
+
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }
@@ -646,7 +650,7 @@ pub enum TranscriptRowSlot {
     Error,
 }
 
-/// Scoped by conversation/session in a future row cache. The message ID and
+/// Scoped by conversation/session in row and image caches. The message ID and
 /// semantic slot remain stable when unrelated history is prepended.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct TranscriptRowKey {
@@ -1308,7 +1312,18 @@ impl Conversation {
         let key = format!("{}:{ordinal}", kind.prefix());
         let index = self.ensure_message(message_id, Role::Assistant);
         let message = &mut self.messages[index];
-        if message.segment_mut(&key).is_some() {
+        if let Some(segment) = message.segment_mut(&key) {
+            if kind == SegmentKind::Reasoning
+                && created > 0
+                && (segment.created == 0 || created < segment.created)
+            {
+                let visible = segment.visible;
+                segment.created = created;
+                if visible {
+                    message.bump_render_revision();
+                }
+                return visible;
+            }
             return false;
         }
         message
@@ -1364,15 +1379,24 @@ impl Conversation {
         let index = self.ensure_message(message_id, Role::Assistant);
         let message = &mut self.messages[index];
         match message.segment_mut(&key) {
-            Some(segment) if segment.text == text => false,
             Some(segment) => {
                 let was_visible = segment.visible;
-                segment.text = text.to_owned();
-                segment.visible = !text.trim().is_empty();
-                if was_visible || segment.visible {
+                let text_changed = segment.text != text;
+                let time_changed =
+                    kind == SegmentKind::Reasoning && segment.created == 0 && created > 0;
+                if text_changed {
+                    segment.text = text.to_owned();
+                    segment.visible = !text.trim().is_empty();
+                }
+                if time_changed {
+                    segment.created = created;
+                }
+                let changed = text_changed && (was_visible || segment.visible)
+                    || time_changed && segment.visible;
+                if changed {
                     message.bump_render_revision();
                 }
-                true
+                changed
             }
             None => {
                 message
@@ -2810,6 +2834,55 @@ mod tests {
             projected_rows(&conversation)[0].render_revision(),
             initial + 2
         );
+    }
+
+    #[test]
+    fn reasoning_timestamp_reconciliation_changes_revision_with_unchanged_text() {
+        let mut conversation = Conversation::default();
+        let event = |id: &str, created, kind: &str, data| {
+            serde_json::json!({
+                "id": id, "created": created, "type": kind, "data": data
+            })
+        };
+        assert!(conversation.apply_event(&event(
+            "evt_00000000000000000000001001", 1000, "session.reasoning.delta",
+            json!({ "sessionID": "ses_1", "assistantMessageID": "msg_a", "ordinal": 0, "delta": "thinking" }),
+        )));
+        let before = projected_rows(&conversation).pop().unwrap();
+        assert_eq!(before.time, 0);
+        assert!(conversation.apply_event(&event(
+            "evt_00000000000000000000001002", 2000, "session.reasoning.ended",
+            json!({ "sessionID": "ses_1", "assistantMessageID": "msg_a", "ordinal": 0, "text": "thinking" }),
+        )));
+        let after = projected_rows(&conversation).pop().unwrap();
+        assert_ne!(before.time, after.time);
+        assert_ne!(before.render_revision(), after.render_revision());
+
+        let mut started = Conversation::default();
+        assert!(started.apply_event(&event(
+            "evt_00000000000000000000001003", 1000, "session.reasoning.delta",
+            json!({ "sessionID": "ses_1", "assistantMessageID": "msg_b", "ordinal": 0, "delta": "thinking" }),
+        )));
+        let revision = projected_rows(&started)[0].render_revision();
+        assert!(started.apply_event(&event(
+            "evt_00000000000000000000001004",
+            3000,
+            "session.reasoning.started",
+            json!({ "sessionID": "ses_1", "assistantMessageID": "msg_b", "ordinal": 0 }),
+        )));
+        assert_ne!(projected_rows(&started)[0].render_revision(), revision);
+
+        // A late start event can replace the provisional end timestamp.
+        let ending = projected_rows(&conversation)[0].clone();
+        assert!(conversation.apply_event(&event(
+            "evt_00000000000000000000001005",
+            1500,
+            "session.reasoning.started",
+            json!({ "sessionID": "ses_1", "assistantMessageID": "msg_a", "ordinal": 0 }),
+        )));
+        let corrected = &projected_rows(&conversation)[0];
+        assert_ne!(corrected.time, ending.time);
+        assert_ne!(corrected.render_revision(), ending.render_revision());
     }
 
     #[test]
