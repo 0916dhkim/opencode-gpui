@@ -2479,6 +2479,7 @@ impl Client {
         };
         let title = session.title.clone();
         let id = session.id.clone();
+        let middle_close_id = id.clone();
         let rename_id = id.clone();
         let rename_key_id = id.clone();
         let close_id = id.clone();
@@ -2525,6 +2526,14 @@ impl Client {
                 this.focus_selected_composer(window, cx);
                 cx.notify();
             }))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _, window, cx| {
+                    this.close_tab(&middle_close_id, cx);
+                    this.focus_selected_composer(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .when(divided, |tab| {
                 tab.child(
                     div()

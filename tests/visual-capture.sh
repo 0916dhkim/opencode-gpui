@@ -149,6 +149,9 @@ fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == close-tab ]]; then
   xdotool mousemove --window "$win" 247 116 click 1
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == middle-close ]]; then
+  xdotool mousemove --window "$win" 110 148 click 2
+fi
 if [[ "${INTERACTION:-}" == permission || "${INTERACTION:-}" == permission-deny || "${INTERACTION:-}" == permission-once || "${INTERACTION:-}" == permission-tab-deny ]]; then
   if [[ "$CLIENT" == gpui ]]; then
     if [[ "${INTERACTION:-}" == permission-tab-deny ]]; then xdotool mousemove --window "$win" 410 680 click 1; fi
