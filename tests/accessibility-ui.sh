@@ -97,6 +97,8 @@ assert len(matches) == 1, 'GPUI application was not registered exactly once'
 assert len(frames) == 1, 'OpenCode frame was not exposed'
 assert len(entries) == 1, 'Composer entry was not exposed'
 assert pyatspi.STATE_EDITABLE in entries[0].getState().getStates(), 'Composer is not editable'
+assert entries[0].queryComponent().grabFocus(), 'Composer did not accept accessible focus'
+assert entries[0].name == 'Ask OpenCode anything…', 'Composer lost its accessible name on focus'
 session_buttons = [child for child in frames[0]
                    if child.getRoleName() == 'push button' and child.name.startswith('Open session: ')]
 assert session_buttons, 'No named session buttons were exposed'

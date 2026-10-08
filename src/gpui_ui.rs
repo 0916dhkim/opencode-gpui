@@ -82,6 +82,7 @@ struct Client {
     attachments: HashMap<(String, usize, usize), Arc<Image>>,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
+    composer_placeholder_focused: bool,
     composer_session: String,
     composers: HashMap<String, Entity<TextareaState>>,
     attachments_draft: Vec<PathBuf>,
@@ -592,6 +593,7 @@ impl Client {
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
+            composer_placeholder_focused: false,
             composer_session: String::new(),
             composers: HashMap::new(),
             attachments_draft: Vec::new(),
@@ -873,6 +875,10 @@ impl Client {
             self.composer = composer;
         }
         self.composer_session = self.active.clone();
+        self.composer_placeholder_focused = false;
+        self.composer.update(cx, |input, cx| {
+            input.set_placeholder("Ask OpenCode anything…", window, cx);
+        });
     }
 
     fn focus_selected_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2328,6 +2334,7 @@ impl Client {
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
+            composer_placeholder_focused: false,
             composer_session: String::new(),
             composers: HashMap::new(),
             attachments_draft: Vec::new(),
@@ -3482,7 +3489,12 @@ impl Client {
             .border_1()
             .border_color(self.tone(0xc8c3ba, 0x30353a))
             .bg(self.tone(0xffffff, 0x191c1f))
-            .child(Textarea::new(&self.composer).bordered(false).h(px(89.)))
+            .child(
+                Textarea::new(&self.composer)
+                    .aria_label("Ask OpenCode anything…")
+                    .bordered(false)
+                    .h(px(89.)),
+            )
             .when(!self.attachments_draft.is_empty(), |composer| {
                 composer.child(files)
             })
@@ -4570,6 +4582,21 @@ impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
         self.sync_composer(window, cx);
+        let composer_focused = self.composer.focus_handle(cx).is_focused(window);
+        if composer_focused != self.composer_placeholder_focused {
+            self.composer_placeholder_focused = composer_focused;
+            self.composer.update(cx, |input, cx| {
+                input.set_placeholder(
+                    if composer_focused {
+                        ""
+                    } else {
+                        "Ask OpenCode anything…"
+                    },
+                    window,
+                    cx,
+                );
+            });
+        }
         self.tab_focus.retain(|id, _| self.open_tabs.contains(id));
         for id in &self.open_tabs {
             self.tab_focus
