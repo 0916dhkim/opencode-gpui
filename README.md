@@ -1,25 +1,14 @@
-# OpenCode Desktop (COSMIC)
+# OpenCode Desktop (GPUI rebuild)
 
-A native COSMIC desktop client for a remote [OpenCode](https://opencode.ai) server, built with [`libcosmic`](https://github.com/pop-os/libcosmic) and `iced`. Designed for Linux / COSMIC Desktop users who want a first-class Wayland desktop experience with pure-Rust performance and memory safety.
+An in-progress native Linux desktop client for [OpenCode v2](https://opencode.ai/v2/docs/) using GPUI Kit. This `rebuild/gpui` branch replaces the old libcosmic UI while retaining the v2 transport and state model. It is **not ready to install as a replacement**; the last verified COSMIC client remains on `main` until behavior and visual parity are complete.
 
-**Requires OpenCode 2.x (2.0.8 or later).**
-
-## Features
-
-- **Native COSMIC Integration**: Built on `libcosmic` with system palette tokens, Wayland support, and responsive drawer navigation.
-- **Connection & Security**: Remembers OpenCode passwords and Cloudflare Access tokens in the Linux system keyring (Secret Service).
-- **Session Tabs & History**: Multiple active sessions in tabs, fast switching, and a session search drawer.
-- **Streaming Transcripts**: Real-time streaming over Server-Sent Events (SSE) for assistant text, reasoning, and tool executions.
-- **Rich Markdown**: Code blocks with language detection and one-click copy to clipboard, formatted headings, lists, blockquotes, and tables.
-- **Steer & Queue Composer**: Steer prompts into active runs at the next turn, queue follow-ups, or stop/park running sessions.
-- **Waiting Prompts Tray**: Interactive tray above composer with switch and cancel controls.
-- **Background Jobs Drawer**: Live visibility into active session background subagents and shell commands with live elapsed times.
+The prototype currently renders a session sidebar, transcript, composer, model and effort pickers, waiting tray, and several modals. Basic v2 bootstrap, streaming events, message send, session creation/rename, model selection, editable connection settings and per-server tab persistence are wired. Queue/switch/cancel/resume and several shortcuts and picker-keyboard paths have been exercised against the in-process preview API. Not all UI paths have been verified against a live server. Permission cards, robust Markdown/virtualized transcript behavior, comprehensive shortcuts, dark-theme parity, and interaction/accessibility testing still need work. Do not treat a successful preview capture as proof of those features.
 
 ## Building & Running
 
 ### Dependencies
 
-Requires Rust 1.93+ (Rust 2024 edition).
+Requires Rust 1.93+ (Rust 2024 edition) and Linux graphics development libraries for GPUI Kit (Wayland/X11, Vulkan and fontconfig). The repository Dockerfile contains an amd64 development/test environment; it is not a minimal runtime image.
 
 Build for Linux:
 
@@ -27,10 +16,11 @@ Build for Linux:
 cargo build --release
 ```
 
-Or run offline preview mode without connecting to a server:
+Run the deterministic offline screenshot fixture, or exercise the real command/event UI against its in-process preview server:
 
 ```bash
 cargo run -- --preview
+cargo run -- --preview-api
 ```
 
 ### CLI Flags
@@ -41,21 +31,9 @@ cargo run -- --preview
 --password <PASS>            HTTP Basic Auth password
 --cf-access-client-id <ID>   Cloudflare Access client ID
 --cf-access-client-secret    Cloudflare Access client secret
---preview                    Launch offline mock preview UI
+--preview                    Render deterministic offline preview data
+--preview-api                Exercise the v2 command/event UI with the fixture
+--drawer <NAME>              Open a preview modal (settings, sessions, new-session, rename, model, level)
 ```
 
-## Keyboard Shortcuts
-
-| Key | Action |
-| --- | --- |
-| `Ctrl+T` | New session |
-| `Ctrl+W` | Close the active tab |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
-| `Ctrl+1` … `Ctrl+9`, `Alt+1` … `Alt+9` | Select a tab by position |
-| `Ctrl+B` | Fold the sidebar |
-| `Ctrl+P` | Session search drawer |
-| `Ctrl+,` | Settings drawer |
-| `Ctrl+G` | Put the caret back in the prompt composer |
-| `Enter` | Send; steers into the run while a session is running |
-| `Ctrl+Enter` | Queue a follow-up turn while a session is running |
-| `Escape` | Close the open drawer |
+The headless visual harness in `tests/visual-capture.sh` captures a GPUI Wayland surface through nested Weston on Xvfb. `tests/stitch-visual.sh` places a GTK reference capture on the left and a GPUI capture on the right as a native 1568×791 comparison. Neither script touches the user's live desktop. The progress checklist and annotated screenshots live in the shared Obsidian note `opencode-gpui-rebuild.md`.

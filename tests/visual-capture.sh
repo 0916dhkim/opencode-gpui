@@ -115,6 +115,74 @@ fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == close-tab ]]; then
   xdotool mousemove --window "$win" 247 116 click 1
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == copy-code ]]; then
+  xdotool mousemove --window "$win" 720 392 click 1
+  sleep 0.2
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool key ctrl+v
+fi
+if [[ "${INTERACTION:-}" == running || "${INTERACTION:-}" == parked ]]; then
+  if [[ "${INTERACTION:-}" == running ]]; then row_y=187; else row_y=224; fi
+  if [[ "$CLIENT" == gpui ]]; then
+    xdotool mousemove --window "$win" 92 "$row_y" click 1
+  else
+    xdotool mousemove 92 "$row_y" click 1
+  fi
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == queue ]]; then
+  xdotool mousemove --window "$win" 92 187 click 1
+  sleep 0.8
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool type --clearmodifiers --delay 30 'Another queued prompt'
+  xdotool key ctrl+Return
+fi
+if [[ "$CLIENT" == gpui && ( "${INTERACTION:-}" == cancel-waiting || "${INTERACTION:-}" == switch-waiting ) ]]; then
+  xdotool mousemove --window "$win" 92 187 click 1
+  sleep 0.8
+  if [[ "${INTERACTION:-}" == cancel-waiting ]]; then action_x=735; else action_x=675; fi
+  xdotool mousemove --window "$win" "$action_x" 503 click 1
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == resume ]]; then
+  xdotool mousemove --window "$win" 92 225 click 1
+  sleep 0.8
+  xdotool mousemove --window "$win" 716 452 click 1
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == shortcut-settings ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool key ctrl+comma
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == shortcut-new-session ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool key ctrl+t
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == shortcut-next-tab ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool key ctrl+Tab
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == shortcut-escape ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool key ctrl+p
+  sleep 0.2
+  xdotool key Escape
+fi
+if [[ "${INTERACTION:-}" == model-picker || "${INTERACTION:-}" == level-picker ]]; then
+  if [[ "${INTERACTION:-}" == model-picker ]]; then picker_x=387; else picker_x=491; fi
+  if [[ "$CLIENT" == gpui ]]; then
+    xdotool mousemove --window "$win" "$picker_x" 748 click 1
+  else
+    xdotool mousemove "$picker_x" 748 click 1
+  fi
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == keyboard-model-choice ]]; then
+  xdotool mousemove --window "$win" 387 748 click 1
+  sleep 0.3
+  xdotool key Up Return
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == keyboard-level-choice ]]; then
+  xdotool mousemove --window "$win" 491 748 click 1
+  sleep 0.3
+  xdotool key Down Return
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == apply-settings ]]; then
   xdotool mousemove --window "$win" 72 764 click 1
   sleep 0.5

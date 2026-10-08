@@ -10,7 +10,7 @@ use gpui_kit::component::text::markdown;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
-    api::{ApiConfig, ApiHandle, Command, UiEvent},
+    api::{ApiConfig, ApiHandle, Command, InboxRequest, UiEvent},
     credentials::{self, CloudflareAccessCredentials, SystemKeyring},
     jobs::{self, JobRow, Jobs},
     model::{
@@ -19,7 +19,7 @@ use opencode_gpui::{
     },
     pending::{Forms, PendingRequest},
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
-    preview, protocol,
+    preview, protocol, tray,
 };
 use serde::Deserialize;
 
@@ -57,8 +57,10 @@ struct Client {
     next_session_request_id: u64,
     next_model_request_id: u64,
     pending_prompt: Option<(u64, String, String, Vec<PathBuf>)>,
+    tray_in_flight: HashSet<String>,
     clear_accepted_draft: Option<(String, String, Vec<PathBuf>)>,
     modal: Option<Modal>,
+    picker_highlight: Option<usize>,
     search: Entity<InputState>,
     rename: Entity<InputState>,
 }
@@ -403,8 +405,10 @@ impl Client {
             next_session_request_id: 0,
             next_model_request_id: 0,
             pending_prompt: None,
+            tray_in_flight: HashSet::new(),
             clear_accepted_draft: None,
             modal: None,
+            picker_highlight: None,
             search: cx.new(|cx| InputState::new(window, cx).placeholder("Search models (fuzzy)…")),
             rename: cx.new(|cx| InputState::new(window, cx)),
         };
@@ -416,11 +420,17 @@ impl Client {
             }
         })
         .detach();
-        cx.subscribe(&client.search, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })
+        cx.subscribe(
+            &client.search,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.picker_highlight = None;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => this.accept_modal_choice(cx),
+                _ => {}
+            },
+        )
         .detach();
         cx.subscribe(
             &client.settings.session_search,
@@ -480,7 +490,6 @@ impl Client {
             self.open_tabs.push(id.clone());
         }
         self.active = id.clone();
-        self.unread.remove(&id);
         self.scroll.scroll_to_bottom();
         self.jobs = self.running_jobs.rows(Some(&id));
         if let Some(api) = &self.api {
@@ -755,6 +764,7 @@ impl Client {
         self.catalogs.clear();
         self.statuses.clear();
         self.forms.clear();
+        self.tray_in_flight.clear();
         self.jobs.clear();
         self.running_jobs = Jobs::default();
         let saved = persisted.servers.get(&key);
@@ -789,6 +799,7 @@ impl Client {
 
     fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
         self.modal = Some(modal);
+        self.picker_highlight = None;
         match modal {
             Modal::Sessions | Modal::NewSession | Modal::Model | Modal::Level => {
                 let placeholder = match modal {
@@ -827,6 +838,219 @@ impl Client {
         cx.notify();
     }
 
+    fn modal_choice_count(&self, cx: &Context<Self>) -> usize {
+        let query = self.search.read(cx).value().to_lowercase();
+        match self.modal {
+            Some(Modal::Sessions) => self
+                .sessions
+                .iter()
+                .filter(|session| session.title.to_lowercase().contains(&query))
+                .take(8)
+                .count(),
+            Some(Modal::NewSession) => self
+                .projects
+                .iter()
+                .filter(|project| {
+                    project.worktree.to_lowercase().contains(&query)
+                        || project
+                            .name
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&query)
+                })
+                .count(),
+            Some(Modal::Model) => self
+                .catalog
+                .models
+                .iter()
+                .filter(|option| {
+                    option.label.to_lowercase().contains(&query)
+                        || option.model_id.to_lowercase().contains(&query)
+                })
+                .take(7)
+                .count(),
+            Some(Modal::Level) => {
+                let variants = self
+                    .selected_model()
+                    .as_ref()
+                    .and_then(|selection| self.catalog.find(selection))
+                    .map(|option| option.variants.as_slice())
+                    .unwrap_or_default();
+                std::iter::once("Default")
+                    .chain(variants.iter().map(String::as_str))
+                    .filter(|level| level.to_lowercase().contains(&query))
+                    .count()
+            }
+            _ => 0,
+        }
+    }
+
+    fn accept_modal_choice(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).value().to_lowercase();
+        let index = self.picker_highlight.unwrap_or_default();
+        match self.modal {
+            Some(Modal::Sessions) => {
+                let id = self
+                    .sessions
+                    .iter()
+                    .filter(|session| session.title.to_lowercase().contains(&query))
+                    .take(8)
+                    .nth(index)
+                    .map(|session| session.id.clone());
+                if let Some(id) = id {
+                    self.select_session(id);
+                    self.modal = None;
+                }
+            }
+            Some(Modal::NewSession) => {
+                let directory = self
+                    .projects
+                    .iter()
+                    .filter(|project| {
+                        project.worktree.to_lowercase().contains(&query)
+                            || project
+                                .name
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&query)
+                    })
+                    .nth(index)
+                    .map(|project| project.worktree.clone());
+                if let Some(directory) = directory {
+                    self.create_session(directory, cx);
+                }
+            }
+            Some(Modal::Model) => {
+                let choice = self
+                    .catalog
+                    .models
+                    .iter()
+                    .filter(|option| {
+                        option.label.to_lowercase().contains(&query)
+                            || option.model_id.to_lowercase().contains(&query)
+                    })
+                    .take(7)
+                    .nth(index)
+                    .map(|option| protocol::ModelRef {
+                        id: option.model_id.clone(),
+                        provider_id: option.provider_id.clone(),
+                        variant: None,
+                    });
+                if let Some(choice) = choice {
+                    self.choose_model(choice, cx);
+                }
+            }
+            Some(Modal::Level) => {
+                let chosen = self.selected_model();
+                let variant = chosen
+                    .as_ref()
+                    .and_then(|selection| self.catalog.find(selection))
+                    .map(|option| option.variants.as_slice())
+                    .unwrap_or_default();
+                let variant = std::iter::once(None)
+                    .chain(variant.iter().cloned().map(Some))
+                    .filter(|variant| {
+                        variant
+                            .as_deref()
+                            .unwrap_or("Default")
+                            .to_lowercase()
+                            .contains(&query)
+                    })
+                    .nth(index);
+                if let (Some(selection), Some(variant)) = (chosen, variant) {
+                    self.choose_model(
+                        protocol::ModelRef {
+                            id: selection.model_id,
+                            provider_id: selection.provider_id,
+                            variant,
+                        },
+                        cx,
+                    );
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = &event.keystroke.modifiers;
+        let key = event.keystroke.key.to_ascii_lowercase();
+        if key == "escape" && self.modal.take().is_some() {
+            self.composer.focus_handle(cx).focus(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if matches!(key.as_str(), "up" | "down") && self.modal_choice_count(cx) > 0 {
+            let len = self.modal_choice_count(cx);
+            let current = self.picker_highlight.unwrap_or_default();
+            self.picker_highlight = Some(if key == "up" {
+                current.saturating_sub(1)
+            } else {
+                (current + 1).min(len - 1)
+            });
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if !modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        let action = match key.as_str() {
+            "t" => Some(Modal::NewSession),
+            "p" => Some(Modal::Sessions),
+            "," | "comma" => Some(Modal::Settings),
+            _ => None,
+        };
+        if let Some(modal) = action {
+            self.show_modal(modal, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.modal.is_some() {
+            return;
+        }
+        let selection = if key == "tab" && !self.open_tabs.is_empty() {
+            let current = self
+                .open_tabs
+                .iter()
+                .position(|id| *id == self.active)
+                .unwrap_or_default();
+            let next = if modifiers.shift {
+                (current + self.open_tabs.len() - 1) % self.open_tabs.len()
+            } else {
+                (current + 1) % self.open_tabs.len()
+            };
+            self.open_tabs.get(next).cloned()
+        } else if key.len() == 1
+            && let Some(index @ 1..=9) = key.chars().next().and_then(|digit| digit.to_digit(10))
+        {
+            self.open_tabs.get((index - 1) as usize).cloned()
+        } else {
+            None
+        };
+        if let Some(id) = selection {
+            self.select_session(id);
+            cx.stop_propagation();
+            cx.notify();
+        } else if key == "w" && !self.active.is_empty() {
+            let id = self.active.clone();
+            self.close_tab(&id, cx);
+            cx.stop_propagation();
+        } else if key == "g" {
+            self.composer.focus_handle(cx).focus(window, cx);
+            cx.stop_propagation();
+        }
+    }
+
     fn active_directories(&self) -> Vec<String> {
         self.sessions
             .iter()
@@ -861,6 +1085,21 @@ impl Client {
             }
         })
         .detach();
+    }
+
+    fn act_on_tray(&mut self, inbox_id: String, request: InboxRequest, cx: &mut Context<Self>) {
+        if self.tray_in_flight.contains(&inbox_id) {
+            return;
+        }
+        if let Some(api) = &self.api {
+            api.send(Command::Inbox {
+                session_id: self.active.clone(),
+                inbox_id: inbox_id.clone(),
+                request,
+            });
+            self.tray_in_flight.insert(inbox_id);
+            cx.notify();
+        }
     }
 
     fn send_prompt(&mut self, queue: bool, cx: &mut Context<Self>) {
@@ -986,6 +1225,7 @@ impl Client {
                 }
                 if !data.retry_needed {
                     self.forms.clear();
+                    self.tray_in_flight.clear();
                 }
                 for pending in data.pending {
                     if let PendingRequest::Form(form) = pending {
@@ -1142,6 +1382,31 @@ impl Client {
                 }
                 Err(error) => self.connection_status = format!("Cancel failed: {error}"),
             },
+            UiEvent::InboxSettled {
+                session_id,
+                inbox_id,
+                request,
+                result,
+            } => {
+                self.tray_in_flight.remove(&inbox_id);
+                match tray::settlement(request, result) {
+                    tray::Settlement::Done => {}
+                    tray::Settlement::Reconcile => {
+                        if let Some(api) = &self.api {
+                            api.send(Command::LoadMessages {
+                                session_id,
+                                cursor: None,
+                            });
+                        }
+                    }
+                    tray::Settlement::Failed(error) => self.connection_status = error,
+                }
+            }
+            UiEvent::Aborted {
+                result: Err(error), ..
+            } => {
+                self.connection_status = format!("Stop failed: {error}");
+            }
             UiEvent::SessionInfoLoaded(info) => {
                 self.running_jobs.apply_session_info(info);
                 self.jobs = self.running_jobs.rows(Some(&self.active));
@@ -1401,8 +1666,10 @@ impl Client {
             next_session_request_id: 0,
             next_model_request_id: 0,
             pending_prompt: None,
+            tray_in_flight: HashSet::new(),
             clear_accepted_draft: None,
             modal,
+            picker_highlight: None,
             search: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(match modal {
                     Some(Modal::Model) => "Search models (fuzzy)…",
@@ -1415,11 +1682,17 @@ impl Client {
             rename: cx
                 .new(|cx| InputState::new(window, cx).default_value("Fix the attach clip padding")),
         };
-        cx.subscribe(&client.search, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })
+        cx.subscribe(
+            &client.search,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.picker_highlight = None;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => this.accept_modal_choice(cx),
+                _ => {}
+            },
+        )
         .detach();
         if settings_sessions {
             client.settings.tab = SettingsTab::Sessions;
@@ -1505,7 +1778,7 @@ impl Client {
             .get(&session.id)
             .is_some_and(RunStatus::is_busy);
         let unread = self.unread.contains(&session.id);
-        let has_jobs = selected || self.jobs.iter().any(|job| job.id == session.id);
+        let has_jobs = self.jobs.iter().any(|job| job.id == session.id);
         let dot_color = if busy {
             0xa46910
         } else if unread {
@@ -1775,51 +2048,75 @@ impl Client {
 
     fn form_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let notice = self.forms.notice(Some(&self.active), &HashMap::new())?;
-        let cancel = notice.cancel;
-        Some(
-            div()
-                .mx(px(16.))
-                .mb(px(8.))
-                .h(px(45.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(12.))
-                .rounded(px(9.))
-                .border_1()
-                .border_color(rgb(0xc8c3ba))
-                .bg(rgb(0xf5f3ef))
-                .child(
-                    div()
-                        .flex_1()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(0x98600f))
-                        .child(notice.text),
-                )
-                .child(div().text_color(rgb(0x4d5354)).child("Open web UI"))
-                .child(
-                    div()
-                        .id("cancel-form")
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let (Some(api), Some(target)) = (&this.api, &cancel) {
-                                api.send(Command::CancelForm {
-                                    form_id: target.form_id.clone(),
-                                    session_id: target.session_id.clone(),
-                                    directory: target.directory.clone(),
-                                });
-                            }
-                            cx.notify();
-                        }))
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(rgb(0xc8c3ba))
-                        .px(px(10.))
-                        .py(px(4.))
-                        .child("Cancel"),
-                )
-                .into_any_element(),
-        )
+        let mut bar = div()
+            .mx(px(16.))
+            .mb(px(8.))
+            .h(px(45.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(rgb(0xc8c3ba))
+            .bg(rgb(0xf5f3ef))
+            .child(
+                div()
+                    .flex_1()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0x98600f))
+                    .child(notice.text),
+            )
+            .child(div().text_color(rgb(0x4d5354)).child("Open web UI"));
+        if let Some(target) = notice.cancel {
+            bar = bar.child(
+                div()
+                    .id("cancel-form")
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(api) = &this.api {
+                            api.send(Command::CancelForm {
+                                form_id: target.form_id.clone(),
+                                session_id: target.session_id.clone(),
+                                directory: target.directory.clone(),
+                            });
+                        }
+                        cx.notify();
+                    }))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .px(px(10.))
+                    .py(px(4.))
+                    .child("Cancel"),
+            );
+        }
+        Some(bar.into_any_element())
+    }
+
+    fn working_pill(&self) -> Option<AnyElement> {
+        self.statuses
+            .get(&self.active)
+            .is_some_and(RunStatus::is_busy)
+            .then(|| {
+                div()
+                    .mx_auto()
+                    .mb(px(10.))
+                    .px(px(12.))
+                    .h(px(29.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .bg(rgb(0xfffdfa))
+                    .text_size(px(12.))
+                    .text_color(rgb(0x555b5c))
+                    .child("◌")
+                    .child("OpenCode is working")
+                    .into_any_element()
+            })
     }
 
     fn chat(&self, cx: &Context<Self>) -> AnyElement {
@@ -1886,6 +2183,154 @@ impl Client {
             .into_any_element()
     }
 
+    fn tray_view(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let items = self.conversations.get(&self.active)?.tray_items();
+        let rows = tray::tray_rows(&items, None, None, &self.tray_in_flight);
+        if rows.is_empty() {
+            return None;
+        }
+        let running = self
+            .statuses
+            .get(&self.active)
+            .is_some_and(RunStatus::is_busy);
+        let paused = !running;
+        let mut card = div()
+            .id("queue-tray")
+            .mx(px(16.))
+            .mb(px(6.))
+            .max_h(px(195.))
+            .overflow_y_scroll()
+            .p(px(5.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(rgb(0xc8c3ba))
+            .bg(rgb(0xf5f0e7))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(1.))
+                    .flex()
+                    .items_center()
+                    .when(paused, |header| {
+                        header.child(div().mr(px(5.)).text_color(rgb(0x858e8c)).child("▪"))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(FontWeight::BOLD)
+                            .child(tray::header_text(rows.len(), paused)),
+                    )
+                    .when_some(
+                        if paused {
+                            tray::resume_request(&rows)
+                        } else {
+                            None
+                        },
+                        |header, (id, request)| {
+                            header.child(
+                                div()
+                                    .id("resume-tray")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.act_on_tray(id.clone(), request, cx);
+                                    }))
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .rounded_full()
+                                    .bg(rgb(0xc59535))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0x252829))
+                                    .child("▶ Resume"),
+                            )
+                        },
+                    ),
+            );
+        for (group_index, group) in tray::tray_groups(&rows, running).into_iter().enumerate() {
+            card = card.child(
+                div()
+                    .id(format!("queue-group-{group_index}"))
+                    .pt(px(3.))
+                    .pl(px(11.))
+                    .border_t_1()
+                    .border_color(rgb(0xd8d1c6))
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(10.))
+                    .text_color(rgb(0x7c8582))
+                    .child(group.label),
+            );
+            for row in group.rows {
+                let switch = tray::row_request(&row, tray::RowAction::Switch, paused);
+                let cancel = tray::row_request(&row, tray::RowAction::Cancel, paused);
+                let badge = tray::badge_text(row.delivery);
+                let label = tray::switch_label(row.delivery);
+                let mut line = div()
+                    .px(px(8.))
+                    .py(px(2.))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(
+                        div()
+                            .px(px(7.))
+                            .py(px(0.))
+                            .rounded_full()
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(10.))
+                            .bg(rgb(if row.delivery == protocol::Delivery::Queue {
+                                0xe8e3d8
+                            } else {
+                                0xe8f2e8
+                            }))
+                            .child(badge),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(row.summary),
+                    );
+                if let Some(request) = switch {
+                    let id = row.id.clone();
+                    line = line.child(
+                        div()
+                            .id(format!("switch-waiting-{id}"))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.act_on_tray(id.clone(), request, cx);
+                            }))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(rgb(0xc8c3ba))
+                            .child(label),
+                    );
+                }
+                if let Some(request) = cancel {
+                    let id = row.id.clone();
+                    line = line.child(
+                        div()
+                            .id(format!("cancel-waiting-{id}"))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.act_on_tray(id.clone(), request, cx);
+                            }))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(rgb(0xc8c3ba))
+                            .child("×"),
+                    );
+                }
+                card = card.child(line);
+            }
+        }
+        Some(card.into_any_element())
+    }
+
     fn composer(&self, cx: &Context<Self>) -> AnyElement {
         let selected_model = self.selected_model();
         let model = selected_model
@@ -1904,11 +2349,19 @@ impl Client {
                     .conversations
                     .get(&self.active)
                     .and_then(Conversation::context_tokens)
-                    .unwrap_or(if self.api.is_none() { 13_400 } else { 0 });
+                    .unwrap_or(if self.api.is_none() && self.active == "ses_preview" {
+                        13_400
+                    } else {
+                        0
+                    });
                 model::format_context_usage(used, limit)
             })
             .unwrap_or_default();
         let model = model.map_or("Choose model".to_owned(), |model| model.label.clone());
+        let running = self
+            .statuses
+            .get(&self.active)
+            .is_some_and(RunStatus::is_busy);
         let mut files = div().px(px(13.)).flex().gap(px(7.));
         for (index, path) in self.attachments_draft.iter().enumerate() {
             let target = path.clone();
@@ -1971,7 +2424,18 @@ impl Client {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Model, window, cx);
                             }))
-                            .child(model),
+                            .max_w(px(160.))
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(model),
+                            )
+                            .child("⌄"),
                     )
                     .child(
                         div()
@@ -1988,7 +2452,37 @@ impl Client {
                             )),
                     )
                     .child(div().flex_1())
-                    .child(context)
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x858e8c))
+                            .child(context),
+                    )
+                    .when(running, |footer| {
+                        footer.child(
+                            div()
+                                .id("stop-run")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(api) = &this.api {
+                                        api.send(Command::Abort {
+                                            session_id: this.active.clone(),
+                                        });
+                                    }
+                                    cx.notify();
+                                }))
+                                .w(px(32.))
+                                .h(px(32.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(rgb(0x555b5c))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child("■"),
+                        )
+                    })
                     .child(
                         div()
                             .id("send-prompt")
@@ -2182,7 +2676,9 @@ impl Client {
                         .iter()
                         .filter(|session| session.title.to_lowercase().contains(&query))
                         .take(8)
+                        .enumerate()
                     {
+                        let (index, session) = session;
                         let selected = session.id == self.active;
                         let id = session.id.clone();
                         card = card.child(
@@ -2194,7 +2690,11 @@ impl Client {
                                 .flex()
                                 .items_center()
                                 .rounded(px(6.))
-                                .bg(rgb(if selected { 0xf1efec } else { 0xffffff }))
+                                .bg(rgb(if self.picker_highlight == Some(index) || selected {
+                                    0xf1efec
+                                } else {
+                                    0xffffff
+                                }))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_session(id.clone());
@@ -2221,15 +2721,20 @@ impl Client {
                         .child("↑ ↓ navigate     ↵ switch                                      esc close"));
                 } else {
                     let query = self.search.read(cx).value().to_lowercase();
-                    for project in self.projects.iter().filter(|project| {
-                        project.worktree.to_lowercase().contains(&query)
-                            || project
-                                .name
-                                .as_deref()
-                                .unwrap_or("")
-                                .to_lowercase()
-                                .contains(&query)
-                    }) {
+                    for (index, project) in self
+                        .projects
+                        .iter()
+                        .filter(|project| {
+                            project.worktree.to_lowercase().contains(&query)
+                                || project
+                                    .name
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .to_lowercase()
+                                    .contains(&query)
+                        })
+                        .enumerate()
+                    {
                         let directory = project.worktree.clone();
                         let label = project.name.clone().unwrap_or_else(|| {
                             project
@@ -2252,7 +2757,11 @@ impl Client {
                                 .flex()
                                 .items_center()
                                 .rounded(px(6.))
-                                .bg(rgb(0xece9e2))
+                                .bg(rgb(if self.picker_highlight.is_none_or(|at| at == index) {
+                                    0xece9e2
+                                } else {
+                                    0xffffff
+                                }))
                                 .font_weight(FontWeight::BOLD)
                                 .child(div().flex_1().child(label))
                                 .child(
@@ -2603,7 +3112,9 @@ impl Client {
                                 || option.model_id.to_lowercase().contains(&query)
                         })
                         .take(7)
+                        .enumerate()
                     {
+                        let (index, option) = option;
                         let selected = self.selected_model().as_ref().is_some_and(|preferred| {
                             preferred.provider_id == option.provider_id
                                 && preferred.model_id == option.model_id
@@ -2623,7 +3134,11 @@ impl Client {
                                 .h(px(52.))
                                 .px(px(14.))
                                 .rounded(px(5.))
-                                .bg(rgb(if selected { 0xece9e2 } else { 0xfffdfa }))
+                                .bg(rgb(if selected || self.picker_highlight == Some(index) {
+                                    0xece9e2
+                                } else {
+                                    0xfffdfa
+                                }))
                                 .flex()
                                 .items_center()
                                 .child(
@@ -2654,11 +3169,18 @@ impl Client {
                         .map(|option| option.variants.clone())
                         .unwrap_or_default();
                     let query = self.search.read(cx).value().to_lowercase();
-                    for variant in std::iter::once(None).chain(variants.into_iter().map(Some)) {
+                    for (index, variant) in std::iter::once(None)
+                        .chain(variants.into_iter().map(Some))
+                        .filter(|variant| {
+                            variant
+                                .as_deref()
+                                .unwrap_or("Default")
+                                .to_lowercase()
+                                .contains(&query)
+                        })
+                        .enumerate()
+                    {
                         let level = variant.as_deref().unwrap_or("Default");
-                        if !level.to_lowercase().contains(&query) {
-                            continue;
-                        }
                         let selected = chosen
                             .as_ref()
                             .is_some_and(|selection| selection.variant == variant);
@@ -2680,8 +3202,18 @@ impl Client {
                                 .px(px(12.))
                                 .flex()
                                 .items_center()
-                                .bg(rgb(if selected { 0x3584df } else { 0xfffdfa }))
-                                .text_color(rgb(if selected { 0xffffff } else { 0x252829 }))
+                                .bg(rgb(if selected || self.picker_highlight == Some(index) {
+                                    0x3584df
+                                } else {
+                                    0xfffdfa
+                                }))
+                                .text_color(rgb(
+                                    if selected || self.picker_highlight == Some(index) {
+                                        0xffffff
+                                    } else {
+                                        0x252829
+                                    },
+                                ))
                                 .child(div().flex_1().child(level.to_owned()))
                                 .child(if selected { "✓" } else { "" }),
                         );
@@ -2729,8 +3261,10 @@ impl Render for Client {
             }
         }
         div()
+            .id("app-root")
             .size_full()
             .relative()
+            .on_key_down(cx.listener(Self::handle_key_down))
             .flex()
             .flex_col()
             .font_family("Noto Sans")
@@ -2792,7 +3326,9 @@ impl Render for Client {
                             .when_some(self.overlay.as_ref(), |view, overlay| {
                                 view.child(overlay.clone())
                             })
+                            .when_some(self.working_pill(), |view, pill| view.child(pill))
                             .when_some(self.form_notice(cx), |view, notice| view.child(notice))
+                            .when_some(self.tray_view(cx), |view, tray| view.child(tray))
                             .child(self.composer(cx)),
                     ),
             )
