@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Inspect the GPUI Wayland application's platform AT-SPI tree in an isolated
 # session bus and nested Weston/Xvfb, without touching the host desktop.
-# Docker prerequisites (install in a disposable container):
-#   apt-get update && apt-get install -y --no-install-recommends at-spi2-core python3-pyatspi
+# The GPUI builder image includes at-spi2-core and python3-pyatspi:
 #   ACCESSIBILITY_BINARY=target/debug/opencode-gpui bash tests/accessibility-ui.sh
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -76,11 +75,17 @@ for attempt in range(60):
               if len(matches) == 1 else [])
     entries = ([child for child in frames[0] if child.getRoleName() == 'entry']
                if len(frames) == 1 else [])
-    if len(entries) == 1 and entries[0].name == 'Ask OpenCode anything…':
+    session_buttons = ([child for child in frames[0]
+                        if child.getRoleName() == 'push button'
+                        and child.name.startswith('Open session: ')]
+                       if len(frames) == 1 else [])
+    if (len(entries) == 1 and entries[0].name == 'Ask OpenCode anything…'
+            and len(session_buttons) >= 5):
         break
     time.sleep(0.3)
 else:
-    print('Timed out waiting for the named GPUI composer in AT-SPI', file=sys.stderr)
+    print('Timed out waiting for the named GPUI composer and session buttons in AT-SPI',
+          file=sys.stderr)
     for app in apps:
         walk(app)
     sys.exit(1)

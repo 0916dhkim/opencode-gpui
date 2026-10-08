@@ -2,11 +2,9 @@
 # Headless check that the OpenCode password saved in Settings lives in a real Secret Service
 # (gnome-keyring) and survives app and keyring-daemon restarts, and that the client still starts
 # and connects when no Secret Service is running. Run it only headless (never on a live desktop);
-# it needs gnome-keyring-daemon and secret-tool, which the builder image lacks:
+# the GPUI builder image includes gnome-keyring-daemon and secret-tool:
 #   docker run --rm --platform linux/amd64 -v "$PWD":/app -w /app \
-#     opencode-gpui-builder-amd64:latest bash -c 'apt-get update -qq &&
-#       apt-get install -y -qq --no-install-recommends gnome-keyring libsecret-tools &&
-#       bash tests/keyring-ui.sh'
+#     opencode-gpui-builder-amd64:latest bash tests/keyring-ui.sh
 # The script starts isolated Weston/Xvfb; without a session bus it re-runs under
 # dbus-run-session. KEYRING_BINARY=path skips the build; KEYRING_TIMEOUT=15 bounds each wait.
 set -uo pipefail

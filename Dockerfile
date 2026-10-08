@@ -2,14 +2,17 @@ FROM rust:bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        at-spi2-core \
         cmake \
         fonts-noto-core \
+        gnome-keyring \
         libdbus-1-dev \
         libexpat1-dev \
         libfontconfig1-dev \
         libfreetype6-dev \
         libgl1-mesa-dev \
         libssl-dev \
+        libsecret-tools \
         libwebkit2gtk-4.1-dev \
         libxkbcommon-dev \
         libxkbcommon-x11-dev \
@@ -20,6 +23,7 @@ RUN apt-get update \
         mesa-vulkan-drivers \
         openbox \
         picom \
+        python3-pyatspi \
         vulkan-tools \
         weston \
         xvfb \
