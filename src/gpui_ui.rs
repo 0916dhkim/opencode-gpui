@@ -122,6 +122,43 @@ fn filter_tab_sessions<'a>(sessions: &'a [Session], query: &str) -> Vec<&'a Sess
         .collect()
 }
 
+fn filter_all_sessions<'a>(sessions: &'a [Session], query: &str) -> Vec<&'a Session> {
+    let query = query.trim();
+    let mut scored: Vec<_> = sessions
+        .iter()
+        .filter_map(|session| {
+            let score = if query.is_empty() {
+                Some(0)
+            } else {
+                match (
+                    fuzzy_score(query, &session.title),
+                    fuzzy_score(query, &session.directory),
+                ) {
+                    (Some(title), Some(directory)) => Some(title.max(directory)),
+                    (title, directory) => title.or(directory),
+                }
+            };
+            score.map(|score| (score, session.time.updated, session))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        if query.is_empty() {
+            b.1.cmp(&a.1)
+        } else {
+            b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1))
+        }
+    });
+    scored
+        .into_iter()
+        .take(SESSION_PICKER_LIMIT)
+        .map(|(_, _, session)| session)
+        .collect()
+}
+
+fn needs_new_connection(current: &ApiConfig, candidate: &ApiConfig, connected: bool) -> bool {
+    !connected || current != candidate
+}
+
 fn filter_models<'a>(models: &'a [model::ModelOption], query: &str) -> Vec<&'a model::ModelOption> {
     let query = query.trim();
     let mut scored: Vec<_> = models
@@ -358,6 +395,9 @@ struct Client {
     permission_focus: [FocusHandle; 3],
     permission_presented: bool,
     settings_tab_focus: [FocusHandle; 2],
+    settings_session_focus: HashMap<String, FocusHandle>,
+    settings_sessions_scroll: ScrollHandle,
+    settings_highlight: Option<usize>,
     child_parents: HashMap<String, String>,
     next_prompt_request_id: u64,
     next_session_request_id: u64,
@@ -395,6 +435,44 @@ struct SettingsFields {
 }
 
 impl SettingsFields {
+    fn reset_draft(&mut self, window: &mut Window, cx: &mut Context<Client>) {
+        let server = self.current.base_url.clone();
+        let username = self.current.username.clone();
+        let client_id = self
+            .current
+            .cloudflare_access
+            .as_ref()
+            .map_or(String::new(), |token| token.client_id.clone());
+        let password_hint = if self.persisted.connection.basic_auth_in_keyring {
+            "Stored in the system keyring"
+        } else if self.current.password.is_some() {
+            "Leave blank to keep the current password"
+        } else {
+            "Required by OpenCode 2.x"
+        };
+        let secret_hint = if self.current.cloudflare_access.is_some() {
+            "Stored in the system keyring"
+        } else {
+            "Optional"
+        };
+        self.server
+            .update(cx, |input, cx| input.set_value(server, window, cx));
+        self.username
+            .update(cx, |input, cx| input.set_value(username, window, cx));
+        self.client_id
+            .update(cx, |input, cx| input.set_value(client_id, window, cx));
+        self.password.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.set_placeholder(password_hint, window, cx);
+        });
+        self.client_secret.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.set_placeholder(secret_hint, window, cx);
+        });
+        self.remember_password = true;
+        self.error = None;
+    }
+
     fn new(
         window: &mut Window,
         cx: &mut Context<Client>,
@@ -1061,6 +1139,9 @@ impl Client {
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: false,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            settings_session_focus: HashMap::new(),
+            settings_sessions_scroll: ScrollHandle::new(),
+            settings_highlight: None,
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
@@ -1116,8 +1197,11 @@ impl Client {
         .detach();
         cx.subscribe(
             &client.settings.session_search,
-            |_, _, event: &InputEvent, cx| {
+            |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.settings_highlight = None;
+                    this.settings_sessions_scroll
+                        .set_offset(point(px(0.), px(0.)));
                     cx.notify();
                 }
             },
@@ -1479,15 +1563,16 @@ impl Client {
         cx.notify();
     }
 
-    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+    fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.preview_api {
+            self.settings.reset_draft(window, cx);
             self.modal = None;
             cx.notify();
             return;
         }
         match self.apply_settings_inner(cx) {
             Ok(()) => {
-                self.settings.error = None;
+                self.settings.reset_draft(window, cx);
                 self.modal = None;
             }
             Err(error) => self.settings.error = Some(error.to_string()),
@@ -1573,8 +1658,15 @@ impl Client {
             password: password_plan.password.clone(),
             cloudflare_access: cloudflare_access.clone(),
         };
-        // Open the new connection before writing any credential under its identity.
-        let (api, receiver, key) = ApiHandle::start(config.clone())?;
+        // When transport settings change, open the replacement before writing
+        // credentials under its identity. An unchanged config must not tear
+        // down the current transcript, tabs, drafts, or SSE connection.
+        let next_connection =
+            if needs_new_connection(&self.settings.current, &config, self.api.is_some()) {
+                Some(ApiHandle::start(config.clone())?)
+            } else {
+                None
+            };
         if let Some(token) = &cloudflare_access {
             credentials::save(&server, token)?;
         } else if old.cloudflare_access.is_some() && old.base_url.trim_end_matches('/') == server {
@@ -1593,11 +1685,18 @@ impl Client {
             basic_auth_in_keyring: stored,
         };
         persisted.save(&persist::default_path())?;
+        self.settings.persisted = persisted.clone();
+        self.settings.current = config;
+        if next_connection.is_none() {
+            if let Some(warning) = warning {
+                self.connection_status = format!("Connected · {warning}");
+            }
+            return Ok(());
+        }
+        let (api, receiver, key) = next_connection.expect("new connection was started");
         self.connection_generation += 1;
         let generation = self.connection_generation;
         self.api = Some(api);
-        self.settings.persisted = persisted.clone();
-        self.settings.current = config;
         self.connection_status = warning.map_or_else(
             || "Connecting".into(),
             |warning| format!("Connecting · {warning}"),
@@ -1713,10 +1812,21 @@ impl Client {
                 self.rename.focus_handle(cx).focus(window, cx);
             }
             Modal::Settings => {
-                self.settings.server.focus_handle(cx).focus(window, cx);
-                self.settings
-                    .server
-                    .update(cx, |input, cx| input.select_all(window, cx));
+                self.settings.reset_draft(window, cx);
+                self.settings_highlight = None;
+                if self.settings.tab == SettingsTab::Sessions {
+                    self.settings_sessions_scroll
+                        .set_offset(point(px(0.), px(0.)));
+                    self.settings
+                        .session_search
+                        .focus_handle(cx)
+                        .focus(window, cx);
+                } else {
+                    self.settings.server.focus_handle(cx).focus(window, cx);
+                    self.settings
+                        .server
+                        .update(cx, |input, cx| input.select_all(window, cx));
+                }
             }
         }
         cx.notify();
@@ -1839,7 +1949,10 @@ impl Client {
                 cx.stop_propagation();
                 return;
             }
-            if self.modal.take().is_some() {
+            if let Some(modal) = self.modal.take() {
+                if modal == Modal::Settings {
+                    self.settings.reset_draft(window, cx);
+                }
                 self.rename_target = None;
                 self.composer.focus_handle(cx).focus(window, cx);
                 cx.stop_propagation();
@@ -1882,6 +1995,94 @@ impl Client {
             self.rename_session(cx);
             cx.stop_propagation();
             return;
+        }
+        if matches!(key.as_str(), "enter" | "return")
+            && self.modal == Some(Modal::Settings)
+            && self.settings.tab == SettingsTab::Connection
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.shift
+        {
+            let field_focused = [
+                &self.settings.server,
+                &self.settings.username,
+                &self.settings.password,
+                &self.settings.client_id,
+                &self.settings.client_secret,
+            ]
+            .iter()
+            .any(|input| input.focus_handle(cx).is_focused(window));
+            if modifiers.control || field_focused {
+                self.apply_settings(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if self.modal == Some(Modal::Settings)
+            && self.settings.tab == SettingsTab::Sessions
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.shift
+        {
+            let search_focused = self
+                .settings
+                .session_search
+                .focus_handle(cx)
+                .is_focused(window);
+            let query = self.settings.session_search.read(cx).value();
+            let choices = filter_all_sessions(&self.sessions, &query);
+            let row_focused = self
+                .settings_session_focus
+                .values()
+                .any(|focus| focus.is_focused(window));
+            if !choices.is_empty() && (search_focused || row_focused) {
+                if matches!(key.as_str(), "enter" | "return") {
+                    let index = if search_focused {
+                        0
+                    } else {
+                        self.settings_highlight.unwrap_or_default()
+                    };
+                    self.select_session(choices[index.min(choices.len() - 1)].id.clone());
+                    self.modal = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if key == "down" || (key == "up" && !search_focused) {
+                    let next = if search_focused {
+                        Some(0)
+                    } else if key == "up" && self.settings_highlight == Some(0) {
+                        None
+                    } else if key == "up" {
+                        Some(
+                            self.settings_highlight
+                                .unwrap_or_default()
+                                .saturating_sub(1),
+                        )
+                    } else {
+                        Some(
+                            (self.settings_highlight.unwrap_or_default() + 1)
+                                .min(choices.len() - 1),
+                        )
+                    };
+                    self.settings_highlight = next;
+                    if let Some(index) = next {
+                        self.settings_sessions_scroll.scroll_to_item(index);
+                        if let Some(focus) = self.settings_session_focus.get(&choices[index].id) {
+                            focus.focus(window, cx);
+                        }
+                    } else {
+                        self.settings
+                            .session_search
+                            .focus_handle(cx)
+                            .focus(window, cx);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+            }
         }
         if matches!(key.as_str(), "up" | "down") && self.modal_choice_count(cx) > 0 {
             let len = self.modal_choice_count(cx);
@@ -2984,6 +3185,9 @@ impl Client {
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: false,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            settings_session_focus: HashMap::new(),
+            settings_sessions_scroll: ScrollHandle::new(),
+            settings_highlight: None,
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
@@ -3043,8 +3247,11 @@ impl Client {
         }
         cx.subscribe(
             &client.settings.session_search,
-            |_, _, event: &InputEvent, cx| {
+            |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.settings_highlight = None;
+                    this.settings_sessions_scroll
+                        .set_offset(point(px(0.), px(0.)));
                     cx.notify();
                 }
             },
@@ -4572,43 +4779,65 @@ impl Client {
             .into_any_element()
     }
 
-    fn settings_sessions_body(&self, cx: &Context<Self>) -> AnyElement {
-        let query = self.settings.session_search.read(cx).value().to_lowercase();
-        let mut rows = div().px(px(21.)).flex().flex_col().gap(px(7.));
-        let mut shown = 0;
-        for session in self
-            .sessions
-            .iter()
-            .filter(|session| {
-                query.is_empty()
-                    || session.title.to_lowercase().contains(&query)
-                    || session.directory.to_lowercase().contains(&query)
-            })
-            .take(50)
-        {
-            shown += 1;
+    fn settings_sessions_body(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let query = self.settings.session_search.read(cx).value();
+        let search_focused = self
+            .settings
+            .session_search
+            .focus_handle(cx)
+            .is_focused(window);
+        let choices = filter_all_sessions(&self.sessions, &query);
+        let shown = choices.len();
+        let mut rows = div()
+            .id("settings-sessions-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.settings_sessions_scroll)
+            .px(px(21.))
+            .flex()
+            .flex_col()
+            .gap(px(7.));
+        for (index, session) in choices.into_iter().enumerate() {
             let id = session.id.clone();
+            let key_id = id.clone();
             let open = self.open_tabs.contains(&id);
+            let highlighted = open || self.settings_highlight == Some(index);
             rows = rows.child(
                 div()
                     .id(format!("settings-session-{id}"))
+                    .role(Role::Button)
+                    .aria_label(format!("Open session {}", session.title))
+                    .track_focus(self.settings_session_focus.get(&id).expect("session focus"))
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_session(id.clone());
                         this.modal = None;
                         cx.notify();
                     }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(
+                            event.keystroke.key.to_ascii_lowercase().as_str(),
+                            "enter" | "return" | "space"
+                        ) {
+                            this.select_session(key_id.clone());
+                            this.modal = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
                     .px(px(14.))
                     .py(px(8.))
                     .rounded(px(7.))
                     .border_1()
                     .border_color(self.tone(
-                        if open { 0xcbbba4 } else { 0xded8cb },
-                        if open { 0x3c4a5f } else { 0x242a34 },
+                        if highlighted { 0xcbbba4 } else { 0xded8cb },
+                        if highlighted { 0x3c4a5f } else { 0x242a34 },
                     ))
                     .bg(self.tone(
-                        if open { 0xf3ede3 } else { 0xfffdfa },
-                        if open { 0x222b38 } else { 0x1a1f26 },
+                        if highlighted { 0xf3ede3 } else { 0xfffdfa },
+                        if highlighted { 0x222b38 } else { 0x1a1f26 },
                     ))
                     .child(
                         div()
@@ -4697,22 +4926,24 @@ impl Client {
                     .items_center()
                     .rounded(px(5.))
                     .border_1()
-                    .border_color(self.tone(0x4f99ee, 0x3b82f6))
-                    .child("⌕")
+                    .border_color(if search_focused {
+                        self.tone(0x4f99ee, 0x3b82f6)
+                    } else {
+                        self.tone(0xd3cec5, 0x262c36)
+                    })
+                    .child(
+                        Icon::default()
+                            .data(include_bytes!("icons/search.svg"))
+                            .with_size(px(16.))
+                            .text_color(self.tone(0x8b918e, 0x71717a)),
+                    )
                     .child(Input::new(&self.settings.session_search).appearance(false)),
             )
-            .child(
-                div()
-                    .id("settings-sessions-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(rows),
-            )
+            .child(rows)
             .into_any_element()
     }
 
-    fn modal_view(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    fn modal_view(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal?;
         let backdrop = div()
             .id("modal-backdrop")
@@ -4726,8 +4957,11 @@ impl Client {
             .items_center()
             .justify_center()
             .bg(rgba(if self.dark { 0x000000a6 } else { 0x00000066 }))
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 if !(this.modal == Some(Modal::Rename) && this.rename_pending.is_some()) {
+                    if this.modal == Some(Modal::Settings) {
+                        this.settings.reset_draft(window, cx);
+                    }
                     this.modal = None;
                     this.rename_target = None;
                     this.rename_error = None;
@@ -5080,6 +5314,7 @@ impl Client {
                     .gap(px(9.))
                     .bg(self.tone(0xfffdfa, 0x15181b));
                 for (index, (label, input)) in fields.into_iter().enumerate() {
+                    let focused = input.focus_handle(cx).is_focused(window);
                     if index == 3 {
                         content = content.child(
                             div()
@@ -5099,8 +5334,8 @@ impl Client {
                             .rounded(px(5.))
                             .border_1()
                             .border_color(self.tone(
-                                if index == 0 { 0x4f99ee } else { 0xd3cec5 },
-                                if index == 0 { 0x3b82f6 } else { 0x262c36 },
+                                if focused { 0x4f99ee } else { 0xd3cec5 },
+                                if focused { 0x3b82f6 } else { 0x262c36 },
                             ))
                             .bg(self.tone(0xffffff, 0x2e2e2e))
                             .text_color(self.tone(0x5a6261, 0xf0ede7))
@@ -5196,7 +5431,7 @@ impl Client {
                         .child(content)
                         .into_any_element()
                 } else {
-                    self.settings_sessions_body(cx)
+                    self.settings_sessions_body(window, cx)
                 };
                 div()
                     .w(px(820.))
@@ -5287,6 +5522,9 @@ impl Client {
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.settings.tab = SettingsTab::Sessions;
+                                        this.settings_highlight = None;
+                                        this.settings_sessions_scroll
+                                            .set_offset(point(px(0.), px(0.)));
                                         this.settings
                                             .session_search
                                             .focus_handle(cx)
@@ -5336,7 +5574,14 @@ impl Client {
                                     .gap(px(2.))
                                     .text_size(px(10.))
                                     .text_color(self.tone(0x929a9a, 0x6a7482))
-                                    .child("127.0.0.1")
+                                    .child(
+                                        url::Url::parse(&self.settings.current.base_url)
+                                            .ok()
+                                            .and_then(|url| url.host_str().map(str::to_owned))
+                                            .unwrap_or_else(|| {
+                                                self.settings.current.base_url.clone()
+                                            }),
+                                    )
                                     .child("opencode-gpui v0.1.0"),
                             ),
                     )
@@ -5366,7 +5611,8 @@ impl Client {
                                     div()
                                         .id("settings-cancel")
                                         .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.settings.reset_draft(window, cx);
                                             this.modal = None;
                                             cx.notify();
                                         }))
@@ -5389,8 +5635,8 @@ impl Client {
                                         div()
                                             .id("settings-apply")
                                             .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.apply_settings(cx);
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.apply_settings(window, cx);
                                             }))
                                             .px(px(14.))
                                             .py(px(7.))
@@ -5641,6 +5887,19 @@ impl Render for Client {
                 .entry(id.clone())
                 .or_insert_with(|| std::array::from_fn(|_| cx.focus_handle().tab_stop(true)));
         }
+        if self.modal == Some(Modal::Settings) && self.settings.tab == SettingsTab::Sessions {
+            let query = self.settings.session_search.read(cx).value();
+            let ids: Vec<_> = filter_all_sessions(&self.sessions, &query)
+                .into_iter()
+                .map(|session| session.id.clone())
+                .collect();
+            self.settings_session_focus.retain(|id, _| ids.contains(id));
+            for id in ids {
+                self.settings_session_focus
+                    .entry(id)
+                    .or_insert_with(|| cx.focus_handle().tab_stop(true));
+            }
+        }
         let mut deferred = Vec::new();
         for (id, text, attachments) in std::mem::take(&mut self.clear_accepted_drafts) {
             if self.active == id {
@@ -5750,7 +6009,7 @@ impl Render for Client {
                             .child(composer_slot),
                     ),
             )
-            .when_some(self.modal_view(cx), |view, modal| view.child(modal));
+            .when_some(self.modal_view(window, cx), |view, modal| view.child(modal));
         root.when_some(row_probe, |view, probe| view.child(probe))
     }
 }
@@ -5795,9 +6054,10 @@ mod tests {
     use super::{
         Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
         TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, VirtualListScrollHandle,
-        filter_levels, filter_models, filter_new_session_projects, filter_tab_sessions,
-        fuzzy_score, inline_image, markdown_blocks, model, new_session_choice, picker_list_height,
-        reorder_tab_ids, sticky_user_index, tab_indicator, tab_number_key,
+        filter_all_sessions, filter_levels, filter_models, filter_new_session_projects,
+        filter_tab_sessions, fuzzy_score, inline_image, markdown_blocks, model,
+        needs_new_connection, new_session_choice, picker_list_height, reorder_tab_ids,
+        sticky_user_index, tab_indicator, tab_number_key,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -6854,6 +7114,190 @@ mod tests {
             "ses_209"
         );
         assert!(filter_tab_sessions(&sessions, "zqx").is_empty());
+    }
+
+    #[test]
+    fn all_sessions_fuzzy_ranks_by_score_then_recency_with_gtk_limit() {
+        let sessions: Vec<_> = (0..205)
+            .map(|index| model::Session {
+                id: format!("session-{index}"),
+                directory: format!("/work/project-{index}"),
+                title: if index == 1 || index == 2 {
+                    "Alpha session".into()
+                } else {
+                    format!("Session {index}")
+                },
+                time: model::SessionTime {
+                    created: index as u64,
+                    updated: index as u64,
+                    archived: None,
+                },
+                parent_id: None,
+                model: None,
+            })
+            .collect();
+        let all = filter_all_sessions(&sessions, "");
+        assert_eq!(all.len(), SESSION_PICKER_LIMIT);
+        assert_eq!(all[0].id, "session-204");
+        assert_eq!(all.last().unwrap().id, "session-5");
+        let alpha = filter_all_sessions(&sessions, "alps");
+        assert_eq!(
+            alpha
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-2", "session-1"]
+        );
+        assert_eq!(
+            filter_all_sessions(&sessions, "project-187")[0].id,
+            "session-187"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn settings_sessions_keyboard_focuses_and_scrolls_to_offscreen_result(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("settings".into())))
+            })
+            .expect("headless settings window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                for index in 0..70 {
+                    let mut session = client.sessions[0].clone();
+                    session.id = format!("settings-extra-{index:02}");
+                    session.title = format!("Extra {index}");
+                    session.time.updated = index as u64 + 10_000;
+                    client.sessions.push(session);
+                }
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-tab-sessions", cx);
+            window.render_frame(cx);
+            assert!(
+                client
+                    .read(cx)
+                    .settings
+                    .session_search
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            window.press("down", cx);
+            assert_eq!(client.read(cx).settings_highlight, Some(0));
+            let first_id = filter_all_sessions(&client.read(cx).sessions, "")[0]
+                .id
+                .clone();
+            assert!(client.read(cx).settings_session_focus[&first_id].is_focused(window));
+            window.press("up", cx);
+            assert!(client.read(cx).settings_highlight.is_none());
+            assert!(
+                client
+                    .read(cx)
+                    .settings
+                    .session_search
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            for _ in 0..35 {
+                window.press("down", cx);
+            }
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).settings_highlight, Some(34));
+            assert!(client.read(cx).settings_sessions_scroll.offset().y < px(0.));
+            let expected = filter_all_sessions(&client.read(cx).sessions, "")[34]
+                .id
+                .clone();
+            window.press("enter", cx);
+            assert!(client.read(cx).modal.is_none());
+            assert_eq!(client.read(cx).active, expected);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn unchanged_connection_does_not_discard_the_live_client() {
+        let current = super::ApiConfig {
+            base_url: "http://127.0.0.1:4096".into(),
+            username: "opencode".into(),
+            password: Some("local test".into()),
+            cloudflare_access: None,
+        };
+        assert!(!needs_new_connection(&current, &current, true));
+        assert!(needs_new_connection(&current, &current, false));
+        let mut changed = current.clone();
+        changed.password = Some("another local test".into());
+        assert!(needs_new_connection(&current, &changed, true));
+    }
+
+    #[gpui_kit::test]
+    fn settings_cancel_discards_draft_secrets_and_enter_applies(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("settings".into())))
+            })
+            .expect("headless settings window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let original = client.read(cx).settings.current.base_url.clone();
+            client.update(cx, |client, cx| {
+                client.settings.server.update(cx, |input, cx| {
+                    input.set_value("https://discard.test", window, cx)
+                });
+                client.settings.password.update(cx, |input, cx| {
+                    input.set_value("discarded test value", window, cx)
+                });
+                client.settings.client_secret.update(cx, |input, cx| {
+                    input.set_value("discarded token value", window, cx)
+                });
+                client.settings.remember_password = false;
+            });
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.press("escape", cx);
+            assert!(client.read(cx).modal.is_none());
+            assert_eq!(
+                client.read(cx).settings.server.read(cx).value().as_ref(),
+                original
+            );
+            assert_eq!(
+                client.read(cx).settings.password.read(cx).value().as_ref(),
+                ""
+            );
+            assert_eq!(
+                client
+                    .read(cx)
+                    .settings
+                    .client_secret
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+                ""
+            );
+            assert!(client.read(cx).settings.remember_password);
+            client.update(cx, |client, cx| {
+                client.preview_api = true;
+                client.show_modal(Modal::Settings, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(
+                client
+                    .read(cx)
+                    .settings
+                    .server
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            window.press("enter", cx);
+            assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
     }
 
     #[test]
