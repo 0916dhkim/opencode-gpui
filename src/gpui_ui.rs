@@ -4984,6 +4984,11 @@ mod tests {
     fn detached_row_layout_matches_mounted_bounds_at_two_widths(cx: &mut TestAppContext) {
         let rows = [
             model::TranscriptRow {
+                key: model::TranscriptRowKey {
+                    message_id: "layout_prose".into(),
+                    slot: model::TranscriptRowSlot::NormalAfter(None),
+                },
+                render_revision: 0,
                 role: model::Role::Assistant,
                 body: "A wrapped paragraph with **emphasis**, `inline code`, and enough words to change line breaks between narrow and wide transcript viewports. The same Markdown element must determine both the offscreen height and the mounted height. This continuation makes the narrow case wrap another time.".into(),
                 images: vec![],
@@ -4991,6 +4996,11 @@ mod tests {
                 kind: model::TranscriptRowKind::Normal,
             },
             model::TranscriptRow {
+                key: model::TranscriptRowKey {
+                    message_id: "layout_code".into(),
+                    slot: model::TranscriptRowSlot::NormalAfter(None),
+                },
+                render_revision: 0,
                 role: model::Role::Assistant,
                 body: "# Code example\n\n```rust\nfn example() {\n    println!(\"a line of code longer than the available space in the narrow transcript\");\n}\n```\n\n- First list item with enough text to wrap when the viewport is narrow.\n- Second item".into(),
                 images: vec![],
@@ -4998,6 +5008,11 @@ mod tests {
                 kind: model::TranscriptRowKind::Normal,
             },
             model::TranscriptRow {
+                key: model::TranscriptRowKey {
+                    message_id: "layout_image".into(),
+                    slot: model::TranscriptRowSlot::NormalAfter(None),
+                },
+                render_revision: 0,
                 role: model::Role::User,
                 body: "This user message includes an image and text that wraps at the narrower width, making the thumbnail part of a variable-height row.".into(),
                 images: vec!["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==".into()],

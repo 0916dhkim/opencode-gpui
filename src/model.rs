@@ -325,6 +325,9 @@ pub struct Segment {
     pub key: String,
     pub kind: SegmentKind,
     pub text: String,
+    /// Maintained as fragments stream, so blank-only updates do not require
+    /// rescanning the accumulated text to decide whether a row changed.
+    visible: bool,
     pub image_url: Option<String>,
     pub created: u64,
     /// A tool segment's structured state; `text` is always rendered from it
@@ -334,10 +337,12 @@ pub struct Segment {
 
 impl Segment {
     fn text(key: String, kind: SegmentKind, text: String, created: u64) -> Self {
+        let visible = !text.trim().is_empty();
         Self {
             key,
             kind,
             text,
+            visible,
             image_url: None,
             created,
             tool: None,
@@ -357,6 +362,7 @@ pub struct ChatMessage {
     pub id: String,
     pub role: Role,
     pub created: u64,
+    render_revision: u64,
     segments: Vec<Segment>,
     error: Option<String>,
     context_tokens: Option<u64>,
@@ -371,6 +377,61 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    fn bump_render_revision(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
+    }
+
+    fn has_timestamped_row(&self) -> bool {
+        self.error.is_some()
+            || self.segments.iter().any(|segment| {
+                segment.visible
+                    && (matches!(segment.kind, SegmentKind::Text | SegmentKind::File)
+                        || segment.created == 0)
+            })
+    }
+
+    /// Full-content and note replacements are already proportional to their
+    /// input. Compare just the projected segment fields, not tool metadata or
+    /// token usage; streaming deltas use the constant-time paths below.
+    fn same_visible_segments(left: &[Segment], right: &[Segment]) -> bool {
+        fn visible_segments(segments: &[Segment]) -> impl Iterator<Item = &Segment> {
+            segments.iter().filter(|segment| {
+                segment.visible
+                    || segment.image_url.is_some()
+                    || matches!(segment.kind, SegmentKind::Tool | SegmentKind::Reasoning)
+            })
+        }
+        let mut left = visible_segments(left);
+        let mut right = visible_segments(right);
+        loop {
+            match (left.next(), right.next()) {
+                (None, None) => return true,
+                (Some(left), Some(right))
+                    if left.kind == right.kind
+                        && left.visible == right.visible
+                        && (!matches!(left.kind, SegmentKind::Tool | SegmentKind::Reasoning)
+                            || left.key == right.key)
+                        && (!left.visible || left.text == right.text)
+                        && left.image_url == right.image_url
+                        && (!left.visible
+                            || !matches!(
+                                left.kind,
+                                SegmentKind::Tool | SegmentKind::Reasoning
+                            )
+                            || left.created == right.created) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    fn same_rendered_content(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.error == other.error
+            && (!(self.has_timestamped_row() || other.has_timestamped_row())
+                || self.created == other.created)
+            && Self::same_visible_segments(&self.segments, &other.segments)
+    }
+
     #[cfg(test)]
     pub fn segment_keys(&self) -> Vec<String> {
         self.segments
@@ -384,6 +445,7 @@ impl ChatMessage {
             id: id.into(),
             role,
             created: 0,
+            render_revision: 0,
             segments: Vec::new(),
             error: None,
             context_tokens: None,
@@ -434,36 +496,61 @@ impl ChatMessage {
         let mut blocks: Vec<String> = Vec::new();
         let mut images: Vec<String> = Vec::new();
         let role = self.role;
-        let mut push = |body: String, images: Vec<String>, time: u64, kind: TranscriptRowKind| {
+        let mut push = |slot: TranscriptRowSlot,
+                        body: String,
+                        images: Vec<String>,
+                        time: u64,
+                        kind: TranscriptRowKind| {
             if body.is_empty() && images.is_empty() {
                 return;
             }
             rows.push(TranscriptRow {
+                key: TranscriptRowKey {
+                    message_id: self.id.clone(),
+                    slot,
+                },
                 role,
+                render_revision: self.render_revision,
                 body,
                 images,
                 time,
                 kind,
             });
         };
+        let mut preceding_special = None;
+        let mut special_occurrences = HashMap::<(TranscriptRowKind, &str), usize>::new();
         for segment in &self.segments {
             if matches!(segment.kind, SegmentKind::Tool | SegmentKind::Reasoning) {
                 push(
+                    TranscriptRowSlot::NormalAfter(preceding_special.clone()),
                     blocks.join("\n\n"),
                     std::mem::take(&mut images),
                     self.created,
                     TranscriptRowKind::Normal,
                 );
                 blocks = Vec::new();
+                let kind = if segment.kind == SegmentKind::Reasoning {
+                    TranscriptRowKind::Reasoning
+                } else {
+                    TranscriptRowKind::Tool
+                };
+                let occurrence = special_occurrences
+                    .entry((kind, &segment.key))
+                    .and_modify(|count| *count += 1)
+                    .or_insert(0);
+                let special = SpecialRowKey {
+                    kind,
+                    segment_key: segment.key.clone(),
+                    occurrence: *occurrence,
+                };
+                preceding_special = Some(special.clone());
                 if !segment.text.trim().is_empty() {
-                    let (body, kind) = match segment.kind {
-                        SegmentKind::Reasoning => (
-                            format!("Reasoning\n{}", segment.text.trim()),
-                            TranscriptRowKind::Reasoning,
-                        ),
-                        _ => (segment.text.clone(), TranscriptRowKind::Tool),
+                    let body = match segment.kind {
+                        SegmentKind::Reasoning => format!("Reasoning\n{}", segment.text.trim()),
+                        _ => segment.text.clone(),
                     };
                     push(
+                        TranscriptRowSlot::Special(special),
                         body,
                         Vec::new(),
                         if segment.created == 0 {
@@ -484,6 +571,7 @@ impl ChatMessage {
             }
         }
         push(
+            TranscriptRowSlot::NormalAfter(preceding_special),
             blocks.join("\n\n"),
             std::mem::take(&mut images),
             self.created,
@@ -491,6 +579,7 @@ impl ChatMessage {
         );
         if let Some(error) = &self.error {
             push(
+                TranscriptRowSlot::Error,
                 error.clone(),
                 Vec::new(),
                 self.created,
@@ -529,7 +618,7 @@ impl ChatMessage {
 
 /// The kind of a transcript row: GTK gave reasoning, tool and error rows
 /// their own widget classes (`message-reasoning`, `message-error-row`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum TranscriptRowKind {
     Normal,
     Reasoning,
@@ -537,16 +626,54 @@ pub enum TranscriptRowKind {
     Error,
 }
 
+/// The occurrence disambiguates repeated special segment IDs within one
+/// message. It is order-relative: inserting another copy *before* one with
+/// the same key can shift the occurrence, so callers must not treat duplicate
+/// IDs as a durable anchor across such ambiguous reorderings.
+/// Ordinary rows are named by the preceding special, not by a text ordinal
+/// or their position in the flattened conversation.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SpecialRowKey {
+    pub kind: TranscriptRowKind,
+    pub segment_key: String,
+    pub occurrence: usize,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum TranscriptRowSlot {
+    NormalAfter(Option<SpecialRowKey>),
+    Special(SpecialRowKey),
+    Error,
+}
+
+/// Scoped by conversation/session in a future row cache. The message ID and
+/// semantic slot remain stable when unrelated history is prepended.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct TranscriptRowKey {
+    pub message_id: String,
+    pub slot: TranscriptRowSlot,
+}
+
 /// One rendered transcript row (GTK's `TranscriptRow`): a message is split at
 /// every reasoning and tool segment, so each gets its own header, timestamp
 /// and row styling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptRow {
+    pub key: TranscriptRowKey,
+    /// Cheap invalidation token shared by the rows of one message. Compare
+    /// with the key and per-conversation snapshot epoch when reusing layout.
+    pub render_revision: u64,
     pub role: Role,
     pub body: String,
     pub images: Vec<String>,
     pub time: u64,
     pub kind: TranscriptRowKind,
+}
+
+impl TranscriptRow {
+    pub fn render_revision(&self) -> u64 {
+        self.render_revision
+    }
 }
 
 /// One undelivered user prompt (a tray row).
@@ -574,9 +701,16 @@ pub struct Conversation {
     pub messages: Vec<ChatMessage>,
     pub next_cursor: Option<String>,
     pub loaded: bool,
+    /// Invalidate per-session row caches after wholesale snapshot replacement.
+    /// Prepending older history deliberately does not advance this epoch.
+    cache_epoch: u64,
 }
 
 impl Conversation {
+    pub fn cache_epoch(&self) -> u64 {
+        self.cache_epoch
+    }
+
     /// `entries` is one history page in chronological order (oldest first).
     /// Queued (undelivered) rows are not history, so they are kept after it
     /// until [`Conversation::sync_queued`] or live inbox events settle them.
@@ -597,6 +731,7 @@ impl Conversation {
         }
         self.next_cursor = next_cursor;
         self.loaded = true;
+        self.cache_epoch = self.cache_epoch.wrapping_add(1);
     }
 
     /// Prepends an older page (chronological order), skipping known entries.
@@ -737,9 +872,15 @@ impl Conversation {
                 let index = self.ensure_message(&data.assistant_message_id, Role::Assistant);
                 let message = &mut self.messages[index];
                 // A retried step restarts the same message.
+                let had_error = message.error.is_some();
+                let old_created = message.created;
+                let has_timestamped_row = message.has_timestamped_row();
                 message.error = None;
                 if data.started > 0 {
                     message.created = millis(data.started);
+                }
+                if had_error || (has_timestamped_row && message.created != old_created) {
+                    message.bump_render_revision();
                 }
                 true
             }
@@ -754,7 +895,11 @@ impl Conversation {
                 let index = self.ensure_message(&data.assistant_message_id, Role::Assistant);
                 let message = &mut self.messages[index];
                 if !is_interrupt(&data.error) {
-                    message.error = Some(structured_error_text(&data.error));
+                    let error = structured_error_text(&data.error);
+                    if message.error.as_deref() != Some(error.as_str()) {
+                        message.error = Some(error);
+                        message.bump_render_revision();
+                    }
                 }
                 if let Some(tokens) = data.tokens.as_ref().and_then(usage_tokens) {
                     message.context_tokens = Some(tokens);
@@ -882,7 +1027,12 @@ impl Conversation {
                 }) else {
                     return false;
                 };
-                message.segments = assistant_segments(&data.content);
+                let segments = assistant_segments(&data.content);
+                let changed = !ChatMessage::same_visible_segments(&message.segments, &segments);
+                message.segments = segments;
+                if changed {
+                    message.bump_render_revision();
+                }
                 true
             }
             Kind::ExecutionFailed(data) => self.execution_failed(event, &data.error, created),
@@ -1130,8 +1280,12 @@ impl Conversation {
         };
         let mut message = self.messages.remove(index);
         message.queued = false;
+        let old_created = message.created;
         if created > 0 {
             message.created = created;
+        }
+        if message.has_timestamped_row() && message.created != old_created {
+            message.bump_render_revision();
         }
         self.insert_message(message);
         true
@@ -1177,10 +1331,21 @@ impl Conversation {
         let index = self.ensure_message(message_id, Role::Assistant);
         let message = &mut self.messages[index];
         match message.segment_mut(&key) {
-            Some(segment) => segment.text.push_str(delta),
-            None => message
-                .segments
-                .push(Segment::text(key, kind, delta.to_owned(), 0)),
+            Some(segment) => {
+                let was_visible = segment.visible;
+                segment.text.push_str(delta);
+                segment.visible |= !delta.trim().is_empty();
+                if was_visible || segment.visible {
+                    message.bump_render_revision();
+                }
+            }
+            None => {
+                let segment = Segment::text(key, kind, delta.to_owned(), 0);
+                if segment.visible {
+                    message.bump_render_revision();
+                }
+                message.segments.push(segment);
+            }
         }
         true
     }
@@ -1201,13 +1366,21 @@ impl Conversation {
         match message.segment_mut(&key) {
             Some(segment) if segment.text == text => false,
             Some(segment) => {
+                let was_visible = segment.visible;
                 segment.text = text.to_owned();
+                segment.visible = !text.trim().is_empty();
+                if was_visible || segment.visible {
+                    message.bump_render_revision();
+                }
                 true
             }
             None => {
                 message
                     .segments
                     .push(Segment::text(key, kind, text.to_owned(), created));
+                if !text.trim().is_empty() {
+                    message.bump_render_revision();
+                }
                 true
             }
         }
@@ -1232,6 +1405,7 @@ impl Conversation {
                 completed: None,
             },
         }));
+        message.bump_render_revision();
         true
     }
 
@@ -1244,12 +1418,14 @@ impl Conversation {
         tool_id: &str,
         update: impl FnOnce(&mut protocol::ToolCall) -> bool,
     ) -> bool {
-        let Some(segment) = self
+        let Some(message) = self
             .messages
             .iter_mut()
             .find(|message| message.id == message_id)
-            .and_then(|message| message.segment_mut(&tool_key(tool_id)))
         else {
+            return false;
+        };
+        let Some(segment) = message.segment_mut(&tool_key(tool_id)) else {
             return false;
         };
         let Some(tool) = segment.tool.as_mut() else {
@@ -1259,7 +1435,11 @@ impl Conversation {
             return false;
         }
         let rendered = tool_segment(tool);
+        let visible_changed = segment.text != rendered.text || segment.created != rendered.created;
         *segment = rendered;
+        if visible_changed {
+            message.bump_render_revision();
+        }
         true
     }
 
@@ -1292,10 +1472,17 @@ impl Conversation {
         };
         let index = self.ensure_message(&id, Role::Assistant);
         let message = &mut self.messages[index];
+        let old_created = message.created;
         if message.created == 0 {
             message.created = created;
         }
-        message.error = Some(structured_error_text(error));
+        let error = structured_error_text(error);
+        if message.error.as_deref() != Some(error.as_str())
+            || (message.created != old_created && message.has_timestamped_row())
+        {
+            message.bump_render_revision();
+        }
+        message.error = Some(error);
         true
     }
 
@@ -1316,7 +1503,14 @@ impl Conversation {
 
     fn replace_note(&mut self, index: usize, message: Option<ChatMessage>) -> bool {
         match message {
-            Some(message) => self.messages[index] = message,
+            Some(mut message) => {
+                let previous = &self.messages[index];
+                message.render_revision = previous.render_revision;
+                if !previous.same_rendered_content(&message) {
+                    message.bump_render_revision();
+                }
+                self.messages[index] = message;
+            }
             None => {
                 self.messages.remove(index);
             }
@@ -1643,6 +1837,7 @@ fn tool_segment(tool: &protocol::ToolCall) -> Segment {
         key: format!("tool:{}", tool.id),
         kind: SegmentKind::Tool,
         text: format!("{name} · {status}{title}{detail}"),
+        visible: true,
         image_url: None,
         created: millis(tool.time.created),
         tool: Some(tool.clone()),
@@ -2369,6 +2564,294 @@ mod tests {
             .into_iter()
             .map(protocol::SessionMessage::from_value)
             .collect()
+    }
+
+    fn projected_rows(conversation: &Conversation) -> Vec<TranscriptRow> {
+        conversation
+            .messages
+            .iter()
+            .filter(|message| !message.in_tray())
+            .flat_map(ChatMessage::rows)
+            .collect()
+    }
+
+    #[test]
+    fn row_keys_survive_prepend_and_streaming_growth() {
+        let mut conversation = Conversation::default();
+        conversation.replace_from_api(
+            &entries(vec![json!({ "id": "msg_later", "type": "user", "time": { "created": 2 }, "text": "later" })]),
+            Some("cursor".into()),
+        );
+        let epoch = conversation.cache_epoch();
+        let retained = projected_rows(&conversation)[0].clone();
+        conversation.prepend_from_api(
+            &entries(vec![json!({ "id": "msg_earlier", "type": "user", "time": { "created": 1 }, "text": "earlier" })]),
+            None,
+        );
+        assert_eq!(conversation.cache_epoch(), epoch);
+        assert_eq!(projected_rows(&conversation)[1], retained);
+        assert_eq!(retained.key.slot, TranscriptRowSlot::NormalAfter(None));
+
+        assert!(conversation.apply_event(&live(
+            "session.text.delta",
+            json!({ "assistantMessageID": "msg_stream", "ordinal": 0, "delta": "Hello" }),
+        )));
+        let streaming = projected_rows(&conversation).pop().unwrap();
+        assert_eq!(streaming.key.message_id, "msg_stream");
+        assert!(conversation.apply_event(&live(
+            "session.text.delta",
+            json!({ "assistantMessageID": "msg_stream", "ordinal": 0, "delta": " world" }),
+        )));
+        let grown = projected_rows(&conversation).pop().unwrap();
+        assert_eq!(streaming.key, grown.key);
+        assert_ne!(streaming.render_revision(), grown.render_revision());
+        assert_eq!(conversation.cache_epoch(), epoch);
+    }
+
+    #[test]
+    fn row_slots_follow_semantic_specials_through_content_reordering() {
+        let mut message = ChatMessage::placeholder("msg_a", Role::Assistant);
+        message.created = 7;
+        message.segments = vec![
+            Segment::text("text:0".into(), SegmentKind::Text, "before".into(), 0),
+            Segment::text(
+                "reasoning:0".into(),
+                SegmentKind::Reasoning,
+                "think".into(),
+                8,
+            ),
+            Segment::text("text:1".into(), SegmentKind::Text, "after".into(), 0),
+            Segment::text("tool:call".into(), SegmentKind::Tool, "tool".into(), 9),
+            Segment::text("text:2".into(), SegmentKind::Text, "last".into(), 0),
+        ];
+        let original = message.rows();
+        assert_eq!(original.len(), 5);
+        message.segments.swap(1, 3);
+        let reordered = message.rows();
+        assert_eq!(reordered.len(), 5);
+        assert_eq!(original[0].key, reordered[0].key);
+        assert_eq!(
+            original[1].key, reordered[3].key,
+            "reasoning follows its key"
+        );
+        assert_eq!(original[3].key, reordered[1].key, "tool follows its key");
+        assert_ne!(
+            original[2].key, reordered[2].key,
+            "normal slot follows its preceding special"
+        );
+        assert_ne!(original[4].key, reordered[4].key);
+        assert_eq!(
+            original[2].render_revision(),
+            reordered[2].render_revision(),
+            "identical visible content can move to a different semantic slot"
+        );
+    }
+
+    #[test]
+    fn snapshot_replacement_invalidates_colliding_ids_even_if_rows_match() {
+        let mut conversation = Conversation::default();
+        let snapshot = |body| {
+            entries(vec![
+                json!({ "id": "msg_same", "type": "user", "time": { "created": 1 }, "text": body }),
+            ])
+        };
+        conversation.replace_from_api(&snapshot("one"), None);
+        let first = projected_rows(&conversation)[0].clone();
+        let epoch = conversation.cache_epoch();
+        conversation.replace_from_api(&snapshot("two"), None);
+        let second = projected_rows(&conversation)[0].clone();
+        assert_eq!(first.key, second.key);
+        assert_eq!(first.render_revision(), second.render_revision());
+        assert_ne!(
+            first.body, second.body,
+            "the epoch guards a reused ID and counter"
+        );
+        assert_ne!(conversation.cache_epoch(), epoch);
+        let epoch = conversation.cache_epoch();
+        conversation.replace_from_api(&snapshot("two"), None);
+        assert_eq!(projected_rows(&conversation)[0], second);
+        assert_ne!(
+            conversation.cache_epoch(),
+            epoch,
+            "even identical snapshots reset cache ownership"
+        );
+    }
+
+    #[test]
+    fn duplicate_special_ids_have_unique_slots_and_distinct_normal_successors() {
+        let mut message = ChatMessage::placeholder("msg_dup", Role::Assistant);
+        message.segments = vec![
+            Segment::text("tool:same".into(), SegmentKind::Tool, "first".into(), 1),
+            Segment::text("text:0".into(), SegmentKind::Text, "a".into(), 0),
+            Segment::text("tool:same".into(), SegmentKind::Tool, "second".into(), 2),
+            Segment::text("text:1".into(), SegmentKind::Text, "b".into(), 0),
+            Segment::text(
+                "reasoning:same".into(),
+                SegmentKind::Reasoning,
+                "think".into(),
+                3,
+            ),
+            Segment::text("text:2".into(), SegmentKind::Text, "c".into(), 0),
+        ];
+        let rows = message.rows();
+        let keys: HashSet<_> = rows.iter().map(|row| &row.key).collect();
+        assert_eq!(keys.len(), rows.len());
+        assert!(matches!(&rows[0].key.slot, TranscriptRowSlot::Special(s) if s.occurrence == 0));
+        assert!(matches!(&rows[2].key.slot, TranscriptRowSlot::Special(s) if s.occurrence == 1));
+        assert!(
+            matches!(&rows[3].key.slot, TranscriptRowSlot::NormalAfter(Some(s)) if s.occurrence == 1)
+        );
+        assert!(matches!(&rows[4].key.slot, TranscriptRowSlot::Special(s) if s.occurrence == 0));
+    }
+
+    #[test]
+    fn note_and_error_transitions_keep_identity_but_change_revision() {
+        let mut conversation = Conversation::default();
+        let shell = live(
+            "session.shell.started",
+            json!({ "shell": { "id": "sh_1", "status": "running", "command": "ls", "cwd": "/w" } }),
+        );
+        assert!(conversation.apply_event(&shell));
+        let running = projected_rows(&conversation)[0].clone();
+        assert!(conversation.apply_event(&live(
+            "session.shell.ended",
+            json!({
+                "shell": { "id": "sh_1", "status": "timeout", "command": "ls", "cwd": "/w" },
+                "output": { "output": "a\n", "cursor": 2, "size": 2, "truncated": false }
+            })
+        )));
+        let ended = projected_rows(&conversation)[0].clone();
+        assert_eq!(running.key, ended.key);
+        assert_ne!(running.render_revision(), ended.render_revision());
+
+        assert!(conversation.apply_event(&live("session.step.failed", json!({
+            "assistantMessageID": "msg_error", "error": { "type": "provider", "message": "boom" }
+        }))));
+        let error = projected_rows(&conversation).pop().unwrap();
+        assert_eq!(error.key.slot, TranscriptRowSlot::Error);
+        assert!(conversation.apply_event(&live(
+            "session.step.started",
+            json!({
+                "assistantMessageID": "msg_error", "agent": "build", "started": 1
+            })
+        )));
+        assert!(
+            !projected_rows(&conversation)
+                .iter()
+                .any(|row| row.key == error.key)
+        );
+        assert!(conversation.apply_event(&live("session.step.failed", json!({
+            "assistantMessageID": "msg_error", "error": { "type": "provider", "message": "different" }
+        }))));
+        let retry_error = projected_rows(&conversation).pop().unwrap();
+        assert_eq!(error.key, retry_error.key);
+        assert_ne!(error.render_revision(), retry_error.render_revision());
+    }
+
+    #[test]
+    fn render_revision_ignores_token_only_and_blank_events_but_tracks_visible_text() {
+        let mut conversation = Conversation::default();
+        conversation.replace_from_api(
+            &entries(vec![json!({
+                "id": "msg_a", "type": "assistant", "time": { "created": 1 },
+                "agent": "build", "content": [{ "type": "text", "text": "answer" }]
+            })]),
+            None,
+        );
+        let initial = projected_rows(&conversation)[0].render_revision();
+        assert!(conversation.apply_event(&live("session.step.ended", json!({
+            "assistantMessageID": "msg_a", "finish": "stop", "cost": 0,
+            "tokens": { "input": 100, "output": 10, "reasoning": 0, "cache": { "read": 0, "write": 0 } }
+        }))));
+        assert_eq!(projected_rows(&conversation)[0].render_revision(), initial);
+        assert!(!conversation.apply_event(&live(
+            "session.text.started",
+            json!({
+                "assistantMessageID": "msg_a", "ordinal": 0
+            })
+        )));
+        assert_eq!(projected_rows(&conversation)[0].render_revision(), initial);
+        assert!(conversation.apply_event(&live(
+            "session.message.content.updated",
+            json!({
+                "messageID": "msg_a", "content": [{ "type": "text", "text": "answer" }]
+            })
+        )));
+        assert_eq!(projected_rows(&conversation)[0].render_revision(), initial);
+        assert!(conversation.apply_event(&live(
+            "session.text.delta",
+            json!({
+                "assistantMessageID": "msg_a", "ordinal": 0, "delta": "!"
+            })
+        )));
+        assert_eq!(
+            projected_rows(&conversation)[0].render_revision(),
+            initial + 1
+        );
+
+        // A new blank fragment is not a row until non-whitespace arrives.
+        assert!(conversation.apply_event(&live(
+            "session.text.delta",
+            json!({
+                "assistantMessageID": "msg_a", "ordinal": 1, "delta": "  "
+            })
+        )));
+        assert_eq!(
+            projected_rows(&conversation)[0].render_revision(),
+            initial + 1
+        );
+        assert!(conversation.apply_event(&live(
+            "session.text.delta",
+            json!({
+                "assistantMessageID": "msg_a", "ordinal": 1, "delta": "next"
+            })
+        )));
+        assert_eq!(
+            projected_rows(&conversation)[0].render_revision(),
+            initial + 2
+        );
+    }
+
+    #[test]
+    fn tool_revision_tracks_rendered_title_and_status_not_metadata() {
+        let mut conversation = Conversation::default();
+        assert!(conversation.apply_event(&live(
+            "session.tool.input.started",
+            json!({
+                "assistantMessageID": "msg_tool", "id": "call_1", "name": "shell"
+            })
+        )));
+        let initial = projected_rows(&conversation)[0].render_revision();
+        assert!(initial > 0);
+        assert!(conversation.apply_event(&live(
+            "session.tool.input.delta",
+            json!({
+                "assistantMessageID": "msg_tool", "id": "call_1", "delta": "{\"command\":\"ls\"}"
+            })
+        )));
+        let titled = projected_rows(&conversation)[0].render_revision();
+        assert!(titled > initial);
+        assert!(conversation.apply_event(&live(
+            "session.tool.called",
+            json!({
+                "assistantMessageID": "msg_tool", "id": "call_1", "input": { "command": "ls" }
+            })
+        )));
+        assert_eq!(projected_rows(&conversation)[0].render_revision(), titled);
+        assert!(!conversation.apply_event(&live(
+            "session.tool.progress",
+            json!({
+                "assistantMessageID": "msg_tool", "id": "call_1", "metadata": { "lines": 3 }
+            })
+        )));
+        assert_eq!(projected_rows(&conversation)[0].render_revision(), titled);
+        assert!(conversation.apply_event(&live(
+            "session.tool.success",
+            json!({
+                "assistantMessageID": "msg_tool", "id": "call_1", "content": []
+            })
+        )));
+        assert!(projected_rows(&conversation)[0].render_revision() > titled);
     }
 
     #[test]
