@@ -183,6 +183,23 @@ fn timestamp(time: u64) -> String {
         .unwrap_or_default()
 }
 
+fn sticky_user_index(
+    users: impl IntoIterator<Item = (usize, Pixels, Pixels)>,
+    viewport_top: Pixels,
+    viewport_bottom: Pixels,
+) -> Option<usize> {
+    let mut last_past_top = None;
+    let mut flush_with_top = false;
+    for (index, top, bottom) in users {
+        if top < viewport_top - px(1.) {
+            last_past_top = Some(index);
+        } else if top <= viewport_top + px(1.) && bottom <= viewport_bottom + px(1.) {
+            flush_with_top = true;
+        }
+    }
+    if flush_with_top { None } else { last_past_top }
+}
+
 fn permission_detail(text: String, dark: bool) -> AnyElement {
     div()
         .p(px(8.))
@@ -2388,6 +2405,7 @@ impl Client {
         div()
             .id(("message", index))
             .w_full()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -2653,7 +2671,15 @@ impl Client {
 
     fn chat(&self, cx: &Context<Self>) -> AnyElement {
         // GTK reserves a permanent 14px gutter for the transcript scrollbar.
-        let mut rows = div().w_full().pr(px(14.)).flex().flex_col();
+        let mut rows = div()
+            .id("transcript")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .w_full()
+            .pr(px(14.))
+            .flex()
+            .flex_col();
         if let Some(cursor) = self
             .conversations
             .get(&self.active)
@@ -2664,6 +2690,7 @@ impl Client {
             rows = rows.child(
                 div()
                     .id("load-earlier")
+                    .flex_shrink_0()
                     .mx(px(28.))
                     .my(px(12.))
                     .px(px(12.))
@@ -2687,45 +2714,40 @@ impl Client {
                     }),
             );
         }
-        let sticky = self
-            .transcript
-            .get(&self.active)
-            .and_then(|transcript| transcript.first())
-            .filter(|row| row.role.label() == "YOU" && self.scroll.offset().y < px(-1.))
-            .map(|row| {
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right(px(14.))
-                    .h(px(106.))
-                    .px(px(28.))
-                    .pt(px(18.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .bg(self.tone(0xf4f1eb, 0x101214))
-                    .border_b_1()
-                    .border_color(self.tone(0xc8c3ba, 0x343a3f))
-                    .shadow_sm()
-                    .child(
-                        div()
-                            .flex()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(self.tone(0x666f76, 0x8d959d))
-                            .child("YOU")
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::NORMAL)
-                                    .text_color(self.tone(0x9da5a4, 0x6a7279))
-                                    .child(timestamp(row.time)),
-                            ),
-                    )
-                    .child(row.body.clone())
-                    .into_any_element()
-            });
+        let sticky = self.sticky_user_row().map(|row| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right(px(14.))
+                .h(px(106.))
+                .px(px(28.))
+                .pt(px(18.))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .bg(self.tone(0xf4f1eb, 0x101214))
+                .border_b_1()
+                .border_color(self.tone(0xc8c3ba, 0x343a3f))
+                .shadow_sm()
+                .child(
+                    div()
+                        .flex()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(self.tone(0x666f76, 0x8d959d))
+                        .child("YOU")
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(self.tone(0x9da5a4, 0x6a7279))
+                                .child(timestamp(row.time)),
+                        ),
+                )
+                .child(row.body.clone())
+                .into_any_element()
+        });
         if let Some(transcript) = self.transcript.get(&self.active) {
             for (index, row) in transcript.iter().enumerate() {
                 rows = rows.child(self.message(row, index, cx));
@@ -2735,17 +2757,35 @@ impl Client {
             .flex_1()
             .min_h_0()
             .relative()
-            .child(
-                div()
-                    .id("transcript")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .child(rows),
-            )
+            .child(rows)
             .when_some(sticky, |view, sticky| view.child(sticky))
             .vertical_scrollbar(&self.scroll)
             .into_any_element()
+    }
+
+    fn sticky_user_row(&self) -> Option<&TranscriptRow> {
+        if self.scroll.offset().y >= px(-1.) {
+            return None;
+        }
+        let transcript = self.transcript.get(&self.active)?;
+        let viewport = self.scroll.bounds();
+        let top = viewport.origin.y;
+        let bottom = top + viewport.size.height;
+        let first_child = usize::from(
+            self.conversations
+                .get(&self.active)
+                .is_some_and(|conversation| conversation.next_cursor.is_some()),
+        );
+        let users = transcript.iter().enumerate().filter_map(|(index, row)| {
+            if row.role.label() != "YOU" {
+                return None;
+            }
+            let bounds = self.scroll.bounds_for_item(index + first_child)?;
+            // GPUI keeps child bounds in unscrolled content coordinates.
+            let row_top = bounds.origin.y + self.scroll.offset().y;
+            Some((index, row_top, row_top + bounds.size.height))
+        });
+        sticky_user_index(users, top, bottom).and_then(|index| transcript.get(index))
     }
 
     fn tray_view(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -4043,7 +4083,18 @@ pub fn run(args: Args) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarkdownBlock, markdown_blocks};
+    use super::{MarkdownBlock, markdown_blocks, sticky_user_index};
+    use gpui_kit::px;
+
+    #[test]
+    fn sticky_tracks_latest_user_past_top_and_hides_flush_row() {
+        let users = [(0, px(-120.), px(-25.)), (3, px(210.), px(280.))];
+        assert_eq!(sticky_user_index(users, px(0.), px(400.)), Some(0));
+        let users = [(0, px(-480.), px(-385.)), (3, px(-20.), px(50.))];
+        assert_eq!(sticky_user_index(users, px(0.), px(400.)), Some(3));
+        let users = [(0, px(-480.), px(-385.)), (3, px(0.), px(70.))];
+        assert_eq!(sticky_user_index(users, px(0.), px(400.)), None);
+    }
 
     #[test]
     fn heading_list_and_fenced_code_keep_their_content() {
