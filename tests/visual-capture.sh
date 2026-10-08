@@ -2,6 +2,8 @@
 # Run only inside the headless Linux test container, never on a live desktop.
 # APP_BINARY, OUTPUT and CLIENT=(gtk|gpui) are required. WINDOW_W/H and
 # CASE=(main|settings|sessions|new-session|model|level|rename) are optional.
+# Static GPUI comparisons omit its extra image fixture by default to match GTK;
+# PREVIEW_IMAGE=1 deliberately includes that extra turn for image-rendering tests.
 set -euo pipefail
 : "${APP_BINARY:?absolute path to preview binary}"
 : "${OUTPUT:?absolute path for output PNG}"
@@ -48,6 +50,9 @@ if [[ "${BG:-light}" == dark ]]; then
 fi
 if [[ "$CLIENT" == gpui ]]; then
   export OPENCODE_GPUI_THEME="${BG:-light}"
+  if [[ "${TEST_LIVE:-0}" != 1 && "${PREVIEW_API:-0}" != 1 && "${PREVIEW_IMAGE:-0}" != 1 ]]; then
+    export OPENCODE_PREVIEW_MATCH_GTK=1
+  fi
 fi
 if [[ "${TEST_LIVE:-0}" == 1 && "$CLIENT" == gpui ]]; then
   app_args=()
@@ -72,10 +77,27 @@ for _ in {1..120}; do
   sleep 0.25
 done
 [[ -n "$win" ]] || { tail -30 "${OUTPUT}.app.log"; exit 1; }
-if [[ "$CLIENT" == gpui && -n "${INTERACTION:-}" ]]; then
-  # The Weston X window exists before GPUI has created its Wayland surface.
-  # Early xdotool events otherwise vanish before the first client frame.
-  sleep 5
+if [[ "$CLIENT" == gpui ]]; then
+  # Weston maps its X window before GPUI's Wayland surface is ready. A fixed
+  # delay sometimes captured a completely black release build; wait for an
+  # actual painted frame before sending input or accepting a screenshot.
+  ready=0
+  for _ in {1..40}; do
+    kill -0 "$app_pid" 2>/dev/null || break
+    if import -window "$win" "$OUTPUT" 2>/dev/null; then
+      frame_mean="$(convert "$OUTPUT" -format '%[fx:mean]' info:)"
+      if awk -v mean="$frame_mean" 'BEGIN { exit !(mean > 0.01) }'; then
+        ready=1
+        break
+      fi
+    fi
+    sleep 0.5
+  done
+  if (( ! ready )); then
+    echo 'GPUI did not paint a visible frame before the capture deadline' >&2
+    tail -30 "${OUTPUT}.app.log" >&2
+    exit 1
+  fi
 fi
 if [[ "$CLIENT" == gtk ]]; then
   xdotool windowsize --sync "$win" "$window_w" "$window_h"
