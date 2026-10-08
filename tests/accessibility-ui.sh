@@ -102,11 +102,14 @@ session_buttons = [child for child in frames[0]
 assert session_buttons, 'No named session buttons were exposed'
 for button in session_buttons:
     assert 'Action' in button.get_interfaces(), f'Session button lacks Action: {button.name}'
+    assert pyatspi.STATE_FOCUSABLE in button.getState().getStates(), (
+        f'Session button is not keyboard-focusable: {button.name}')
     children = list(button)
     for prefix in ('Rename session: ', 'Close tab: '):
         assert any(child.getRoleName() == 'push button'
-                   and child.name.startswith(prefix) and 'Action' in child.get_interfaces()
-                   for child in children), f'{button.name} lacks actionable {prefix}'
+                    and child.name.startswith(prefix) and 'Action' in child.get_interfaces()
+                    and pyatspi.STATE_FOCUSABLE in child.getState().getStates()
+                    for child in children), f'{button.name} lacks actionable {prefix}'
 for interface in ('Text', 'EditableText'):
     try:
         getattr(entries[0], 'query' + interface)()

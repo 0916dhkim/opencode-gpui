@@ -28,6 +28,21 @@ use serde::Deserialize;
 
 use crate::Args;
 
+fn tab_number_key(key: &str) -> Option<usize> {
+    match key {
+        "1" | "numpad1" | "kp_1" => Some(0),
+        "2" | "numpad2" | "kp_2" => Some(1),
+        "3" | "numpad3" | "kp_3" => Some(2),
+        "4" | "numpad4" | "kp_4" => Some(3),
+        "5" | "numpad5" | "kp_5" => Some(4),
+        "6" | "numpad6" | "kp_6" => Some(5),
+        "7" | "numpad7" | "kp_7" => Some(6),
+        "8" | "numpad8" | "kp_8" => Some(7),
+        "9" | "numpad9" | "kp_9" => Some(8),
+        _ => None,
+    }
+}
+
 struct Client {
     dark: bool,
     api: Option<ApiHandle>,
@@ -54,6 +69,8 @@ struct Client {
     running_jobs: Jobs,
     sessions: Vec<Session>,
     open_tabs: Vec<String>,
+    tab_focus: HashMap<String, [FocusHandle; 3]>,
+    tab_shortcut_hint: bool,
     bootstrapped: bool,
     projects: Vec<Project>,
     active: String,
@@ -84,6 +101,7 @@ struct Client {
     tray_in_flight: HashSet<String>,
     clear_accepted_drafts: Vec<(String, String, Vec<PathBuf>)>,
     modal: Option<Modal>,
+    rename_target: Option<String>,
     picker_highlight: Option<usize>,
     search: Entity<InputState>,
     rename: Entity<InputState>,
@@ -467,6 +485,8 @@ impl Client {
             running_jobs: Jobs::default(),
             sessions: Vec::new(),
             open_tabs: Vec::new(),
+            tab_focus: HashMap::new(),
+            tab_shortcut_hint: false,
             bootstrapped: false,
             projects: Vec::new(),
             active: String::new(),
@@ -502,6 +522,7 @@ impl Client {
             tray_in_flight: HashSet::new(),
             clear_accepted_drafts: Vec::new(),
             modal: None,
+            rename_target: None,
             picker_highlight: None,
             search: cx.new(|cx| InputState::new(window, cx).placeholder("Search models (fuzzy)…")),
             rename: cx.new(|cx| InputState::new(window, cx)),
@@ -681,9 +702,22 @@ impl Client {
         }
     }
 
+    fn update_tab_status(&mut self, id: String, status: RunStatus) {
+        let was_busy = self.statuses.get(&id).is_some_and(RunStatus::is_busy);
+        if was_busy
+            && !status.is_busy()
+            && self.open_tabs.contains(&id)
+            && self.unread.insert(id.clone())
+        {
+            self.persist_tabs();
+        }
+        self.statuses.insert(id, status);
+    }
+
     fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
         let index = self.open_tabs.iter().position(|tab| tab == id);
         self.open_tabs.retain(|tab| tab != id);
+        self.tab_focus.remove(id);
         self.conversations.remove(id);
         self.loading_messages.remove(id);
         self.message_events_during_load.remove(id);
@@ -748,6 +782,17 @@ impl Client {
         self.composer_session = self.active.clone();
     }
 
+    fn focus_selected_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_composer(window, cx);
+        let focus = if self.modal.is_none() && self.visible_permission().is_some() {
+            self.permission_focus[0].clone()
+        } else {
+            self.composer.focus_handle(cx)
+        };
+        focus.focus(window, cx);
+        window.on_next_frame(move |window, cx| focus.focus(window, cx));
+    }
+
     fn selected_model(&self) -> Option<ModelSelection> {
         self.sessions
             .iter()
@@ -797,23 +842,21 @@ impl Client {
 
     fn rename_session(&mut self, cx: &mut Context<Self>) {
         let title = self.rename.read(cx).value().trim().to_owned();
-        if title.is_empty() || self.active.is_empty() {
+        let id = self.rename_target.as_deref().unwrap_or(&self.active);
+        if title.is_empty() || id.is_empty() {
             return;
         }
         if let Some(api) = &self.api {
             self.next_session_request_id += 1;
             api.send(Command::RenameSession {
                 request_id: self.next_session_request_id,
-                session_id: self.active.clone(),
+                session_id: id.to_owned(),
                 title,
             });
-        } else if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == self.active)
-        {
+        } else if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
             session.title = title;
         }
+        self.rename_target = None;
         self.modal = None;
         cx.notify();
     }
@@ -1022,10 +1065,11 @@ impl Client {
                 self.search.focus_handle(cx).focus(window, cx);
             }
             Modal::Rename => {
+                let target = self.rename_target.as_deref().unwrap_or(&self.active);
                 let title = self
                     .sessions
                     .iter()
-                    .find(|session| session.id == self.active)
+                    .find(|session| session.id == target)
                     .map(|session| session.title.clone())
                     .unwrap_or_default();
                 self.rename.update(cx, |input, cx| {
@@ -1189,10 +1233,50 @@ impl Client {
     ) {
         let modifiers = &event.keystroke.modifiers;
         let key = event.keystroke.key.to_ascii_lowercase();
-        if key == "escape" && self.modal.take().is_some() {
-            self.composer.focus_handle(cx).focus(window, cx);
-            cx.stop_propagation();
+        if (matches!(key.as_str(), "alt" | "alt_l" | "alt_r")
+            || (modifiers.alt && !modifiers.control))
+            && !self.tab_shortcut_hint
+        {
+            self.tab_shortcut_hint = true;
             cx.notify();
+        }
+        if key == "escape"
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.shift
+        {
+            if self.modal.take().is_some() {
+                self.rename_target = None;
+                self.composer.focus_handle(cx).focus(window, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            // GTK consumes Escape while the permission prompt replaces the
+            // composer; it must not acknowledge the active tab's unread mark.
+            if self.visible_permission().is_some() {
+                cx.stop_propagation();
+                return;
+            }
+            if self.unread.remove(&self.active) {
+                self.persist_tabs();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+        if key == "f2"
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.shift
+            && self.modal.is_none()
+            && !self.active.is_empty()
+        {
+            self.rename_target = Some(self.active.clone());
+            self.show_modal(Modal::Rename, window, cx);
+            cx.stop_propagation();
             return;
         }
         if matches!(key.as_str(), "up" | "down") && self.modal_choice_count(cx) > 0 {
@@ -1203,6 +1287,20 @@ impl Client {
             } else {
                 (current + 1).min(len - 1)
             });
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if modifiers.alt
+            && !modifiers.control
+            && !modifiers.platform
+            && !modifiers.shift
+            && self.modal.is_none()
+            && let Some(index) = tab_number_key(&key)
+            && let Some(id) = self.open_tabs.get(index).cloned()
+        {
+            self.select_session(id);
+            self.focus_selected_composer(window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1224,36 +1322,48 @@ impl Client {
         if self.modal.is_some() {
             return;
         }
-        let selection = if key == "tab" && !self.open_tabs.is_empty() {
-            let current = self
-                .open_tabs
-                .iter()
-                .position(|id| *id == self.active)
-                .unwrap_or_default();
-            let next = if modifiers.shift {
-                (current + self.open_tabs.len() - 1) % self.open_tabs.len()
+        let selection =
+            if matches!(key.as_str(), "tab" | "iso_left_tab") && !self.open_tabs.is_empty() {
+                let current = self
+                    .open_tabs
+                    .iter()
+                    .position(|id| *id == self.active)
+                    .unwrap_or_default();
+                let next = if modifiers.shift || key == "iso_left_tab" {
+                    (current + self.open_tabs.len() - 1) % self.open_tabs.len()
+                } else {
+                    (current + 1) % self.open_tabs.len()
+                };
+                self.open_tabs.get(next).cloned()
+            } else if let Some(index) = tab_number_key(&key) {
+                self.open_tabs.get(index).cloned()
             } else {
-                (current + 1) % self.open_tabs.len()
+                None
             };
-            self.open_tabs.get(next).cloned()
-        } else if key.len() == 1
-            && let Some(index @ 1..=9) = key.chars().next().and_then(|digit| digit.to_digit(10))
-        {
-            self.open_tabs.get((index - 1) as usize).cloned()
-        } else {
-            None
-        };
         if let Some(id) = selection {
             self.select_session(id);
+            self.focus_selected_composer(window, cx);
             cx.stop_propagation();
             cx.notify();
         } else if key == "w" && !self.active.is_empty() {
             let id = self.active.clone();
             self.close_tab(&id, cx);
+            self.focus_selected_composer(window, cx);
             cx.stop_propagation();
         } else if key == "g" {
             self.composer.focus_handle(cx).focus(window, cx);
             cx.stop_propagation();
+        }
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            event.keystroke.key.to_ascii_lowercase().as_str(),
+            "alt" | "alt_l" | "alt_r"
+        ) && self.tab_shortcut_hint
+        {
+            self.tab_shortcut_hint = false;
+            cx.notify();
         }
     }
 
@@ -1862,11 +1972,7 @@ impl Client {
                         self.child_parents.insert(child, parent);
                     }
                     if let Some((id, status)) = model::run_status_change(&kind) {
-                        let was_busy = self.statuses.get(&id).is_some_and(RunStatus::is_busy);
-                        if was_busy && !status.is_busy() && id != self.active {
-                            self.unread.insert(id.clone());
-                        }
-                        self.statuses.insert(id, status);
+                        self.update_tab_status(id, status);
                     }
                     if let Some(change) = model::SessionChange::from_kind(&event, &kind) {
                         let id = change.session_id().to_owned();
@@ -2113,6 +2219,8 @@ impl Client {
             running_jobs,
             sessions,
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
+            tab_focus: HashMap::new(),
+            tab_shortcut_hint: false,
             bootstrapped: true,
             projects,
             active,
@@ -2148,6 +2256,7 @@ impl Client {
             tray_in_flight: HashSet::new(),
             clear_accepted_drafts: Vec::new(),
             modal,
+            rename_target: None,
             picker_highlight: None,
             search: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(match modal {
@@ -2251,7 +2360,14 @@ impl Client {
         client
     }
 
-    fn tab(&self, session: &Session, divided: bool, cx: &Context<Self>) -> AnyElement {
+    fn tab(
+        &self,
+        session: &Session,
+        index: usize,
+        divided: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let focus = self.tab_focus.get(&session.id).expect("rendered tab focus");
         let selected = self.active == session.id;
         let busy = self
             .statuses
@@ -2269,9 +2385,32 @@ impl Client {
         let title = session.title.clone();
         let id = session.id.clone();
         let rename_id = id.clone();
+        let rename_key_id = id.clone();
         let close_id = id.clone();
+        let close_key_id = id.clone();
+        let activate_id = id.clone();
+        let indicator = if self.tab_shortcut_hint && index < 9 {
+            (index + 1).to_string()
+        } else if has_jobs || busy {
+            "✿".to_owned()
+        } else {
+            "●".to_owned()
+        };
         div()
             .id(format!("tab-{id}"))
+            .role(Role::Button)
+            .aria_label(format!("Open session: {}", session.title))
+            .test_support()
+            .track_focus(&focus[0])
+            .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.select_session(activate_id.clone());
+                    this.focus_selected_composer(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .relative()
             .h(px(34.))
             .w_full()
@@ -2286,8 +2425,9 @@ impl Client {
                 self.tone(0xf4f1eb, 0x0d0f11)
             })
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_session(id.clone());
+                this.focus_selected_composer(window, cx);
                 cx.notify();
             }))
             .when(divided, |tab| {
@@ -2301,11 +2441,7 @@ impl Client {
                         .bg(self.tone(0xc8c3ba, 0x2b3034)),
                 )
             })
-            .child(div().text_color(rgb(dot_color)).child(if has_jobs || busy {
-                "✿"
-            } else {
-                "●"
-            }))
+            .child(div().text_color(rgb(dot_color)).child(indicator))
             .child(
                 div()
                     .flex_1()
@@ -2327,6 +2463,18 @@ impl Client {
             .child(
                 div()
                     .id(format!("rename-{}", session.id))
+                    .role(Role::Button)
+                    .aria_label(format!("Rename session: {}", session.title))
+                    .test_support()
+                    .track_focus(&focus[1])
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.rename_target = Some(rename_key_id.clone());
+                            this.show_modal(Modal::Rename, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .text_color(if selected {
                         self.tone(0x555b5c, 0xc8c4bd)
                     } else {
@@ -2335,7 +2483,7 @@ impl Client {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.select_session(rename_id.clone());
+                        this.rename_target = Some(rename_id.clone());
                         this.show_modal(Modal::Rename, window, cx);
                     }))
                     .child("✎"),
@@ -2343,15 +2491,28 @@ impl Client {
             .child(
                 div()
                     .id(format!("close-{}", session.id))
+                    .role(Role::Button)
+                    .aria_label(format!("Close tab: {}", session.title))
+                    .test_support()
+                    .track_focus(&focus[2])
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.close_tab(&close_key_id, cx);
+                            this.focus_selected_composer(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .text_color(if selected {
                         self.tone(0x555b5c, 0xc8c4bd)
                     } else {
                         self.tone(0xa3a9a8, 0x899097)
                     })
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.close_tab(&close_id, cx);
+                        this.focus_selected_composer(window, cx);
                     }))
                     .child("×"),
             )
@@ -2361,10 +2522,10 @@ impl Client {
     fn sidebar(&self, cx: &Context<Self>) -> AnyElement {
         let mut tabs = div().flex().flex_col().p(px(8.)).gap(px(5.));
         let mut previous_inactive = false;
-        for id in &self.open_tabs {
+        for (index, id) in self.open_tabs.iter().enumerate() {
             if let Some(session) = self.sessions.iter().find(|session| &session.id == id) {
                 let active = session.id == self.active;
-                tabs = tabs.child(self.tab(session, !active && previous_inactive, cx));
+                tabs = tabs.child(self.tab(session, index, !active && previous_inactive, cx));
                 previous_inactive = !active;
             }
         }
@@ -4209,6 +4370,12 @@ impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
         self.sync_composer(window, cx);
+        self.tab_focus.retain(|id, _| self.open_tabs.contains(id));
+        for id in &self.open_tabs {
+            self.tab_focus
+                .entry(id.clone())
+                .or_insert_with(|| std::array::from_fn(|_| cx.focus_handle().tab_stop(true)));
+        }
         if let Some((old_offset, old_max)) = self.preserve_scroll.take() {
             let scroll = self.scroll.clone();
             window.on_next_frame(move |window, _| {
@@ -4252,7 +4419,8 @@ impl Render for Client {
             .id("app-root")
             .size_full()
             .relative()
-            .on_key_down(cx.listener(Self::handle_key_down))
+            .capture_key_down(cx.listener(Self::handle_key_down))
+            .capture_key_up(cx.listener(Self::handle_key_up))
             .flex()
             .flex_col()
             .font_family("Noto Sans")
@@ -4360,9 +4528,10 @@ pub fn run(args: Args) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, MarkdownBlock, markdown_blocks, sticky_user_index};
+    use super::{Client, MarkdownBlock, Modal, markdown_blocks, sticky_user_index, tab_number_key};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext, Role, TestAppContext, WindowOptions, px};
+    use gpui_kit::{AppContext, Focusable, Role, TestAppContext, WindowOptions, px};
+    use opencode_gpui::model::RunStatus;
 
     #[gpui_kit::test]
     fn permission_action_exposes_role_name_and_updates_state(cx: &mut TestAppContext) {
@@ -4433,6 +4602,177 @@ mod tests {
         })
         .unwrap();
         cx.update(|cx| assert!(!client.read(cx).settings.remember_password));
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_shortcuts_navigate_rename_and_acknowledge_unread(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        let tabs = cx.update(|cx| client.read(cx).open_tabs.clone());
+        assert!(tabs.len() >= 2);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("alt-2", cx);
+            assert_eq!(client.read(cx).active, tabs[1]);
+            assert!(client.read(cx).tab_shortcut_hint);
+            window.press("alt", cx);
+            assert!(!client.read(cx).tab_shortcut_hint);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(client.read(cx).permission_focus[0].is_focused(window));
+            client.update(cx, |client, cx| {
+                client.unread.insert(client.active.clone());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.press("escape", cx);
+            assert!(client.read(cx).unread.contains(&tabs[1]));
+            window.press("ctrl-1", cx);
+            assert_eq!(client.read(cx).active, tabs[0]);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-shift-tab", cx);
+            assert_eq!(client.read(cx).active, *tabs.last().unwrap());
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("f2", cx);
+            assert!(client.read(cx).modal == Some(Modal::Rename));
+            window.press("escape", cx);
+            assert!(client.read(cx).modal.is_none());
+            client.update(cx, |client, cx| {
+                client.unread.insert(client.active.clone());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.press("escape", cx);
+            assert!(!client.read(cx).unread.contains(&client.read(cx).active));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn numbered_tab_shortcuts_only_accept_one_through_nine() {
+        assert_eq!(tab_number_key("1"), Some(0));
+        assert_eq!(tab_number_key("numpad9"), Some(8));
+        assert_eq!(tab_number_key("kp_4"), Some(3));
+        assert_eq!(tab_number_key("0"), None);
+        assert_eq!(tab_number_key("10"), None);
+        assert_eq!(tab_number_key("x"), None);
+    }
+
+    #[gpui_kit::test]
+    fn composer_keeps_keyboard_navigation_after_switching_tabs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.permissions.clear();
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-tab", cx);
+            assert_eq!(client.read(cx).active, "ses_other");
+            assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-1", cx);
+            assert_eq!(client.read(cx).active, "ses_preview");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn inactive_row_actions_target_the_clicked_tab(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        let original = cx.update(|cx| client.read(cx).active.clone());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("rename-ses_other", cx);
+            assert_eq!(client.read(cx).active, original);
+            assert_eq!(client.read(cx).rename_target.as_deref(), Some("ses_other"));
+            assert_eq!(
+                client.read(cx).rename.read(cx).value().as_ref(),
+                "SSH tunnel notes"
+            );
+            client.update(cx, |client, cx| {
+                client.rename.update(cx, |input, cx| {
+                    input.set_value("Renamed other", window, cx);
+                });
+                client.rename_session(cx);
+            });
+            assert_eq!(client.read(cx).active, original);
+            assert_eq!(
+                client
+                    .read(cx)
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == "ses_other")
+                    .unwrap()
+                    .title,
+                "Renamed other"
+            );
+            window.render_frame(cx);
+            let close_focus = client.read(cx).tab_focus["ses_other"][2].clone();
+            close_focus.focus(window, cx);
+            window.press("space", cx);
+            assert!(!client.read(cx).open_tabs.contains(&"ses_other".to_owned()));
+            assert_eq!(client.read(cx).active, original);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn busy_to_idle_marks_open_tabs_unread_including_active(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, _| {
+                client
+                    .statuses
+                    .insert(client.active.clone(), RunStatus::Busy);
+                client.update_tab_status(client.active.clone(), RunStatus::Idle);
+                assert!(client.unread.contains(&client.active));
+                client.statuses.insert("ses_closed".into(), RunStatus::Busy);
+                client.update_tab_status("ses_closed".into(), RunStatus::Idle);
+                assert!(!client.unread.contains("ses_closed"));
+                client.select_session("ses_other".into());
+                assert!(!client.unread.contains("ses_other"));
+            });
+        });
     }
 
     #[test]
