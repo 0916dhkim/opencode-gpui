@@ -115,6 +115,27 @@ fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == close-tab ]]; then
   xdotool mousemove --window "$win" 247 116 click 1
 fi
+if [[ "${INTERACTION:-}" == permission || "${INTERACTION:-}" == permission-deny || "${INTERACTION:-}" == permission-once ]]; then
+  if [[ "$CLIENT" == gpui ]]; then
+    xdotool mousemove --window "$win" 92 148 click 1
+    sleep 0.4
+    if [[ "${INTERACTION:-}" == permission-deny ]]; then xdotool mousemove --window "$win" 492 737 click 1; fi
+    if [[ "${INTERACTION:-}" == permission-once ]]; then xdotool mousemove --window "$win" 578 737 click 1; fi
+  else
+    xdotool mousemove 92 148 click 1
+  fi
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == close-last-reopen ]]; then
+  for _ in {1..5}; do
+    xdotool mousemove --window "$win" 247 116 click 1
+    sleep 0.25
+  done
+  xdotool mousemove --window "$win" 72 764 click 1
+  sleep 0.4
+  xdotool mousemove --window "$win" 80 198 click 1
+  sleep 0.4
+  xdotool mousemove --window "$win" 440 252 click 1
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == copy-code ]]; then
   xdotool mousemove --window "$win" 720 392 click 1
   sleep 0.2

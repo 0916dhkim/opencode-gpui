@@ -11,13 +11,13 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
     api::{ApiConfig, ApiHandle, Command, InboxRequest, UiEvent},
-    credentials::{self, CloudflareAccessCredentials, SystemKeyring},
+    credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
     jobs::{self, JobRow, Jobs},
     model::{
         self, Conversation, ModelCatalog, ModelSelection, Project, RunStatus, Session,
         SessionModel, TranscriptRow, TranscriptRowKind,
     },
-    pending::{Forms, PendingRequest},
+    pending::{self, Forms, PendingRequest},
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
     preview, protocol, tray,
 };
@@ -53,6 +53,9 @@ struct Client {
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
     forms: Forms,
+    permissions: Vec<PendingPermission>,
+    permission_in_flight: HashSet<String>,
+    child_parents: HashMap<String, String>,
     next_prompt_request_id: u64,
     next_session_request_id: u64,
     next_model_request_id: u64,
@@ -63,6 +66,12 @@ struct Client {
     picker_highlight: Option<usize>,
     search: Entity<InputState>,
     rename: Entity<InputState>,
+}
+
+#[derive(Clone)]
+struct PendingPermission {
+    request: protocol::PermissionRequest,
+    directory: Option<String>,
 }
 
 struct SettingsFields {
@@ -163,6 +172,17 @@ fn timestamp(time: u64) -> String {
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+fn permission_detail(text: String) -> AnyElement {
+    div()
+        .p(px(8.))
+        .rounded(px(5.))
+        .bg(rgb(0xefede8))
+        .font_family("DejaVu Sans Mono")
+        .text_size(px(11.))
+        .child(text)
+        .into_any_element()
 }
 
 fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
@@ -401,6 +421,9 @@ impl Client {
             statuses: HashMap::new(),
             jobs: Vec::new(),
             forms: Forms::default(),
+            permissions: Vec::new(),
+            permission_in_flight: HashSet::new(),
+            child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
             next_model_request_id: 0,
@@ -490,6 +513,7 @@ impl Client {
             self.open_tabs.push(id.clone());
         }
         self.active = id.clone();
+        self.unread.remove(&id);
         self.scroll.scroll_to_bottom();
         self.jobs = self.running_jobs.rows(Some(&id));
         if let Some(api) = &self.api {
@@ -552,6 +576,9 @@ impl Client {
     fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
         let index = self.open_tabs.iter().position(|tab| tab == id);
         self.open_tabs.retain(|tab| tab != id);
+        self.conversations.remove(id);
+        self.transcript.remove(id);
+        self.unread.remove(id);
         if self.active == id {
             let next = index
                 .and_then(|index| {
@@ -564,7 +591,6 @@ impl Client {
             } else {
                 self.active.clear();
                 self.jobs.clear();
-                self.transcript.clear();
             }
         }
         self.persist_tabs();
@@ -690,11 +716,29 @@ impl Client {
         if username.is_empty() {
             anyhow::bail!("Username cannot be empty");
         }
-        let password = if typed_password.is_empty() {
-            self.settings.current.password.clone()
-        } else {
-            Some(typed_password)
-        };
+        let old = &self.settings.current;
+        let old_stored = self.settings.persisted.connection.basic_auth_in_keyring
+            && credentials::same_password_identity(
+                &old.base_url,
+                &old.username,
+                &self.settings.persisted.connection.server,
+                &self.settings.persisted.connection.username,
+            );
+        let password_plan = credentials::plan_password(
+            &SystemKeyring,
+            PasswordTarget {
+                server: &old.base_url,
+                username: &old.username,
+            },
+            old.password.as_deref(),
+            old_stored,
+            PasswordTarget {
+                server: &server,
+                username: &username,
+            },
+            &typed_password,
+            self.settings.remember_password,
+        );
         let cloudflare_access = if client_id.is_empty() {
             None
         } else if !client_secret.is_empty() {
@@ -714,41 +758,38 @@ impl Client {
         let config = ApiConfig {
             base_url: server.clone(),
             username: username.clone(),
-            password: password.clone(),
+            password: password_plan.password.clone(),
             cloudflare_access: cloudflare_access.clone(),
         };
-        let old = &self.settings.current;
-        let remember = self.settings.remember_password && password.is_some();
-        if remember {
-            credentials::save_password(
-                &SystemKeyring,
-                &server,
-                &username,
-                password.as_deref().unwrap(),
-            )?;
-        } else if self.settings.persisted.connection.basic_auth_in_keyring {
-            credentials::remove_password(&SystemKeyring, &old.base_url, &old.username)?;
-        }
+        // Open the new connection before writing any credential under its identity.
+        let (api, receiver, key) = ApiHandle::start(config.clone())?;
         if let Some(token) = &cloudflare_access {
             credentials::save(&server, token)?;
-        } else if self.settings.persisted.connection.cloudflare_access {
+        } else if old.cloudflare_access.is_some() && old.base_url.trim_end_matches('/') == server {
             credentials::remove(&old.base_url)?;
+        }
+        let (stored, warning) =
+            credentials::apply_password_change(&SystemKeyring, &server, &username, &password_plan);
+        if let Some(warning) = &warning {
+            log::warn!("{warning}");
         }
         let mut persisted = self.settings.persisted.clone();
         persisted.connection = ConnectionSettings {
             server: server.clone(),
             username,
             cloudflare_access: cloudflare_access.is_some(),
-            basic_auth_in_keyring: remember,
+            basic_auth_in_keyring: stored,
         };
         persisted.save(&persist::default_path())?;
-        let (api, receiver, key) = ApiHandle::start(config.clone())?;
         self.connection_generation += 1;
         let generation = self.connection_generation;
         self.api = Some(api);
         self.settings.persisted = persisted.clone();
         self.settings.current = config;
-        self.connection_status = "Connecting".into();
+        self.connection_status = warning.map_or_else(
+            || "Connecting".into(),
+            |warning| format!("Connecting · {warning}"),
+        );
         self.disconnected = false;
         self.sessions.clear();
         self.open_tabs = persisted
@@ -764,6 +805,9 @@ impl Client {
         self.catalogs.clear();
         self.statuses.clear();
         self.forms.clear();
+        self.permissions.clear();
+        self.permission_in_flight.clear();
+        self.child_parents.clear();
         self.tray_in_flight.clear();
         self.jobs.clear();
         self.running_jobs = Jobs::default();
@@ -1059,6 +1103,97 @@ impl Client {
             .collect()
     }
 
+    fn upsert_permission(
+        &mut self,
+        directory: Option<String>,
+        request: protocol::PermissionRequest,
+    ) {
+        if let Some(existing) = self
+            .permissions
+            .iter_mut()
+            .find(|item| item.request.id == request.id)
+        {
+            existing.directory = directory.or(existing.directory.take());
+            existing.request = request;
+        } else {
+            self.permissions
+                .push(PendingPermission { request, directory });
+        }
+    }
+
+    fn reconcile_pending(&mut self, requests: Vec<PendingRequest>, covered: &HashSet<String>) {
+        let missing_permissions = pending::dismissed_requests(
+            self.permissions.iter().map(|item| &item.request.id),
+            &requests,
+            covered,
+            |id| {
+                self.permissions
+                    .iter()
+                    .find(|item| item.request.id == id)
+                    .and_then(|item| item.directory.clone())
+            },
+        );
+        self.permissions
+            .retain(|item| !missing_permissions.contains(&item.request.id));
+        for id in missing_permissions {
+            self.permission_in_flight.remove(&id);
+        }
+        let form_ids: Vec<String> = self.forms.ids().map(str::to_owned).collect();
+        let missing_forms =
+            pending::dismissed_requests(form_ids.iter(), &requests, covered, |id| {
+                self.forms.directory(id).map(str::to_owned)
+            });
+        for id in missing_forms {
+            self.forms.remove(&id);
+        }
+        for pending in requests {
+            match pending {
+                PendingRequest::Form(form) => self.forms.upsert(form),
+                PendingRequest::Permission { directory, request } => {
+                    self.upsert_permission(Some(directory), request);
+                }
+            }
+        }
+    }
+
+    fn visible_permission(&self) -> Option<PendingPermission> {
+        self.permissions
+            .iter()
+            .find(|item| {
+                pending::permission_scope(
+                    &item.request.session_id,
+                    |id| self.sessions.iter().any(|session| session.id == id),
+                    &self.child_parents,
+                )
+                .is_none_or(|scope| scope == self.active)
+            })
+            .cloned()
+    }
+
+    fn reply_permission(
+        &mut self,
+        request_id: String,
+        session_id: String,
+        decision: protocol::PermissionDecision,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.permission_in_flight.insert(request_id.clone()) {
+            return;
+        }
+        if let Some(api) = &self.api {
+            api.send(Command::ReplyPermission {
+                request_id,
+                session_id,
+                decision,
+            });
+        } else {
+            self.permissions
+                .retain(|item| item.request.id != request_id);
+            self.permission_in_flight.remove(&request_id);
+        }
+        cx.notify();
+    }
+
     fn choose_attachments(&mut self, cx: &mut Context<Self>) {
         let supports_attachments = self
             .selected_model()
@@ -1107,6 +1242,7 @@ impl Client {
         if (text.trim().is_empty() && self.attachments_draft.is_empty())
             || self.active.is_empty()
             || self.pending_prompt.is_some()
+            || self.visible_permission().is_some()
         {
             return;
         }
@@ -1224,14 +1360,9 @@ impl Client {
                     self.statuses.extend(data.statuses);
                 }
                 if !data.retry_needed {
-                    self.forms.clear();
                     self.tray_in_flight.clear();
                 }
-                for pending in data.pending {
-                    if let PendingRequest::Form(form) = pending {
-                        self.forms.upsert(form);
-                    }
-                }
+                self.reconcile_pending(data.pending, &data.pending_covered);
                 let directories = self.active_directories();
                 let context = jobs::Context {
                     roots: &self.sessions,
@@ -1382,6 +1513,17 @@ impl Client {
                 }
                 Err(error) => self.connection_status = format!("Cancel failed: {error}"),
             },
+            UiEvent::PermissionReplied { request_id, result } => {
+                self.permission_in_flight.remove(&request_id);
+                match result {
+                    Ok(_) => self
+                        .permissions
+                        .retain(|item| item.request.id != request_id),
+                    Err(error) => {
+                        self.connection_status = format!("Permission reply failed: {error}")
+                    }
+                }
+            }
             UiEvent::InboxSettled {
                 session_id,
                 inbox_id,
@@ -1408,6 +1550,14 @@ impl Client {
                 self.connection_status = format!("Stop failed: {error}");
             }
             UiEvent::SessionInfoLoaded(info) => {
+                for (_, result) in &info {
+                    if let Ok(session) = result
+                        && let Some(parent) = &session.parent_id
+                    {
+                        self.child_parents
+                            .insert(session.id.clone(), parent.clone());
+                    }
+                }
                 self.running_jobs.apply_session_info(info);
                 self.jobs = self.running_jobs.rows(Some(&self.active));
                 let directories = self.active_directories();
@@ -1427,6 +1577,9 @@ impl Client {
             UiEvent::ServerEvent(envelope) => {
                 if let Ok(event) = protocol::Event::deserialize(&envelope.payload) {
                     let kind = protocol::decode_event(&event);
+                    if let Some((child, parent)) = pending::subagent_child(&kind) {
+                        self.child_parents.insert(child, parent);
+                    }
                     if let Some((id, status)) = model::run_status_change(&kind) {
                         let was_busy = self.statuses.get(&id).is_some_and(RunStatus::is_busy);
                         if was_busy && !status.is_busy() && id != self.active {
@@ -1488,26 +1641,23 @@ impl Client {
                         opencode_gpui::pending::pending_change(&kind, envelope.directory.as_deref())
                     {
                         match change {
+                            pending::PendingChange::Permission { directory, request } => {
+                                self.upsert_permission(directory, request);
+                            }
                             opencode_gpui::pending::PendingChange::Form(form) => {
                                 self.forms.upsert(form)
                             }
                             opencode_gpui::pending::PendingChange::Resolved(id) => {
                                 self.forms.remove(&id);
+                                self.permissions.retain(|item| item.request.id != id);
+                                self.permission_in_flight.remove(&id);
                             }
-                            _ => {}
                         }
                     }
                 }
             }
             UiEvent::PendingLoaded(snapshot) => {
-                if snapshot.complete {
-                    self.forms.clear();
-                }
-                for pending in snapshot.requests {
-                    if let PendingRequest::Form(form) = pending {
-                        self.forms.upsert(form);
-                    }
-                }
+                self.reconcile_pending(snapshot.requests, &snapshot.covered);
             }
             _ => {}
         }
@@ -1538,9 +1688,16 @@ impl Client {
         let projects = bootstrap.projects.clone();
         let sessions = bootstrap.sessions;
         let mut forms = Forms::default();
+        let mut permissions = Vec::new();
         for pending in bootstrap.pending {
-            if let PendingRequest::Form(form) = pending {
-                forms.upsert(form);
+            match pending {
+                PendingRequest::Form(form) => forms.upsert(form),
+                PendingRequest::Permission { directory, request } => {
+                    permissions.push(PendingPermission {
+                        request,
+                        directory: Some(directory),
+                    });
+                }
             }
         }
         let dirs = vec!["/repo".to_owned()];
@@ -1662,6 +1819,9 @@ impl Client {
             statuses: bootstrap.statuses,
             jobs,
             forms,
+            permissions,
+            permission_in_flight: HashSet::new(),
+            child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
             next_model_request_id: 0,
@@ -1744,6 +1904,8 @@ impl Client {
         client.sessions.clear();
         client.transcript.clear();
         client.conversations.clear();
+        client.forms.clear();
+        client.permissions.clear();
         api.send(Command::Bootstrap {
             sessions: vec![],
             directories: vec![],
@@ -1778,7 +1940,7 @@ impl Client {
             .get(&session.id)
             .is_some_and(RunStatus::is_busy);
         let unread = self.unread.contains(&session.id);
-        let has_jobs = self.jobs.iter().any(|job| job.id == session.id);
+        let has_jobs = self.running_jobs.sessions_with_jobs().contains(&session.id);
         let dot_color = if busy {
             0xa46910
         } else if unread {
@@ -2092,6 +2254,152 @@ impl Client {
             );
         }
         Some(bar.into_any_element())
+    }
+
+    fn permission_card(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let prompt = self.visible_permission()?;
+        let request = &prompt.request;
+        let requester = self
+            .sessions
+            .iter()
+            .find(|session| session.id == request.session_id)
+            .map(|session| session.title.clone())
+            .or_else(|| {
+                self.child_parents
+                    .get(&request.session_id)
+                    .and_then(|parent| self.sessions.iter().find(|session| &session.id == parent))
+                    .map(|parent| format!("a subagent of {}", parent.title))
+            })
+            .unwrap_or_else(|| format!("session {}", request.session_id));
+        let directory = prompt.directory.or_else(|| {
+            self.sessions
+                .iter()
+                .find(|session| session.id == request.session_id)
+                .map(|session| session.directory.clone())
+                .or_else(|| {
+                    self.child_parents
+                        .get(&request.session_id)
+                        .and_then(|parent| {
+                            self.sessions.iter().find(|session| &session.id == parent)
+                        })
+                        .map(|parent| parent.directory.clone())
+                })
+        });
+        let mut context = format!("Requested by {requester}");
+        if let Some(directory) = directory {
+            context.push_str(&format!("\n{directory}"));
+        }
+        if let Some(source) = pending::source_text(request) {
+            context.push_str(&format!("\n{source}"));
+        }
+        let mut details = div().flex().flex_col().gap(px(12.));
+        let mut has_details = false;
+        if let Some(message) = request
+            .message
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            details = details.child(message.to_owned());
+            has_details = true;
+        }
+        if !request.resources.is_empty() {
+            details = details.child(permission_detail(request.resources.join("\n")));
+            has_details = true;
+        }
+        if let Some(metadata) = pending::metadata_text(request.metadata.as_ref()) {
+            details = details.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0x626764))
+                    .child(metadata),
+            );
+            has_details = true;
+        }
+        let always = pending::always_patterns(request);
+        if let Some(patterns) = &always {
+            details = details
+                .child(
+                    div()
+                        .text_color(rgb(0x8b5918))
+                        .child("Always allow would remember:"),
+                )
+                .child(permission_detail(patterns.clone()));
+            has_details = true;
+        }
+        let mut actions = div().flex().justify_end().gap(px(8.));
+        let mut choices = vec![
+            ("Deny", protocol::PermissionDecision::Reject),
+            ("Allow once", protocol::PermissionDecision::Once),
+        ];
+        if always.is_some() {
+            choices.push(("Always allow", protocol::PermissionDecision::Always));
+        }
+        let in_flight = self.permission_in_flight.contains(&request.id);
+        for (label, decision) in choices {
+            let id = request.id.clone();
+            let session_id = request.session_id.clone();
+            actions = actions.child(
+                div()
+                    .id(format!("permission-{label}-{}", request.id))
+                    .px(px(12.))
+                    .py(px(7.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .bg(rgb(if decision == protocol::PermissionDecision::Once {
+                        0xc59535
+                    } else {
+                        0xfffdfa
+                    }))
+                    .when(!in_flight, |button| {
+                        button
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.reply_permission(id.clone(), session_id.clone(), decision, cx);
+                            }))
+                    })
+                    .child(label),
+            );
+        }
+        let action = if request.action.trim().is_empty() {
+            "tool action"
+        } else {
+            request.action.trim()
+        };
+        let mut card = div()
+            .id("permission-card")
+            .mx(px(16.))
+            .mb(px(17.))
+            .p(px(16.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .rounded(px(11.))
+            .border_1()
+            .border_color(rgb(0xc8c3ba))
+            .bg(rgb(0xfffdfa))
+            .child(
+                div()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(format!("Allow {action}?")),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0x737875))
+                    .child(context),
+            );
+        if has_details {
+            card = card.child(
+                div()
+                    .min_h(px(80.))
+                    .max_h(px(320.))
+                    .overflow_y_scrollbar()
+                    .child(details),
+            );
+        }
+        Some(card.child(actions).into_any_element())
     }
 
     fn working_pill(&self) -> Option<AnyElement> {
@@ -3260,6 +3568,9 @@ impl Render for Client {
                 self.attachments_draft.clear();
             }
         }
+        let composer_slot = self
+            .permission_card(cx)
+            .unwrap_or_else(|| self.composer(cx));
         div()
             .id("app-root")
             .size_full()
@@ -3329,7 +3640,7 @@ impl Render for Client {
                             .when_some(self.working_pill(), |view, pill| view.child(pill))
                             .when_some(self.form_notice(cx), |view, notice| view.child(notice))
                             .when_some(self.tray_view(cx), |view, tray| view.child(tray))
-                            .child(self.composer(cx)),
+                            .child(composer_slot),
                     ),
             )
             .when_some(self.modal_view(cx), |view, modal| view.child(modal))
