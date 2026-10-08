@@ -1,12 +1,12 @@
 [package]
-name = "opencode-cosmic"
+name = "opencode-gpui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
-description = "A native COSMIC client for OpenCode"
+description = "A native GPUI client for OpenCode"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/0916dhkim/opencode-cosmic"
+repository = "https://github.com/0916dhkim/opencode-gpui"
 
 [dependencies]
 anyhow = "1.0"
@@ -14,9 +14,10 @@ async-channel = "2.3"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 dirs = "6.0"
+env_logger = "0.11"
 jiff = "0.2"
 keyring = { version = "3.6", features = ["crypto-rust", "sync-secret-service"] }
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", default-features = false, features = ["tokio", "winit", "wayland", "wgpu", "dbus-config"] }
+gpui-kit = "0.7.1"
 log = "0.4"
 mime_guess = "2.0"
 pulldown-cmark = { version = "0.13", default-features = false }

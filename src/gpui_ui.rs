@@ -1,0 +1,2848 @@
+//! GPUI Kit shell backed by the v2 transport, or its deterministic preview fixture.
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use base64::Engine;
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::text::markdown;
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
+use opencode_gpui::{
+    api::{ApiConfig, ApiHandle, Command, UiEvent},
+    credentials::{self, CloudflareAccessCredentials, SystemKeyring},
+    jobs::{self, JobRow, Jobs},
+    model::{
+        self, Conversation, ModelCatalog, ModelSelection, Project, RunStatus, Session,
+        SessionModel, TranscriptRow, TranscriptRowKind,
+    },
+    pending::{Forms, PendingRequest},
+    persist::{self, ConnectionSettings, PersistedState, PersistedTab},
+    preview, protocol,
+};
+use serde::Deserialize;
+
+use crate::Args;
+
+struct Client {
+    api: Option<ApiHandle>,
+    preview_api: bool,
+    connection_generation: u64,
+    settings: SettingsFields,
+    saved_active: Option<String>,
+    connection_status: String,
+    disconnected: bool,
+    server_version: Option<String>,
+    conversations: HashMap<String, Conversation>,
+    catalogs: HashMap<String, ModelCatalog>,
+    running_jobs: Jobs,
+    sessions: Vec<Session>,
+    open_tabs: Vec<String>,
+    bootstrapped: bool,
+    projects: Vec<Project>,
+    active: String,
+    transcript: HashMap<String, Vec<TranscriptRow>>,
+    attachments: HashMap<(String, usize, usize), Arc<Image>>,
+    catalog: ModelCatalog,
+    composer: Entity<TextareaState>,
+    attachments_draft: Vec<PathBuf>,
+    overlay: Option<String>,
+    scroll: ScrollHandle,
+    unread: HashSet<String>,
+    statuses: HashMap<String, RunStatus>,
+    jobs: Vec<JobRow>,
+    forms: Forms,
+    next_prompt_request_id: u64,
+    next_session_request_id: u64,
+    next_model_request_id: u64,
+    pending_prompt: Option<(u64, String, String, Vec<PathBuf>)>,
+    clear_accepted_draft: Option<(String, String, Vec<PathBuf>)>,
+    modal: Option<Modal>,
+    search: Entity<InputState>,
+    rename: Entity<InputState>,
+}
+
+struct SettingsFields {
+    persisted: PersistedState,
+    current: ApiConfig,
+    server: Entity<InputState>,
+    username: Entity<InputState>,
+    password: Entity<InputState>,
+    client_id: Entity<InputState>,
+    client_secret: Entity<InputState>,
+    session_search: Entity<InputState>,
+    tab: SettingsTab,
+    remember_password: bool,
+    error: Option<String>,
+}
+
+impl SettingsFields {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Client>,
+        persisted: PersistedState,
+        current: ApiConfig,
+    ) -> Self {
+        let remember_password = true;
+        let password_hint = if persisted.connection.basic_auth_in_keyring {
+            "Stored in the system keyring"
+        } else if current.password.is_some() {
+            "Leave blank to keep the current password"
+        } else {
+            "Required by OpenCode 2.x"
+        };
+        let (id, secret) = current.cloudflare_access.as_ref().map_or_else(
+            || (String::new(), "Optional"),
+            |token| (token.client_id.clone(), "Stored in the system keyring"),
+        );
+        Self {
+            server: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(current.base_url.clone())
+                    .placeholder("https://opencode.example.com")
+            }),
+            username: cx
+                .new(|cx| InputState::new(window, cx).default_value(current.username.clone())),
+            password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder(password_hint)
+            }),
+            client_id: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(id)
+                    .placeholder("Optional")
+            }),
+            client_secret: cx
+                .new(|cx| InputState::new(window, cx).masked(true).placeholder(secret)),
+            session_search: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Search sessions by title or path...")
+            }),
+            tab: SettingsTab::Connection,
+            remember_password,
+            persisted,
+            current,
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Modal {
+    Settings,
+    Sessions,
+    NewSession,
+    Rename,
+    Model,
+    Level,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Connection,
+    Sessions,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MarkdownBlock {
+    Heading(u8, String),
+    Paragraph(String),
+    List(Vec<String>),
+    Code(String, String),
+}
+
+fn timestamp(time: u64) -> String {
+    jiff::Timestamp::from_millisecond(time as i64)
+        .map(|timestamp| {
+            timestamp
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .strftime("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
+    let mut lines = source.lines().peekable();
+    let mut blocks = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(language) = line.strip_prefix("```") {
+            let mut code = String::new();
+            for next in lines.by_ref() {
+                if next.starts_with("```") {
+                    break;
+                }
+                if !code.is_empty() {
+                    code.push('\n');
+                }
+                code.push_str(next);
+            }
+            blocks.push(MarkdownBlock::Code(language.to_owned(), code));
+            continue;
+        }
+        if let Some((level, title)) = line
+            .split_once(' ')
+            .filter(|(marks, _)| !marks.is_empty() && marks.bytes().all(|c| c == b'#'))
+        {
+            blocks.push(MarkdownBlock::Heading(level.len() as u8, title.to_owned()));
+            continue;
+        }
+        if line.starts_with("- ") || line.starts_with("* ") {
+            let mut items = vec![line[2..].to_owned()];
+            while let Some(next) = lines
+                .peek()
+                .filter(|next| next.starts_with("- ") || next.starts_with("* "))
+            {
+                items.push(next[2..].to_owned());
+                lines.next();
+            }
+            blocks.push(MarkdownBlock::List(items));
+            continue;
+        }
+        let mut text = line.to_owned();
+        while let Some(next) = lines.peek().filter(|next| {
+            !next.trim().is_empty()
+                && !next.starts_with("```")
+                && !next.starts_with("# ")
+                && !next.starts_with("- ")
+                && !next.starts_with("* ")
+        }) {
+            text.push('\n');
+            text.push_str(next);
+            lines.next();
+        }
+        blocks.push(MarkdownBlock::Paragraph(text));
+    }
+    blocks
+}
+
+fn inline_image(url: &str) -> Option<Arc<Image>> {
+    let (metadata, encoded) = url.strip_prefix("data:")?.split_once(',')?;
+    let format = match metadata {
+        "image/png;base64" => ImageFormat::Png,
+        "image/jpeg;base64" => ImageFormat::Jpeg,
+        "image/webp;base64" => ImageFormat::Webp,
+        "image/gif;base64" => ImageFormat::Gif,
+        _ => return None,
+    };
+    // Avoid decoding an unbounded server-supplied data URL on the UI thread.
+    if encoded.len() > 14_000_000 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+impl Client {
+    fn markdown_body(&self, source: &str, row_index: usize, cx: &Context<Self>) -> AnyElement {
+        let mut content = div().w_full().flex().flex_col().gap(px(10.));
+        for (block_index, block) in markdown_blocks(source).into_iter().enumerate() {
+            let element: AnyElement = match block {
+                MarkdownBlock::Heading(level, title) => div()
+                    .text_size(px(match level {
+                        1 => 18.,
+                        2 => 16.,
+                        _ => 14.,
+                    }))
+                    .font_weight(FontWeight::BOLD)
+                    .child(title)
+                    .into_any_element(),
+                MarkdownBlock::Paragraph(text) => markdown(text).into_any_element(),
+                MarkdownBlock::List(items) => {
+                    let mut list = div().flex().flex_col().gap(px(10.));
+                    for item in items {
+                        list = list.child(
+                            div()
+                                .flex()
+                                .gap(px(9.))
+                                .child(div().w(px(17.)).text_color(rgb(0x777e7d)).child("•"))
+                                .child(markdown(item)),
+                        );
+                    }
+                    list.into_any_element()
+                }
+                MarkdownBlock::Code(language, code) => {
+                    let copy = code.clone();
+                    div()
+                        .w_full()
+                        .rounded(px(7.))
+                        .border_1()
+                        .border_color(rgb(0xd2cdc5))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h(px(32.))
+                                .px(px(12.))
+                                .flex()
+                                .items_center()
+                                .bg(rgb(0xece9e2))
+                                .border_b_1()
+                                .border_color(rgb(0xd2cdc5))
+                                .text_size(px(10.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0x777e7d))
+                                .child(language)
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .id(format!("copy-code-{row_index}-{block_index}"))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy.clone(),
+                                            ));
+                                        }))
+                                        .child("▣"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .min_h(px(65.))
+                                .p(px(12.))
+                                .font_family("monospace")
+                                .text_size(px(12.))
+                                .child(code),
+                        )
+                        .into_any_element()
+                }
+            };
+            content = content.child(element);
+        }
+        content.into_any_element()
+    }
+
+    fn from_live(window: &mut Window, cx: &mut Context<Self>, args: &Args) -> Self {
+        let (state, state_warning) = match persist::load_with_legacy(&persist::default_path()) {
+            Ok(loaded) => loaded,
+            Err(error) => (PersistedState::default(), Some(error.to_string())),
+        };
+        let server = args
+            .server
+            .clone()
+            .unwrap_or(state.connection.server.clone());
+        let username = args
+            .username
+            .clone()
+            .unwrap_or(state.connection.username.clone());
+        let password = credentials::initial_password(
+            &SystemKeyring,
+            &server,
+            &username,
+            args.password.clone(),
+            state.connection.basic_auth_in_keyring,
+            state.connection.basic_auth_in_keyring,
+        );
+        let cloudflare_access = match (&args.cf_access_client_id, &args.cf_access_client_secret) {
+            (Some(id), Some(secret)) => {
+                CloudflareAccessCredentials::new(id.clone(), secret.clone()).map(Some)
+            }
+            (None, None) if state.connection.cloudflare_access => credentials::load(&server),
+            (None, None) => Ok(None),
+            _ => Err(anyhow::anyhow!(
+                "Cloudflare Access requires both client ID and secret"
+            )),
+        };
+        let mut warnings: Vec<String> = [state_warning, password.warning]
+            .into_iter()
+            .flatten()
+            .collect();
+        let cloudflare_access = match cloudflare_access {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                warnings.push(error.to_string());
+                None
+            }
+        };
+        let config = ApiConfig {
+            base_url: server,
+            username,
+            password: password.password,
+            cloudflare_access,
+        };
+        let scroll = ScrollHandle::new();
+        let mut client = Self {
+            api: None,
+            preview_api: false,
+            connection_generation: 0,
+            settings: SettingsFields::new(window, cx, state.clone(), config.clone()),
+            saved_active: None,
+            connection_status: "Connecting".into(),
+            disconnected: false,
+            server_version: None,
+            conversations: HashMap::new(),
+            catalogs: HashMap::new(),
+            running_jobs: Jobs::default(),
+            sessions: Vec::new(),
+            open_tabs: Vec::new(),
+            bootstrapped: false,
+            projects: Vec::new(),
+            active: String::new(),
+            transcript: HashMap::new(),
+            attachments: HashMap::new(),
+            catalog: ModelCatalog::default(),
+            composer: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(2, 8)
+                    .submit_on_enter(true)
+                    .placeholder("Ask OpenCode anything…")
+            }),
+            attachments_draft: Vec::new(),
+            overlay: None,
+            scroll,
+            unread: HashSet::new(),
+            statuses: HashMap::new(),
+            jobs: Vec::new(),
+            forms: Forms::default(),
+            next_prompt_request_id: 0,
+            next_session_request_id: 0,
+            next_model_request_id: 0,
+            pending_prompt: None,
+            clear_accepted_draft: None,
+            modal: None,
+            search: cx.new(|cx| InputState::new(window, cx).placeholder("Search models (fuzzy)…")),
+            rename: cx.new(|cx| InputState::new(window, cx)),
+        };
+        cx.subscribe(&client.composer, |this, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { secondary, shift } = event
+                && !shift
+            {
+                this.send_prompt(*secondary, cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&client.search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(
+            &client.settings.session_search,
+            |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        match ApiHandle::start(config) {
+            Ok((api, receiver, key)) => {
+                let saved = state.servers.get(&key);
+                client.saved_active = saved.and_then(|saved| saved.active.clone());
+                client.open_tabs = saved
+                    .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
+                    .unwrap_or_default();
+                client.unread = saved.map(|saved| saved.unread.clone()).unwrap_or_default();
+                api.send(Command::Bootstrap {
+                    sessions: saved
+                        .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
+                        .unwrap_or_default(),
+                    directories: saved
+                        .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
+                        .unwrap_or_default(),
+                });
+                client.api = Some(api);
+                cx.spawn(async move |this, cx| {
+                    while let Ok(event) = receiver.recv().await {
+                        if this
+                            .update(cx, |this, cx| {
+                                if this.connection_generation == 0 {
+                                    this.handle_live_event(event, cx);
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(error) => client.connection_status = format!("Connection failed: {error}"),
+        }
+        if !warnings.is_empty() {
+            log::warn!("GPUI connection setup: {}", warnings.join("; "));
+            if client.api.is_some() {
+                client.connection_status = format!("Connecting · {}", warnings.join("; "));
+            }
+        }
+        client
+    }
+
+    fn select_session(&mut self, id: String) {
+        if !self.open_tabs.contains(&id) {
+            self.open_tabs.push(id.clone());
+        }
+        self.active = id.clone();
+        self.unread.remove(&id);
+        self.scroll.scroll_to_bottom();
+        self.jobs = self.running_jobs.rows(Some(&id));
+        if let Some(api) = &self.api {
+            if !self
+                .conversations
+                .get(&id)
+                .is_some_and(|conversation| conversation.loaded)
+            {
+                api.send(Command::LoadMessages {
+                    session_id: id.clone(),
+                    cursor: None,
+                });
+            }
+            if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
+                self.catalog = self
+                    .catalogs
+                    .get(&session.directory)
+                    .cloned()
+                    .unwrap_or_default();
+                if !self.catalogs.contains_key(&session.directory) {
+                    api.send(Command::LoadModels {
+                        directory: session.directory.clone(),
+                    });
+                }
+            }
+        }
+        if self.bootstrapped {
+            self.persist_tabs();
+        }
+    }
+
+    fn persist_tabs(&mut self) {
+        if self.api.is_none() || self.preview_api {
+            return;
+        }
+        let key = self
+            .settings
+            .current
+            .base_url
+            .trim_end_matches('/')
+            .to_owned();
+        let server = self.settings.persisted.servers.entry(key).or_default();
+        server.tabs = self
+            .open_tabs
+            .iter()
+            .filter_map(|id| self.sessions.iter().find(|session| &session.id == id))
+            .map(|session| PersistedTab {
+                id: session.id.clone(),
+                title: session.title.clone(),
+                directory: session.directory.clone(),
+            })
+            .collect();
+        server.active = (!self.active.is_empty()).then(|| self.active.clone());
+        server.unread = self.unread.clone();
+        if let Err(error) = self.settings.persisted.save(&persist::default_path()) {
+            self.connection_status = format!("State save failed: {error}");
+        }
+    }
+
+    fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
+        let index = self.open_tabs.iter().position(|tab| tab == id);
+        self.open_tabs.retain(|tab| tab != id);
+        if self.active == id {
+            let next = index
+                .and_then(|index| {
+                    self.open_tabs
+                        .get(index.min(self.open_tabs.len().saturating_sub(1)))
+                })
+                .cloned();
+            if let Some(next) = next {
+                self.select_session(next);
+            } else {
+                self.active.clear();
+                self.jobs.clear();
+                self.transcript.clear();
+            }
+        }
+        self.persist_tabs();
+        cx.notify();
+    }
+
+    fn selected_model(&self) -> Option<ModelSelection> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == self.active)
+            .and_then(Session::model_selection)
+            .or_else(|| self.catalog.preferred.clone())
+    }
+
+    fn choose_model(&mut self, model: protocol::ModelRef, cx: &mut Context<Self>) {
+        if self.active.is_empty() {
+            return;
+        }
+        if let Some(api) = &self.api {
+            self.next_model_request_id += 1;
+            api.send(Command::SelectModel {
+                request_id: self.next_model_request_id,
+                session_id: self.active.clone(),
+                model,
+            });
+        } else if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == self.active)
+        {
+            session.model = Some(SessionModel {
+                id: model.id,
+                provider_id: model.provider_id,
+                variant: model.variant,
+            });
+        }
+        self.modal = None;
+        cx.notify();
+    }
+
+    fn create_session(&mut self, directory: String, cx: &mut Context<Self>) {
+        if let Some(api) = &self.api {
+            self.next_session_request_id += 1;
+            api.send(Command::CreateSession {
+                request_id: self.next_session_request_id,
+                directory,
+                title: None,
+            });
+        }
+        self.modal = None;
+        cx.notify();
+    }
+
+    fn rename_session(&mut self, cx: &mut Context<Self>) {
+        let title = self.rename.read(cx).value().trim().to_owned();
+        if title.is_empty() || self.active.is_empty() {
+            return;
+        }
+        if let Some(api) = &self.api {
+            self.next_session_request_id += 1;
+            api.send(Command::RenameSession {
+                request_id: self.next_session_request_id,
+                session_id: self.active.clone(),
+                title,
+            });
+        } else if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == self.active)
+        {
+            session.title = title;
+        }
+        self.modal = None;
+        cx.notify();
+    }
+
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        if self.preview_api || self.api.is_none() {
+            self.modal = None;
+            cx.notify();
+            return;
+        }
+        match self.apply_settings_inner(cx) {
+            Ok(()) => {
+                self.settings.error = None;
+                self.modal = None;
+            }
+            Err(error) => self.settings.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn apply_settings_inner(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let server = self
+            .settings
+            .server
+            .read(cx)
+            .value()
+            .trim()
+            .trim_end_matches('/')
+            .to_owned();
+        let username = self.settings.username.read(cx).value().trim().to_owned();
+        let typed_password = self.settings.password.read(cx).value().to_string();
+        let client_id = self.settings.client_id.read(cx).value().trim().to_owned();
+        let client_secret = self.settings.client_secret.read(cx).value().to_string();
+        let url = url::Url::parse(&server).map_err(|_| anyhow::anyhow!("Invalid server URL"))?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            anyhow::bail!("The server URL cannot contain credentials, a query, or a fragment");
+        }
+        let loopback = match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(host)) => host == "localhost",
+            None => false,
+        };
+        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+            anyhow::bail!("Remote servers require HTTPS; loopback HTTP is allowed");
+        }
+        if username.is_empty() {
+            anyhow::bail!("Username cannot be empty");
+        }
+        let password = if typed_password.is_empty() {
+            self.settings.current.password.clone()
+        } else {
+            Some(typed_password)
+        };
+        let cloudflare_access = if client_id.is_empty() {
+            None
+        } else if !client_secret.is_empty() {
+            Some(CloudflareAccessCredentials::new(
+                client_id.clone(),
+                client_secret,
+            )?)
+        } else {
+            self.settings
+                .current
+                .cloudflare_access
+                .clone()
+                .filter(|old| old.client_id == client_id)
+                .ok_or_else(|| anyhow::anyhow!("Enter the Cloudflare client secret for this ID"))?
+                .into()
+        };
+        let config = ApiConfig {
+            base_url: server.clone(),
+            username: username.clone(),
+            password: password.clone(),
+            cloudflare_access: cloudflare_access.clone(),
+        };
+        let old = &self.settings.current;
+        let remember = self.settings.remember_password && password.is_some();
+        if remember {
+            credentials::save_password(
+                &SystemKeyring,
+                &server,
+                &username,
+                password.as_deref().unwrap(),
+            )?;
+        } else if self.settings.persisted.connection.basic_auth_in_keyring {
+            credentials::remove_password(&SystemKeyring, &old.base_url, &old.username)?;
+        }
+        if let Some(token) = &cloudflare_access {
+            credentials::save(&server, token)?;
+        } else if self.settings.persisted.connection.cloudflare_access {
+            credentials::remove(&old.base_url)?;
+        }
+        let mut persisted = self.settings.persisted.clone();
+        persisted.connection = ConnectionSettings {
+            server: server.clone(),
+            username,
+            cloudflare_access: cloudflare_access.is_some(),
+            basic_auth_in_keyring: remember,
+        };
+        persisted.save(&persist::default_path())?;
+        let (api, receiver, key) = ApiHandle::start(config.clone())?;
+        self.connection_generation += 1;
+        let generation = self.connection_generation;
+        self.api = Some(api);
+        self.settings.persisted = persisted.clone();
+        self.settings.current = config;
+        self.connection_status = "Connecting".into();
+        self.disconnected = false;
+        self.sessions.clear();
+        self.open_tabs = persisted
+            .servers
+            .get(&key)
+            .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
+            .unwrap_or_default();
+        self.bootstrapped = false;
+        self.projects.clear();
+        self.active.clear();
+        self.transcript.clear();
+        self.conversations.clear();
+        self.catalogs.clear();
+        self.statuses.clear();
+        self.forms.clear();
+        self.jobs.clear();
+        self.running_jobs = Jobs::default();
+        let saved = persisted.servers.get(&key);
+        self.saved_active = saved.and_then(|saved| saved.active.clone());
+        if let Some(api) = &self.api {
+            api.send(Command::Bootstrap {
+                sessions: saved
+                    .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
+                    .unwrap_or_default(),
+                directories: saved
+                    .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
+                    .unwrap_or_default(),
+            });
+        }
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = receiver.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        if this.connection_generation == generation {
+                            this.handle_live_event(event, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        Ok(())
+    }
+
+    fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal = Some(modal);
+        match modal {
+            Modal::Sessions | Modal::NewSession | Modal::Model | Modal::Level => {
+                let placeholder = match modal {
+                    Modal::Model => "Search models (fuzzy)…",
+                    Modal::Level => "Search levels (fuzzy)…",
+                    Modal::Sessions => "Search tabs…",
+                    Modal::NewSession => "Search projects…",
+                    _ => "Search…",
+                };
+                self.search.update(cx, |input, cx| {
+                    input.set_placeholder(placeholder, window, cx);
+                    input.set_value("", window, cx);
+                });
+                self.search.focus_handle(cx).focus(window, cx);
+            }
+            Modal::Rename => {
+                let title = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == self.active)
+                    .map(|session| session.title.clone())
+                    .unwrap_or_default();
+                self.rename.update(cx, |input, cx| {
+                    input.set_value(title, window, cx);
+                    input.select_all(window, cx);
+                });
+                self.rename.focus_handle(cx).focus(window, cx);
+            }
+            Modal::Settings => {
+                self.settings.server.focus_handle(cx).focus(window, cx);
+                self.settings
+                    .server
+                    .update(cx, |input, cx| input.select_all(window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn active_directories(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|session| session.id == self.active)
+            .map(|session| session.directory.clone())
+            .collect()
+    }
+
+    fn choose_attachments(&mut self, cx: &mut Context<Self>) {
+        let supports_attachments = self
+            .selected_model()
+            .as_ref()
+            .and_then(|selection| self.catalog.find(selection))
+            .is_none_or(|model| model.supports_attachments);
+        if !supports_attachments {
+            self.connection_status = "Selected model does not accept attachments".into();
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let picked = rfd::AsyncFileDialog::new().pick_files().await;
+            if let Some(files) = picked {
+                let _ = this.update(cx, |this, cx| {
+                    for file in files {
+                        let path = file.path().to_path_buf();
+                        if !this.attachments_draft.contains(&path) {
+                            this.attachments_draft.push(path);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn send_prompt(&mut self, queue: bool, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().to_string();
+        if (text.trim().is_empty() && self.attachments_draft.is_empty())
+            || self.active.is_empty()
+            || self.pending_prompt.is_some()
+        {
+            return;
+        }
+        let Some(api) = &self.api else {
+            return;
+        };
+        self.next_prompt_request_id += 1;
+        let request_id = self.next_prompt_request_id;
+        let delivery = self
+            .statuses
+            .get(&self.active)
+            .is_some_and(RunStatus::is_busy)
+            .then_some(if queue {
+                protocol::Delivery::Queue
+            } else {
+                protocol::Delivery::Steer
+            });
+        api.send(Command::SendPrompt {
+            request_id,
+            message_id: protocol::new_message_id(),
+            session_id: self.active.clone(),
+            text: text.clone(),
+            attachments: self.attachments_draft.clone(),
+            delivery,
+        });
+        self.pending_prompt = Some((
+            request_id,
+            self.active.clone(),
+            text,
+            self.attachments_draft.clone(),
+        ));
+        cx.notify();
+    }
+
+    fn update_transcript(&mut self, session_id: &str) {
+        let Some(conversation) = self.conversations.get(session_id) else {
+            return;
+        };
+        let rows: Vec<TranscriptRow> = conversation
+            .messages
+            .iter()
+            .filter(|message| !message.in_tray())
+            .flat_map(|message| message.rows())
+            .collect();
+        self.attachments.retain(|(id, _, _), _| id != session_id);
+        for (row_index, row) in rows.iter().enumerate() {
+            for (image_index, url) in row.images.iter().enumerate() {
+                if let Some(image) = inline_image(url) {
+                    self.attachments
+                        .insert((session_id.to_owned(), row_index, image_index), image);
+                }
+            }
+        }
+        self.transcript.insert(session_id.to_owned(), rows);
+    }
+
+    fn handle_live_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
+        match event {
+            UiEvent::Connection {
+                connected: true, ..
+            } => {
+                self.connection_status = self
+                    .server_version
+                    .as_ref()
+                    .map(|version| format!("Connected · {version}"))
+                    .unwrap_or_else(|| "Connected".into());
+                // The stream reconnects independently of request workers; resync after outages.
+                if self.disconnected {
+                    if let Some(api) = &self.api {
+                        api.send(Command::Bootstrap {
+                            sessions: vec![self.active.clone()],
+                            directories: self.active_directories(),
+                        });
+                    }
+                    self.disconnected = false;
+                }
+            }
+            UiEvent::Connection {
+                connected: false,
+                error: _,
+            } => {
+                self.disconnected = true;
+                self.connection_status = "Disconnected · reconnecting".into();
+            }
+            UiEvent::Bootstrap(Ok(data)) => {
+                self.server_version = Some(data.version.clone());
+                self.projects = data.projects.clone();
+                if !self.disconnected {
+                    self.connection_status = if data.warnings.is_empty() {
+                        format!("Connected · {}", data.version)
+                    } else {
+                        format!("Connected · {} · Partial refresh", data.version)
+                    };
+                }
+                if data.sessions_complete {
+                    self.sessions = data.sessions;
+                    self.open_tabs
+                        .retain(|id| self.sessions.iter().any(|session| &session.id == id));
+                } else {
+                    for session in data.sessions {
+                        if let Some(existing) = self
+                            .sessions
+                            .iter_mut()
+                            .find(|existing| existing.id == session.id)
+                        {
+                            *existing = session;
+                        } else {
+                            self.sessions.push(session);
+                        }
+                    }
+                }
+                if data.statuses_complete {
+                    self.statuses = data.statuses;
+                } else {
+                    self.statuses.extend(data.statuses);
+                }
+                if !data.retry_needed {
+                    self.forms.clear();
+                }
+                for pending in data.pending {
+                    if let PendingRequest::Form(form) = pending {
+                        self.forms.upsert(form);
+                    }
+                }
+                let directories = self.active_directories();
+                let context = jobs::Context {
+                    roots: &self.sessions,
+                    directories: &directories,
+                };
+                let busy: HashSet<String> = self
+                    .statuses
+                    .iter()
+                    .filter(|(_, status)| status.is_busy())
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                self.running_jobs
+                    .apply_snapshot(Some(&busy), data.shells, &context);
+                self.jobs = self.running_jobs.rows(Some(&self.active));
+                let wanted = self.running_jobs.take_wanted(&context);
+                if !wanted.is_empty()
+                    && let Some(api) = &self.api
+                {
+                    api.send(Command::LoadSessionInfo {
+                        session_ids: wanted,
+                    });
+                }
+                let desired = self
+                    .saved_active
+                    .take()
+                    .filter(|id| self.sessions.iter().any(|session| &session.id == id))
+                    .or_else(|| {
+                        self.sessions
+                            .iter()
+                            .find(|session| session.id == self.active)
+                            .map(|session| session.id.clone())
+                    })
+                    .or_else(|| {
+                        self.sessions
+                            .iter()
+                            .find(|session| session.parent_id.is_none())
+                            .map(|session| session.id.clone())
+                    });
+                if let Some(id) = desired {
+                    self.conversations.remove(&id);
+                    if let Some(directory) = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == id)
+                        .map(|session| session.directory.clone())
+                    {
+                        self.catalogs.remove(&directory);
+                    }
+                    self.select_session(id);
+                } else {
+                    self.active.clear();
+                    self.catalog = ModelCatalog::default();
+                }
+                self.bootstrapped = true;
+            }
+            UiEvent::Bootstrap(Err(_)) => self.connection_status = "Refresh failed".into(),
+            UiEvent::MessagesLoaded {
+                session_id,
+                cursor: None,
+                result: Ok(page),
+            } => {
+                let conversation = self.conversations.entry(session_id.clone()).or_default();
+                conversation.replace_from_api(&page.messages, page.next_cursor);
+                if let Some(queued) = page.queued {
+                    conversation.sync_queued(&queued);
+                }
+                self.update_transcript(&session_id);
+            }
+            UiEvent::MessagesLoaded {
+                session_id,
+                result: Err(error),
+                ..
+            } => {
+                self.connection_status = format!("History failed ({session_id}): {error}");
+            }
+            UiEvent::ModelsLoaded {
+                directory,
+                result: Ok(catalog),
+            } => {
+                self.catalogs.insert(directory.clone(), catalog.clone());
+                if self
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == self.active && session.directory == directory)
+                {
+                    self.catalog = catalog;
+                }
+            }
+            UiEvent::ModelsLoaded {
+                result: Err(error), ..
+            } => self.connection_status = format!("Models failed: {error}"),
+            UiEvent::SessionCreated { result, .. } => match result {
+                Ok(session) => {
+                    let id = session.id.clone();
+                    self.sessions.push(session);
+                    self.select_session(id);
+                }
+                Err(error) => self.connection_status = format!("Create failed: {error}"),
+            },
+            UiEvent::SessionRenamed {
+                session_id, result, ..
+            } => match result {
+                Ok(session) => {
+                    if let Some(existing) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        *existing = session;
+                    }
+                    self.persist_tabs();
+                }
+                Err(error) => self.connection_status = format!("Rename failed: {error}"),
+            },
+            UiEvent::ModelSelected {
+                session_id,
+                model,
+                result,
+                ..
+            } => match result {
+                Ok(()) => {
+                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        session.model = Some(SessionModel {
+                            id: model.id,
+                            provider_id: model.provider_id,
+                            variant: model.variant,
+                        });
+                    }
+                }
+                Err(error) => self.connection_status = format!("Model change failed: {error}"),
+            },
+            UiEvent::PromptAccepted {
+                request_id,
+                session_id,
+                result,
+            } => {
+                if self
+                    .pending_prompt
+                    .as_ref()
+                    .is_some_and(|(pending, id, _, _)| *pending == request_id && *id == session_id)
+                    && let Some((_, id, text, attachments)) = self.pending_prompt.take()
+                {
+                    match result {
+                        Ok(()) => self.clear_accepted_draft = Some((id, text, attachments)),
+                        Err(error) => self.connection_status = format!("Send failed: {error}"),
+                    }
+                }
+            }
+            UiEvent::FormCancelled { form_id, result } => match result {
+                Ok(_) => {
+                    self.forms.remove(&form_id);
+                }
+                Err(error) => self.connection_status = format!("Cancel failed: {error}"),
+            },
+            UiEvent::SessionInfoLoaded(info) => {
+                self.running_jobs.apply_session_info(info);
+                self.jobs = self.running_jobs.rows(Some(&self.active));
+                let directories = self.active_directories();
+                let context = jobs::Context {
+                    roots: &self.sessions,
+                    directories: &directories,
+                };
+                let wanted = self.running_jobs.take_wanted(&context);
+                if !wanted.is_empty()
+                    && let Some(api) = &self.api
+                {
+                    api.send(Command::LoadSessionInfo {
+                        session_ids: wanted,
+                    });
+                }
+            }
+            UiEvent::ServerEvent(envelope) => {
+                if let Ok(event) = protocol::Event::deserialize(&envelope.payload) {
+                    let kind = protocol::decode_event(&event);
+                    if let Some((id, status)) = model::run_status_change(&kind) {
+                        let was_busy = self.statuses.get(&id).is_some_and(RunStatus::is_busy);
+                        if was_busy && !status.is_busy() && id != self.active {
+                            self.unread.insert(id.clone());
+                        }
+                        self.statuses.insert(id, status);
+                    }
+                    if let Some(change) = model::SessionChange::from_kind(&event, &kind) {
+                        let id = change.session_id().to_owned();
+                        change.apply(&mut self.sessions);
+                        if self.active.is_empty()
+                            && self.sessions.iter().any(|session| session.id == id)
+                        {
+                            self.select_session(id);
+                        } else if id == self.active
+                            && !self.sessions.iter().any(|session| session.id == id)
+                        {
+                            if let Some(next) =
+                                self.sessions.first().map(|session| session.id.clone())
+                            {
+                                self.select_session(next);
+                            } else {
+                                self.active.clear();
+                                self.catalog = ModelCatalog::default();
+                            }
+                        }
+                    }
+                    if let Some(id) = kind.session_id()
+                        && self
+                            .conversations
+                            .entry(id.to_owned())
+                            .or_default()
+                            .apply(&event, &kind)
+                    {
+                        self.update_transcript(id);
+                    }
+                    if let Some(job_event) =
+                        jobs::job_event(&event, &kind, envelope.directory.as_deref())
+                    {
+                        let directories = self.active_directories();
+                        let context = jobs::Context {
+                            roots: &self.sessions,
+                            directories: &directories,
+                        };
+                        self.running_jobs.apply_event(job_event, &context);
+                        self.jobs = self.running_jobs.rows(Some(&self.active));
+                    }
+                    if let Some(model::CatalogInvalidation {
+                        directory: Some(directory),
+                        ..
+                    }) = model::CatalogInvalidation::from_kind(&event, &kind)
+                    {
+                        self.catalogs.remove(&directory);
+                        if let Some(api) = &self.api {
+                            api.send(Command::LoadModels { directory });
+                        }
+                    }
+                    if let Some(change) =
+                        opencode_gpui::pending::pending_change(&kind, envelope.directory.as_deref())
+                    {
+                        match change {
+                            opencode_gpui::pending::PendingChange::Form(form) => {
+                                self.forms.upsert(form)
+                            }
+                            opencode_gpui::pending::PendingChange::Resolved(id) => {
+                                self.forms.remove(&id);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            UiEvent::PendingLoaded(snapshot) => {
+                if snapshot.complete {
+                    self.forms.clear();
+                }
+                for pending in snapshot.requests {
+                    if let PendingRequest::Form(form) = pending {
+                        self.forms.upsert(form);
+                    }
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn from_preview(window: &mut Window, cx: &mut Context<Self>, overlay: Option<String>) -> Self {
+        let settings_sessions = overlay.as_deref() == Some("settings-sessions");
+        let modal = match overlay.as_deref() {
+            Some("settings") | Some("settings-sessions") => Some(Modal::Settings),
+            Some("sessions") => Some(Modal::Sessions),
+            Some("new-session") => Some(Modal::NewSession),
+            Some("rename") => Some(Modal::Rename),
+            Some("model") => Some(Modal::Model),
+            Some("level") => Some(Modal::Level),
+            _ => None,
+        };
+        let mut fixture = preview::State::new();
+        let bootstrap = match fixture.handle(Command::Bootstrap {
+            sessions: vec![],
+            directories: vec![],
+        }) {
+            UiEvent::Bootstrap(Ok(data)) => data,
+            _ => unreachable!("the preview fixture always bootstraps"),
+        };
+        let server = preview::server_state();
+        let active = server.active.expect("preview tab");
+        let projects = bootstrap.projects.clone();
+        let sessions = bootstrap.sessions;
+        let mut forms = Forms::default();
+        for pending in bootstrap.pending {
+            if let PendingRequest::Form(form) = pending {
+                forms.upsert(form);
+            }
+        }
+        let dirs = vec!["/repo".to_owned()];
+        let context = jobs::Context {
+            roots: &sessions,
+            directories: &dirs,
+        };
+        let busy: HashSet<String> = bootstrap
+            .statuses
+            .iter()
+            .filter(|(_, status)| status.is_busy())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut running_jobs = Jobs::default();
+        running_jobs.apply_snapshot(Some(&busy), bootstrap.shells, &context);
+        let wanted = running_jobs.take_wanted(&context);
+        if let UiEvent::SessionInfoLoaded(info) = fixture.handle(Command::LoadSessionInfo {
+            session_ids: wanted,
+        }) {
+            running_jobs.apply_session_info(info);
+        }
+        let jobs = running_jobs.rows(Some(&active));
+        let mut transcript: HashMap<String, Vec<TranscriptRow>> = HashMap::new();
+        let mut conversations = HashMap::new();
+        for session in &sessions {
+            if let UiEvent::MessagesLoaded {
+                result: Ok(page), ..
+            } = fixture.handle(Command::LoadMessages {
+                session_id: session.id.clone(),
+                cursor: None,
+            }) {
+                let mut conversation = Conversation::default();
+                conversation.replace_from_api(&page.messages, page.next_cursor);
+                if let Some(queued) = page.queued {
+                    conversation.sync_queued(&queued);
+                }
+                transcript.insert(
+                    session.id.clone(),
+                    conversation
+                        .messages
+                        .iter()
+                        .filter(|message| !message.in_tray())
+                        .flat_map(|message| message.rows())
+                        .collect(),
+                );
+                conversations.insert(session.id.clone(), conversation);
+            }
+        }
+        let attachments = transcript
+            .iter()
+            .flat_map(|(session_id, rows)| {
+                rows.iter().enumerate().flat_map(move |(row_index, row)| {
+                    row.images
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(image_index, url)| {
+                            inline_image(url)
+                                .map(|image| ((session_id.clone(), row_index, image_index), image))
+                        })
+                })
+            })
+            .collect();
+        let catalog = match fixture.handle(Command::LoadModels {
+            directory: "/repo".into(),
+        }) {
+            UiEvent::ModelsLoaded {
+                result: Ok(catalog),
+                ..
+            } => catalog,
+            _ => ModelCatalog::default(),
+        };
+        let scroll = ScrollHandle::new();
+        scroll.scroll_to_bottom();
+        let after_first_layout = scroll.clone();
+        window.on_next_frame(move |window, _| {
+            after_first_layout.scroll_to_bottom();
+            window.refresh();
+        });
+        let mut client = Self {
+            api: None,
+            preview_api: false,
+            connection_generation: 0,
+            settings: SettingsFields::new(
+                window,
+                cx,
+                PersistedState::default(),
+                ApiConfig {
+                    base_url: "http://127.0.0.1:4096".into(),
+                    username: "opencode".into(),
+                    password: None,
+                    cloudflare_access: None,
+                },
+            ),
+            saved_active: None,
+            connection_status: "Connected · preview".into(),
+            disconnected: false,
+            server_version: None,
+            conversations,
+            catalogs: HashMap::new(),
+            running_jobs,
+            sessions,
+            open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
+            bootstrapped: true,
+            projects,
+            active,
+            transcript,
+            attachments,
+            catalog,
+            composer: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(2, 8)
+                    .submit_on_enter(true)
+                    .placeholder("Ask OpenCode anything…")
+            }),
+            attachments_draft: Vec::new(),
+            overlay: if modal.is_none() { overlay } else { None },
+            scroll,
+            unread: server.unread,
+            statuses: bootstrap.statuses,
+            jobs,
+            forms,
+            next_prompt_request_id: 0,
+            next_session_request_id: 0,
+            next_model_request_id: 0,
+            pending_prompt: None,
+            clear_accepted_draft: None,
+            modal,
+            search: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(match modal {
+                    Some(Modal::Model) => "Search models (fuzzy)…",
+                    Some(Modal::Level) => "Search levels (fuzzy)…",
+                    Some(Modal::Sessions) => "Search tabs…",
+                    Some(Modal::NewSession) => "Search projects…",
+                    _ => "Search…",
+                })
+            }),
+            rename: cx
+                .new(|cx| InputState::new(window, cx).default_value("Fix the attach clip padding")),
+        };
+        cx.subscribe(&client.search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+        if settings_sessions {
+            client.settings.tab = SettingsTab::Sessions;
+        }
+        cx.subscribe(
+            &client.settings.session_search,
+            |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        if matches!(
+            modal,
+            Some(Modal::Sessions | Modal::NewSession | Modal::Model | Modal::Level)
+        ) {
+            let focus = client.search.focus_handle(cx);
+            window.on_next_frame(move |window, cx| focus.focus(window, cx));
+        } else if modal == Some(Modal::Rename) {
+            let focus = client.rename.focus_handle(cx);
+            let rename = client.rename.clone();
+            window.on_next_frame(move |window, cx| {
+                focus.focus(window, cx);
+                rename.update(cx, |input, cx| input.select_all(window, cx));
+            });
+        } else if modal == Some(Modal::Settings) {
+            if client.settings.tab == SettingsTab::Connection {
+                let focus = client.settings.server.focus_handle(cx);
+                let server = client.settings.server.clone();
+                window.on_next_frame(move |window, cx| {
+                    focus.focus(window, cx);
+                    server.update(cx, |input, cx| input.select_all(window, cx));
+                });
+            } else {
+                let focus = client.settings.session_search.focus_handle(cx);
+                window.on_next_frame(move |window, cx| focus.focus(window, cx));
+            }
+        }
+        client
+    }
+
+    fn from_api_preview(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut client = Self::from_preview(window, cx, None);
+        let (api, receiver, _) = ApiHandle::preview();
+        client.preview_api = true;
+        client.connection_status = "Connecting · preview API".into();
+        client.saved_active = Some(client.active.clone());
+        client.sessions.clear();
+        client.transcript.clear();
+        client.conversations.clear();
+        api.send(Command::Bootstrap {
+            sessions: vec![],
+            directories: vec![],
+        });
+        client.api = Some(api);
+        cx.subscribe(&client.composer, |this, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { secondary, shift } = event
+                && !shift
+            {
+                this.send_prompt(*secondary, cx);
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = receiver.recv().await {
+                if this
+                    .update(cx, |this, cx| this.handle_live_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        client
+    }
+
+    fn tab(&self, session: &Session, divided: bool, cx: &Context<Self>) -> AnyElement {
+        let selected = self.active == session.id;
+        let busy = self
+            .statuses
+            .get(&session.id)
+            .is_some_and(RunStatus::is_busy);
+        let unread = self.unread.contains(&session.id);
+        let has_jobs = selected || self.jobs.iter().any(|job| job.id == session.id);
+        let dot_color = if busy {
+            0xa46910
+        } else if unread {
+            0x176899
+        } else {
+            0x7c8682
+        };
+        let title = session.title.clone();
+        let id = session.id.clone();
+        let rename_id = id.clone();
+        let close_id = id.clone();
+        div()
+            .id(format!("tab-{id}"))
+            .relative()
+            .h(px(34.))
+            .w_full()
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .rounded(px(6.))
+            .bg(if selected {
+                rgb(0xe3e0da)
+            } else {
+                rgb(0xf4f1eb)
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_session(id.clone());
+                cx.notify();
+            }))
+            .when(divided, |tab| {
+                tab.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(1.))
+                        .bg(rgb(0xc8c3ba)),
+                )
+            })
+            .child(div().text_color(rgb(dot_color)).child(if has_jobs || busy {
+                "✿"
+            } else {
+                "●"
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(rgb(if unread || busy { dot_color } else { 0x555b5c }))
+                    .font_weight(if unread || busy {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .child(title),
+            )
+            .child(
+                div()
+                    .id(format!("rename-{}", session.id))
+                    .text_color(rgb(if selected { 0x555b5c } else { 0xa3a9a8 }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.select_session(rename_id.clone());
+                        this.show_modal(Modal::Rename, window, cx);
+                    }))
+                    .child("✎"),
+            )
+            .child(
+                div()
+                    .id(format!("close-{}", session.id))
+                    .text_color(rgb(if selected { 0x555b5c } else { 0xa3a9a8 }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_tab(&close_id, cx);
+                    }))
+                    .child("×"),
+            )
+            .into_any_element()
+    }
+
+    fn sidebar(&self, cx: &Context<Self>) -> AnyElement {
+        let mut tabs = div().flex().flex_col().p(px(8.)).gap(px(5.));
+        let mut previous_inactive = false;
+        for id in &self.open_tabs {
+            if let Some(session) = self.sessions.iter().find(|session| &session.id == id) {
+                let active = session.id == self.active;
+                tabs = tabs.child(self.tab(session, !active && previous_inactive, cx));
+                previous_inactive = !active;
+            }
+        }
+        let mut jobs_panel = div()
+            .flex()
+            .flex_col()
+            .px(px(12.))
+            .py(px(12.))
+            .gap(px(8.))
+            .border_t_1()
+            .border_color(rgb(0xc8c3ba));
+        if !self.jobs.is_empty() {
+            jobs_panel = jobs_panel.child(
+                div()
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0x737a78))
+                    .child(format!("BACKGROUND  {}", self.jobs.len())),
+            );
+            for job in &self.jobs {
+                jobs_panel = jobs_panel.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .px(px(6.))
+                        .child(div().text_size(px(12.)).child(job.title.clone()))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(0x87908d))
+                                .child(job.subtitle(1_704_067_320_000)),
+                        ),
+                );
+            }
+        }
+        div()
+            .w(px(270.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xf4f1eb))
+            .border_r_1()
+            .border_color(rgb(0xc8c3ba))
+            .child(
+                div()
+                    .id("new-session")
+                    .h(px(39.))
+                    .px(px(16.))
+                    .flex()
+                    .items_center()
+                    .text_color(rgb(0x667078))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_modal(Modal::NewSession, window, cx);
+                    }))
+                    .child("⊞  New session"),
+            )
+            .child(tabs)
+            .child(div().flex_1())
+            .child(jobs_panel)
+            .child(
+                div()
+                    .p(px(14.))
+                    .border_t_1()
+                    .border_color(rgb(0xded8cb))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .id("footer-tabs")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_modal(Modal::Sessions, window, cx);
+                            }))
+                            .child("≡  Tabs"),
+                    )
+                    .child(
+                        div()
+                            .id("footer-settings")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_modal(Modal::Settings, window, cx);
+                            }))
+                            .child("⚙  Settings"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn message(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> AnyElement {
+        let user = row.role.label() == "YOU";
+        let shade = if user { rgb(0xe4ddd0) } else { rgb(0xf4f1eb) };
+        let mut body = div().flex().flex_col().gap(px(10.));
+        match row.kind {
+            TranscriptRowKind::Tool => {
+                body = body.child(div().font_family("monospace").child(row.body.clone()))
+            }
+            TranscriptRowKind::Error => {
+                body = body.child(
+                    div()
+                        .p(px(12.))
+                        .border_l_4()
+                        .border_color(rgb(0xcf222e))
+                        .bg(rgb(0xf8eae7))
+                        .child(row.body.clone()),
+                )
+            }
+            TranscriptRowKind::Normal if !user => {
+                body = body.child(self.markdown_body(&row.body, index, cx))
+            }
+            _ => body = body.child(row.body.clone()),
+        }
+        for (image_index, image) in row.images.iter().enumerate() {
+            let source = self
+                .attachments
+                .get(&(self.active.clone(), index, image_index));
+            let thumbnail = div()
+                .h(px(120.))
+                .w(px(200.))
+                .rounded(px(5.))
+                .border_1()
+                .border_color(rgb(0xd8d1c6))
+                .overflow_hidden();
+            body = body.child(match source {
+                Some(source) => thumbnail
+                    .child(
+                        img(source.clone())
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element(),
+                None => thumbnail
+                    .child(if image.starts_with("data:") {
+                        "Image unavailable".to_owned()
+                    } else {
+                        image.clone()
+                    })
+                    .into_any_element(),
+            });
+        }
+        div()
+            .id(("message", index))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .px(px(28.))
+            .pt(px(18.))
+            .pb(px(20.))
+            .bg(shade)
+            .border_b_1()
+            .border_color(rgb(0xc8c3ba))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0x666f76))
+                    .child(row.role.label().to_owned())
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(rgb(0x9da5a4))
+                            .child(timestamp(row.time)),
+                    ),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
+    fn form_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let notice = self.forms.notice(Some(&self.active), &HashMap::new())?;
+        let cancel = notice.cancel;
+        Some(
+            div()
+                .mx(px(16.))
+                .mb(px(8.))
+                .h(px(45.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(12.))
+                .rounded(px(9.))
+                .border_1()
+                .border_color(rgb(0xc8c3ba))
+                .bg(rgb(0xf5f3ef))
+                .child(
+                    div()
+                        .flex_1()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0x98600f))
+                        .child(notice.text),
+                )
+                .child(div().text_color(rgb(0x4d5354)).child("Open web UI"))
+                .child(
+                    div()
+                        .id("cancel-form")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let (Some(api), Some(target)) = (&this.api, &cancel) {
+                                api.send(Command::CancelForm {
+                                    form_id: target.form_id.clone(),
+                                    session_id: target.session_id.clone(),
+                                    directory: target.directory.clone(),
+                                });
+                            }
+                            cx.notify();
+                        }))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(rgb(0xc8c3ba))
+                        .px(px(10.))
+                        .py(px(4.))
+                        .child("Cancel"),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn chat(&self, cx: &Context<Self>) -> AnyElement {
+        // GTK reserves a permanent 14px gutter for the transcript scrollbar.
+        let mut rows = div().w_full().pr(px(14.)).flex().flex_col();
+        let sticky = self
+            .transcript
+            .get(&self.active)
+            .and_then(|transcript| transcript.first())
+            .filter(|row| row.role.label() == "YOU" && self.scroll.offset().y < px(-1.))
+            .map(|row| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right(px(14.))
+                    .h(px(106.))
+                    .px(px(28.))
+                    .pt(px(18.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .bg(rgb(0xf4f1eb))
+                    .border_b_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .shadow_sm()
+                    .child(
+                        div()
+                            .flex()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0x666f76))
+                            .child("YOU")
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(rgb(0x9da5a4))
+                                    .child(timestamp(row.time)),
+                            ),
+                    )
+                    .child(row.body.clone())
+                    .into_any_element()
+            });
+        if let Some(transcript) = self.transcript.get(&self.active) {
+            for (index, row) in transcript.iter().enumerate() {
+                rows = rows.child(self.message(row, index, cx));
+            }
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .child(
+                div()
+                    .id("transcript")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(rows),
+            )
+            .when_some(sticky, |view, sticky| view.child(sticky))
+            .vertical_scrollbar(&self.scroll)
+            .into_any_element()
+    }
+
+    fn composer(&self, cx: &Context<Self>) -> AnyElement {
+        let selected_model = self.selected_model();
+        let model = selected_model
+            .as_ref()
+            .and_then(|preferred| {
+                self.catalog.models.iter().find(|model| {
+                    model.provider_id == preferred.provider_id
+                        && model.model_id == preferred.model_id
+                })
+            })
+            .or_else(|| self.catalog.models.first());
+        let context = model
+            .and_then(|option| option.context_limit)
+            .map(|limit| {
+                let used = self
+                    .conversations
+                    .get(&self.active)
+                    .and_then(Conversation::context_tokens)
+                    .unwrap_or(if self.api.is_none() { 13_400 } else { 0 });
+                model::format_context_usage(used, limit)
+            })
+            .unwrap_or_default();
+        let model = model.map_or("Choose model".to_owned(), |model| model.label.clone());
+        let mut files = div().px(px(13.)).flex().gap(px(7.));
+        for (index, path) in self.attachments_draft.iter().enumerate() {
+            let target = path.clone();
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            files = files.child(
+                div()
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(5.))
+                    .bg(rgb(0xf4f1eb))
+                    .flex()
+                    .gap(px(6.))
+                    .child(label)
+                    .child(
+                        div()
+                            .id(format!("remove-attachment-{index}"))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.attachments_draft.retain(|path| path != &target);
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            );
+        }
+        div()
+            .mx(px(16.))
+            .mb(px(17.))
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(0xc8c3ba))
+            .bg(rgb(0xffffff))
+            .child(Textarea::new(&self.composer).bordered(false).h(px(89.)))
+            .when(!self.attachments_draft.is_empty(), |composer| {
+                composer.child(files)
+            })
+            .child(
+                div()
+                    .h(px(46.))
+                    .px(px(14.))
+                    .flex()
+                    .items_center()
+                    .gap(px(18.))
+                    .child(
+                        div()
+                            .id("attach-file")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_attachments(cx);
+                            }))
+                            .child("♧"),
+                    )
+                    .child(
+                        div()
+                            .id("composer-model")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_modal(Modal::Model, window, cx);
+                            }))
+                            .child(model),
+                    )
+                    .child(
+                        div()
+                            .id("composer-level")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_modal(Modal::Level, window, cx);
+                            }))
+                            .child(format!(
+                                "{}⌄",
+                                selected_model
+                                    .and_then(|selection| selection.variant)
+                                    .unwrap_or_else(|| "Default".into())
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .child(context)
+                    .child(
+                        div()
+                            .id("send-prompt")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.send_prompt(false, cx);
+                            }))
+                            .w(px(32.))
+                            .h(px(32.))
+                            .rounded_full()
+                            .bg(rgb(0xc59535))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(0xffffff))
+                            .child("➤"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn settings_sessions_body(&self, cx: &Context<Self>) -> AnyElement {
+        let query = self.settings.session_search.read(cx).value().to_lowercase();
+        let mut rows = div().px(px(21.)).flex().flex_col().gap(px(7.));
+        let mut shown = 0;
+        for session in self
+            .sessions
+            .iter()
+            .filter(|session| {
+                query.is_empty()
+                    || session.title.to_lowercase().contains(&query)
+                    || session.directory.to_lowercase().contains(&query)
+            })
+            .take(50)
+        {
+            shown += 1;
+            let id = session.id.clone();
+            let open = self.open_tabs.contains(&id);
+            rows = rows.child(
+                div()
+                    .id(format!("settings-session-{id}"))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_session(id.clone());
+                        this.modal = None;
+                        cx.notify();
+                    }))
+                    .px(px(14.))
+                    .py(px(8.))
+                    .rounded(px(7.))
+                    .border_1()
+                    .border_color(rgb(if open { 0xcbbba4 } else { 0xded8cb }))
+                    .bg(rgb(if open { 0xf3ede3 } else { 0xfffdfa }))
+                    .child(
+                        div()
+                            .flex()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(session.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .px(px(4.))
+                                    .py(px(2.))
+                                    .rounded(px(2.))
+                                    .border_1()
+                                    .border_color(rgb(if open { 0xa5dbb4 } else { 0xded8cb }))
+                                    .bg(rgb(if open { 0xe4f7e9 } else { 0xf4f1eb }))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(9.))
+                                    .text_color(rgb(if open { 0x167e49 } else { 0x77817e }))
+                                    .child(if open { "OPEN TAB" } else { "SERVER" }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(5.))
+                            .flex()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x858e8c))
+                            .child(div().flex_1().child(session.directory.clone()))
+                            .child(timestamp(session.time.updated)),
+                    ),
+            );
+        }
+        if shown == 0 {
+            rows = rows.child(div().p(px(16.)).child("No matching sessions"));
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xfffdfa))
+            .child(
+                div()
+                    .px(px(22.))
+                    .pt(px(17.))
+                    .pb(px(7.))
+                    .border_b_1()
+                    .border_color(rgb(0xded8cb))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(16.))
+                            .child("All Sessions"),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.))
+                            .text_size(px(11.))
+                            .text_color(rgb(0x818984))
+                            .child(format!(
+                                "Search all {} workspace sessions on this server",
+                                self.sessions.len()
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .mx(px(18.))
+                    .mt(px(14.))
+                    .mb(px(12.))
+                    .h(px(50.))
+                    .px(px(9.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(rgb(0x4f99ee))
+                    .child("⌕")
+                    .child(Input::new(&self.settings.session_search).bordered(false)),
+            )
+            .child(
+                div()
+                    .id("settings-sessions-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(rows),
+            )
+            .into_any_element()
+    }
+
+    fn modal_view(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let modal = self.modal?;
+        let backdrop = div()
+            .id("modal-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .pt(px(46.))
+            .bg(rgba(0x00000066))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.modal = None;
+                cx.notify();
+            }));
+        let panel: AnyElement = match modal {
+            Modal::Sessions | Modal::NewSession => {
+                let sessions = modal == Modal::Sessions;
+                let mut card = div()
+                    .w(px(if sessions { 520. } else { 349. }))
+                    .h(px(if sessions { 410. } else { 319. }))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .bg(rgb(0xffffff))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(if sessions { 48. } else { 55. }))
+                            .px(px(12.))
+                            .border_b_1()
+                            .border_color(rgb(if sessions { 0xded8cb } else { 0x4f99ee }))
+                            .flex()
+                            .items_center()
+                            .when(sessions, |view| view.child("⌕"))
+                            .child(Input::new(&self.search).bordered(false)),
+                    );
+                if sessions {
+                    let query = self.search.read(cx).value().to_lowercase();
+                    for session in self
+                        .sessions
+                        .iter()
+                        .filter(|session| session.title.to_lowercase().contains(&query))
+                        .take(8)
+                    {
+                        let selected = session.id == self.active;
+                        let id = session.id.clone();
+                        card = card.child(
+                            div()
+                                .id(format!("session-choice-{}", session.id))
+                                .h(px(44.))
+                                .mx(px(10.))
+                                .px(px(12.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .bg(rgb(if selected { 0xf1efec } else { 0xffffff }))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_session(id.clone());
+                                    this.modal = None;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(session.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(0x85909a))
+                                        .child(session.directory.clone()),
+                                ),
+                        );
+                    }
+                    card = card.child(div().flex_1()).child(div().h(px(28.))
+                        .border_t_1().border_color(rgb(0xded8cb)).px(px(12.))
+                        .text_size(px(11.)).text_color(rgb(0x87908d))
+                        .child("↑ ↓ navigate     ↵ switch                                      esc close"));
+                } else {
+                    let query = self.search.read(cx).value().to_lowercase();
+                    for project in self.projects.iter().filter(|project| {
+                        project.worktree.to_lowercase().contains(&query)
+                            || project
+                                .name
+                                .as_deref()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .contains(&query)
+                    }) {
+                        let directory = project.worktree.clone();
+                        let label = project.name.clone().unwrap_or_else(|| {
+                            project
+                                .worktree
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("repo")
+                                .to_owned()
+                        });
+                        card = card.child(
+                            div()
+                                .id(format!("project-choice-{}", project.worktree))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.create_session(directory.clone(), cx);
+                                }))
+                                .h(px(44.))
+                                .m(px(4.))
+                                .px(px(18.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .bg(rgb(0xece9e2))
+                                .font_weight(FontWeight::BOLD)
+                                .child(div().flex_1().child(label))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(rgb(0x758080))
+                                        .child(project.worktree.clone()),
+                                ),
+                        );
+                    }
+                }
+                card.into_any_element()
+            }
+            Modal::Rename => div()
+                .w(px(349.))
+                .h(px(221.))
+                .p(px(18.))
+                .gap(px(10.))
+                .flex()
+                .flex_col()
+                .rounded(px(11.))
+                .border_1()
+                .border_color(rgb(0xc8c3ba))
+                .bg(rgb(0xfffdfa))
+                .shadow_lg()
+                .child("Session title")
+                .child(
+                    div()
+                        .h(px(34.))
+                        .border_1()
+                        .border_color(rgb(0x4f99ee))
+                        .rounded(px(5.))
+                        .child(Input::new(&self.rename).bordered(false)),
+                )
+                .child("Session ID")
+                .child(
+                    div()
+                        .h(px(38.))
+                        .border_1()
+                        .border_color(rgb(0xd3cec5))
+                        .rounded(px(5.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_family("monospace")
+                                .child(self.active.clone()),
+                        )
+                        .child("▣"),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .id("rename-cancel")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.modal = None;
+                                    cx.notify();
+                                }))
+                                .px(px(14.))
+                                .py(px(7.))
+                                .border_1()
+                                .border_color(rgb(0xd3cec5))
+                                .rounded(px(5.))
+                                .child("Cancel"),
+                        )
+                        .child(
+                            div()
+                                .id("rename-save")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.rename_session(cx);
+                                }))
+                                .px(px(14.))
+                                .py(px(7.))
+                                .bg(rgb(0xc59535))
+                                .border_1()
+                                .border_color(rgb(0x1f5c99))
+                                .rounded(px(5.))
+                                .child("Save"),
+                        ),
+                )
+                .into_any_element(),
+            Modal::Settings => {
+                let fields = [
+                    ("OpenCode server URL", &self.settings.server),
+                    ("Username", &self.settings.username),
+                    ("Password", &self.settings.password),
+                    ("Client ID", &self.settings.client_id),
+                    ("Client secret", &self.settings.client_secret),
+                ];
+                let mut content = div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .px(px(22.))
+                    .pt(px(17.))
+                    .pb(px(22.))
+                    .gap(px(8.))
+                    .bg(rgb(0xfffdfa))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(16.))
+                            .child("Server Connection"),
+                    )
+                    .child(
+                        div()
+                            .mb(px(15.))
+                            .text_size(px(11.))
+                            .text_color(rgb(0x737c7a))
+                            .child("Configure server endpoint, credentials, and Cloudflare tokens"),
+                    );
+                for (index, (label, input)) in fields.into_iter().enumerate() {
+                    if index == 3 {
+                        content = content.child(
+                            div()
+                                .mt(px(3.))
+                                .pt(px(14.))
+                                .border_t_1()
+                                .border_color(rgb(0xded8cb))
+                                .child("Cloudflare Access service token"),
+                        );
+                    }
+                    content = content.child(div().child(label)).child(
+                        div()
+                            .h(px(34.))
+                            .px(px(9.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(rgb(if index == 0 { 0x4f99ee } else { 0xd3cec5 }))
+                            .bg(rgb(0xffffff))
+                            .text_color(rgb(0x5a6261))
+                            .child(Input::new(input).bordered(false)),
+                    );
+                    if index == 2 {
+                        content = content.child(
+                            div()
+                                .id("remember-password")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings.remember_password = !this.settings.remember_password;
+                                    cx.notify();
+                                }))
+                                .child(format!(
+                                    "{} Remember the password in the system keyring",
+                                    if self.settings.remember_password { "☑" } else { "☐" }
+                                )),
+                        )
+                            .child(div().mt(px(5.)).text_size(px(10.)).text_color(rgb(0x818984))
+                                .child("Remote servers require HTTPS. Loopback HTTP is supported for SSH tunnels. A remembered password is used only for this server URL and username; uncheck Remember to remove it."));
+                    }
+                }
+                content = content.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(0x818984))
+                        .child("The token is sent only to HTTPS servers and stored in the Linux system keyring. Clear the client ID to remove it."),
+                );
+                if let Some(error) = &self.settings.error {
+                    content = content.child(div().text_color(rgb(0xa6332b)).child(error.clone()));
+                }
+                let content = if self.settings.tab == SettingsTab::Connection {
+                    content.into_any_element()
+                } else {
+                    self.settings_sessions_body(cx)
+                };
+                div()
+                    .w(px(820.))
+                    .h(px(675.))
+                    .flex()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .bg(rgb(0xf5f0e7))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .w(px(280.))
+                            .flex()
+                            .flex_col()
+                            .px(px(8.))
+                            .pt(px(16.))
+                            .pb(px(16.))
+                            .child(
+                                div()
+                                    .pl(px(8.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(16.))
+                                    .child("Settings"),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-tab-connection")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.settings.tab = SettingsTab::Connection;
+                                        this.settings.server.focus_handle(cx).focus(window, cx);
+                                        cx.notify();
+                                    }))
+                                    .mt(px(12.))
+                                    .px(px(9.))
+                                    .py(px(5.))
+                                    .bg(rgb(if self.settings.tab == SettingsTab::Connection {
+                                        0xe3e0da
+                                    } else {
+                                        0xf5f0e7
+                                    }))
+                                    .child("⌁   Connection"),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-tab-sessions")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.settings.tab = SettingsTab::Sessions;
+                                        this.settings
+                                            .session_search
+                                            .focus_handle(cx)
+                                            .focus(window, cx);
+                                        cx.notify();
+                                    }))
+                                    .mt(px(2.))
+                                    .px(px(9.))
+                                    .py(px(5.))
+                                    .bg(rgb(if self.settings.tab == SettingsTab::Sessions {
+                                        0xe3e0da
+                                    } else {
+                                        0xf5f0e7
+                                    }))
+                                    .child("≡   Sessions"),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .pl(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x929a9a))
+                                    .child("127.0.0.1  ·  opencode-gpui v0.1.0"),
+                            ),
+                    )
+                    .child(
+                        div().w(px(540.)).flex().flex_col().child(content).child(
+                            div()
+                                .h(px(56.))
+                                .px(px(22.))
+                                .flex()
+                                .items_center()
+                                .border_t_1()
+                                .border_color(rgb(0xded8cb))
+                                .bg(rgb(0xf9f7f3))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(0x818984))
+                                        .child(if self.settings.tab == SettingsTab::Connection {
+                                            "Secrets stay out of the state file"
+                                        } else {
+                                            "↑ ↓ to navigate · Enter to open in tab"
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-cancel")
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.modal = None;
+                                            cx.notify();
+                                        }))
+                                        .px(px(14.))
+                                        .py(px(7.))
+                                        .mr(px(9.))
+                                        .border_1()
+                                        .border_color(rgb(0xd3cec5))
+                                        .rounded(px(5.))
+                                        .child(if self.settings.tab == SettingsTab::Connection {
+                                            "Cancel"
+                                        } else {
+                                            "Close"
+                                        }),
+                                )
+                                .when(self.settings.tab == SettingsTab::Connection, |footer| {
+                                    footer.child(
+                                        div()
+                                            .id("settings-apply")
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.apply_settings(cx);
+                                            }))
+                                            .px(px(14.))
+                                            .py(px(7.))
+                                            .rounded(px(5.))
+                                            .bg(rgb(0xc59535))
+                                            .child("Apply"),
+                                    )
+                                }),
+                        ),
+                    )
+                    .into_any_element()
+            }
+            Modal::Model | Modal::Level => {
+                let model = modal == Modal::Model;
+                let mut list = div()
+                    .w(px(if model { 368. } else { 268. }))
+                    .h(px(if model { 178. } else { 204. }))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .bg(rgb(0xfffdfa))
+                    .shadow_lg()
+                    .p(px(14.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .h(px(34.))
+                            .w_full()
+                            .px(px(6.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(rgb(0x4f99ee))
+                            .bg(rgb(0xffffff))
+                            .child("⌕")
+                            .child(Input::new(&self.search).bordered(false)),
+                    );
+                if model {
+                    let query = self.search.read(cx).value().to_lowercase();
+                    for option in self
+                        .catalog
+                        .models
+                        .iter()
+                        .filter(|option| {
+                            option.label.to_lowercase().contains(&query)
+                                || option.model_id.to_lowercase().contains(&query)
+                        })
+                        .take(7)
+                    {
+                        let selected = self.selected_model().as_ref().is_some_and(|preferred| {
+                            preferred.provider_id == option.provider_id
+                                && preferred.model_id == option.model_id
+                        });
+                        let selection = protocol::ModelRef {
+                            id: option.model_id.clone(),
+                            provider_id: option.provider_id.clone(),
+                            variant: None,
+                        };
+                        list = list.child(
+                            div()
+                                .id(format!("pick-model-{}", option.model_id))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.choose_model(selection.clone(), cx);
+                                }))
+                                .h(px(52.))
+                                .px(px(14.))
+                                .rounded(px(5.))
+                                .bg(rgb(if selected { 0xece9e2 } else { 0xfffdfa }))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.))
+                                        .child(option.label.clone())
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(rgb(0x777e7d))
+                                                .child(format!(
+                                                    "{}/{}",
+                                                    option.provider_id, option.model_id
+                                                )),
+                                        ),
+                                )
+                                .child(if selected { "✓" } else { "" }),
+                        );
+                    }
+                } else {
+                    let chosen = self.selected_model();
+                    let variants = chosen
+                        .as_ref()
+                        .and_then(|selection| self.catalog.find(selection))
+                        .map(|option| option.variants.clone())
+                        .unwrap_or_default();
+                    let query = self.search.read(cx).value().to_lowercase();
+                    for variant in std::iter::once(None).chain(variants.into_iter().map(Some)) {
+                        let level = variant.as_deref().unwrap_or("Default");
+                        if !level.to_lowercase().contains(&query) {
+                            continue;
+                        }
+                        let selected = chosen
+                            .as_ref()
+                            .is_some_and(|selection| selection.variant == variant);
+                        let model_ref = chosen.as_ref().map(|selection| protocol::ModelRef {
+                            id: selection.model_id.clone(),
+                            provider_id: selection.provider_id.clone(),
+                            variant: variant.clone(),
+                        });
+                        list = list.child(
+                            div()
+                                .id(format!("pick-level-{level}"))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(model) = &model_ref {
+                                        this.choose_model(model.clone(), cx);
+                                    }
+                                }))
+                                .h(px(33.))
+                                .px(px(12.))
+                                .flex()
+                                .items_center()
+                                .bg(rgb(if selected { 0x3584df } else { 0xfffdfa }))
+                                .text_color(rgb(if selected { 0xffffff } else { 0x252829 }))
+                                .child(div().flex_1().child(level.to_owned()))
+                                .child(if selected { "✓" } else { "" }),
+                        );
+                    }
+                }
+                list.into_any_element()
+            }
+        };
+        let backdrop = if matches!(modal, Modal::Model | Modal::Level) {
+            backdrop
+                .items_start()
+                .justify_end()
+                .pl(px(if modal == Modal::Model { 225. } else { 379. }))
+                .pb(px(77.))
+                .bg(rgba(0x00000000))
+        } else if modal == Modal::Settings {
+            backdrop.items_start().justify_start().pt(px(80.))
+        } else {
+            backdrop
+        };
+        Some(
+            backdrop
+                .child(
+                    div()
+                        .id("modal-panel")
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(panel),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+impl Render for Client {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((id, text, attachments)) = self.clear_accepted_draft.take()
+            && self.active == id
+            && self.composer.read(cx).value().as_ref() == text
+        {
+            self.composer.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+            if self.attachments_draft == attachments {
+                self.attachments_draft.clear();
+            }
+        }
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .font_family("Noto Sans")
+            .text_size(px(13.))
+            .text_color(rgb(0x252829))
+            .bg(rgb(0xf4f1eb))
+            .child(
+                div()
+                    .h(px(46.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(rgb(0xc8c3ba))
+                    .child(div().w(px(270.)).pl(px(16.)).child("◫"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .pl(px(27.))
+                            .child(div().font_weight(FontWeight::BOLD).child("OpenCode"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x77817e))
+                                    .child(self.connection_status.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pr(px(16.))
+                            .flex()
+                            .gap(px(20.))
+                            .child("−")
+                            .child("□")
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.sidebar(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(self.chat(cx))
+                            .when_some(self.overlay.as_ref(), |view, overlay| {
+                                view.child(overlay.clone())
+                            })
+                            .when_some(self.form_notice(cx), |view, notice| view.child(notice))
+                            .child(self.composer(cx)),
+                    ),
+            )
+            .when_some(self.modal_view(cx), |view, modal| view.child(modal))
+    }
+}
+
+pub fn run(args: Args) {
+    application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            let options = WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some("OpenCode".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| {
+                    if args.preview {
+                        Client::from_preview(window, cx, args.drawer.clone())
+                    } else if args.preview_api {
+                        Client::from_api_preview(window, cx)
+                    } else {
+                        Client::from_live(window, cx, &args)
+                    }
+                })
+            })
+            .expect("open GPUI window");
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MarkdownBlock, markdown_blocks};
+
+    #[test]
+    fn heading_list_and_fenced_code_keep_their_content() {
+        assert_eq!(
+            markdown_blocks(
+                "# Padding\n\nDraw it at **22px**.\n\n- inner\n- outer\n\n```rust\npaperclip_icon(22)\n```"
+            ),
+            vec![
+                MarkdownBlock::Heading(1, "Padding".into()),
+                MarkdownBlock::Paragraph("Draw it at **22px**.".into()),
+                MarkdownBlock::List(vec!["inner".into(), "outer".into()]),
+                MarkdownBlock::Code("rust".into(), "paperclip_icon(22)".into()),
+            ]
+        );
+    }
+}

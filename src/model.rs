@@ -1783,29 +1783,6 @@ fn compaction_body(compaction: &protocol::CompactionMessage) -> Option<String> {
     }
 }
 
-fn push_transcript_row(
-    rows: &mut Vec<String>,
-    role: &str,
-    body: String,
-    images: Vec<String>,
-    time: u64,
-    kind: &str,
-) {
-    if body.is_empty() && images.is_empty() {
-        return;
-    }
-    rows.push(
-        json!({
-            "role": role,
-            "body": body,
-            "images": images,
-            "time": time,
-            "kind": kind,
-        })
-        .to_string(),
-    );
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunStatus {
     Idle,

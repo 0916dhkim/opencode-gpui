@@ -11,20 +11,15 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! pkg-config --atleast-version=4.6 gtk4 2>/dev/null; then
-  printf '%s\n' 'GTK 4.6 development files are required. See README.md for distro packages.' >&2
-  exit 1
-fi
-
 cargo build --manifest-path "${ROOT}/Cargo.toml" --release --locked
-install -Dm755 "${ROOT}/target/release/opencode-cosmic" "${BIN_DIR}/opencode-cosmic"
+install -Dm755 "${ROOT}/target/release/opencode-gpui" "${BIN_DIR}/opencode-gpui"
 install -d "${APPLICATION_DIR}"
-sed "s|@EXEC@|${BIN_DIR}/opencode-cosmic|g" \
-  "${ROOT}/data/ai.opencode.Cosmic.desktop" \
-  > "${APPLICATION_DIR}/ai.opencode.Cosmic.desktop"
+sed "s|@EXEC@|${BIN_DIR}/opencode-gpui|g" \
+  "${ROOT}/data/ai.opencode.Gpui.desktop" \
+  > "${APPLICATION_DIR}/ai.opencode.Gpui.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "${APPLICATION_DIR}"
 fi
 
-printf 'Installed OpenCode COSMIC to %s\n' "${BIN_DIR}/opencode-cosmic"
+printf 'Installed OpenCode GPUI to %s\n' "${BIN_DIR}/opencode-gpui"

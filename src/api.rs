@@ -472,14 +472,14 @@ impl Api {
             .connect_timeout(Duration::from_secs(5))
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("opencode-cosmic/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("opencode-gpui/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to initialize HTTP client")?;
         let event_client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(None)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("opencode-cosmic/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("opencode-gpui/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to initialize event-stream client")?;
         Ok(Self {

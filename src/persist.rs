@@ -154,13 +154,59 @@ impl PersistedState {
 pub fn default_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("opencode-cosmic")
+        .join("opencode-gpui")
         .join("state.json")
+}
+
+/// Reuse the last client's non-secret state once, without changing its files.
+/// The old client can still run while the GPUI replacement is under review.
+pub fn load_with_legacy(path: &Path) -> Result<(PersistedState, Option<String>)> {
+    if path.exists() {
+        return PersistedState::load(path);
+    }
+    let Some(config) = path.parent().and_then(Path::parent) else {
+        return PersistedState::load(path);
+    };
+    for name in ["opencode-cosmic", "opencode-gtk"] {
+        let legacy = config.join(name).join("state.json");
+        if legacy.exists() {
+            let bytes = fs::read(&legacy)
+                .with_context(|| format!("failed to read {}", legacy.display()))?;
+            let state: PersistedState = serde_json::from_slice(&bytes)
+                .with_context(|| format!("legacy state is invalid at {}", legacy.display()))?;
+            state.save(path)?;
+            return Ok((
+                state,
+                Some(format!("Copied state from {}", legacy.display())),
+            ));
+        }
+    }
+    PersistedState::load(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_state_is_copied_once_without_touching_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("opencode-cosmic/state.json");
+        let new = dir.path().join("opencode-gpui/state.json");
+        let state = PersistedState {
+            zoom_level: 1.25,
+            ..PersistedState::default()
+        };
+        state.save(&old).unwrap();
+
+        let (loaded, warning) = load_with_legacy(&new).unwrap();
+        assert_eq!(loaded.zoom_level, 1.25);
+        assert!(warning.unwrap().contains("opencode-cosmic"));
+        assert!(old.exists());
+        assert!(new.exists());
+        let (_, warning) = load_with_legacy(&new).unwrap();
+        assert!(warning.is_none());
+    }
 
     #[test]
     fn state_round_trips_without_credentials() {

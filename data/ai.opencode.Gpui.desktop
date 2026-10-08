@@ -1,10 +1,10 @@
 [Desktop Entry]
-Name=OpenCode COSMIC
-Comment=Native COSMIC desktop client for an OpenCode server
+Name=OpenCode GPUI
+Comment=Native GPUI desktop client for an OpenCode server
 Exec=@EXEC@
 Icon=utilities-terminal
 Terminal=false
 Type=Application
 Categories=Development;IDE;
-Keywords=OpenCode;AI;Development;COSMIC;
+Keywords=OpenCode;AI;Development;GPUI;
 StartupNotify=true

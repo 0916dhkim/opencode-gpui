@@ -5,8 +5,10 @@ use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const KEYRING_SERVICE: &str = "ai.opencode.Cosmic.cloudflare-access";
-const PASSWORD_KEYRING_SERVICE: &str = "ai.opencode.Cosmic.basic-auth";
+const KEYRING_SERVICE: &str = "ai.opencode.Gpui.cloudflare-access";
+const PASSWORD_KEYRING_SERVICE: &str = "ai.opencode.Gpui.basic-auth";
+const LEGACY_KEYRING_SERVICE: &str = "ai.opencode.Cosmic.cloudflare-access";
+const LEGACY_PASSWORD_KEYRING_SERVICE: &str = "ai.opencode.Cosmic.basic-auth";
 const STORED_VERSION: u8 = 1;
 
 /// Where secrets live. The app uses [`SystemKeyring`]; tests inject an
@@ -71,9 +73,32 @@ struct StoredCredentials {
 }
 
 pub fn load(server: &str) -> Result<Option<CloudflareAccessCredentials>> {
-    let stored = match SystemKeyring.get(KEYRING_SERVICE, &server_account(server)?) {
+    load_from(&SystemKeyring, server)
+}
+
+fn load_from(
+    store: &impl SecretStore,
+    server: &str,
+) -> Result<Option<CloudflareAccessCredentials>> {
+    let account = server_account(server)?;
+    let stored = match store.get(KEYRING_SERVICE, &account) {
         Ok(stored) => stored,
-        Err(KeyringError::NoEntry) => return Ok(None),
+        Err(KeyringError::NoEntry) => match store.get(LEGACY_KEYRING_SERVICE, &account) {
+            Ok(stored) => {
+                // Copy, never move: an installed older client can still read its entry.
+                // Validate before writing: a corrupt old entry must not shadow
+                // a later repair under the new service name.
+                decode(&stored)?;
+                store
+                    .set(KEYRING_SERVICE, &account, &stored)
+                    .context("failed to migrate Cloudflare Access credentials")?;
+                stored
+            }
+            Err(KeyringError::NoEntry) => return Ok(None),
+            Err(error) => {
+                return Err(error).context("failed to read legacy Cloudflare Access credentials");
+            }
+        },
         Err(error) => return Err(error).context("failed to read Cloudflare Access credentials"),
     };
     decode(&stored).map(Some)
@@ -91,10 +116,16 @@ pub fn save(server: &str, credentials: &CloudflareAccessCredentials) -> Result<(
 }
 
 pub fn remove(server: &str) -> Result<()> {
-    match SystemKeyring.delete(KEYRING_SERVICE, &server_account(server)?) {
-        Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
-        Err(error) => Err(error).context("failed to remove Cloudflare Access credentials"),
+    let account = server_account(server)?;
+    for service in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
+        match SystemKeyring.delete(service, &account) {
+            Ok(()) | Err(KeyringError::NoEntry) => {}
+            Err(error) => {
+                return Err(error).context("failed to remove Cloudflare Access credentials");
+            }
+        }
     }
+    Ok(())
 }
 
 fn server_account(server: &str) -> Result<String> {
@@ -175,16 +206,32 @@ pub fn load_password(
     let account = password_account(server, username)?;
     let stored = match store.get(PASSWORD_KEYRING_SERVICE, &account) {
         Ok(stored) => stored,
-        Err(KeyringError::NoEntry) => return Ok(None),
+        Err(KeyringError::NoEntry) => match store.get(LEGACY_PASSWORD_KEYRING_SERVICE, &account) {
+            Ok(stored) => {
+                decode_password(&stored)?;
+                store
+                    .set(PASSWORD_KEYRING_SERVICE, &account, &stored)
+                    .map_err(|error| {
+                        anyhow!("could not migrate the stored OpenCode password: {error}")
+                    })?;
+                stored
+            }
+            Err(KeyringError::NoEntry) => return Ok(None),
+            Err(error) => return Err(anyhow!("could not read the legacy system keyring: {error}")),
+        },
         Err(error) => return Err(anyhow!("could not read the system keyring: {error}")),
     };
+    decode_password(&stored).map(Some)
+}
+
+fn decode_password(stored: &str) -> Result<String> {
     // Never chain the JSON error: it can quote the stored value.
-    let stored: StoredPassword = serde_json::from_str(&stored)
+    let stored: StoredPassword = serde_json::from_str(stored)
         .map_err(|_| anyhow!("the stored OpenCode password entry is invalid"))?;
     if stored.version != STORED_VERSION {
         bail!("the stored OpenCode password entry uses an unsupported version");
     }
-    Ok(Some(stored.password))
+    Ok(stored.password)
 }
 
 pub fn save_password(
@@ -209,10 +256,13 @@ pub fn save_password(
 
 pub fn remove_password(store: &impl SecretStore, server: &str, username: &str) -> Result<()> {
     let account = password_account(server, username)?;
-    match store.delete(PASSWORD_KEYRING_SERVICE, &account) {
-        Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
-        Err(error) => Err(anyhow!("could not update the system keyring: {error}")),
+    for service in [PASSWORD_KEYRING_SERVICE, LEGACY_PASSWORD_KEYRING_SERVICE] {
+        match store.delete(service, &account) {
+            Ok(()) | Err(KeyringError::NoEntry) => {}
+            Err(error) => return Err(anyhow!("could not update the system keyring: {error}")),
+        }
     }
+    Ok(())
 }
 
 /// The Basic password to start with and whether it came from the keyring.
@@ -515,6 +565,42 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_credentials_migrate_without_deleting_the_cosmic_entry() {
+        let store = MemoryStore::default();
+        let account = server_account(SERVER).unwrap();
+        let credentials =
+            CloudflareAccessCredentials::new("client".into(), "secret".into()).unwrap();
+        let encoded = serde_json::to_string(&StoredCredentials {
+            version: STORED_VERSION,
+            credentials: credentials.clone(),
+        })
+        .unwrap();
+        store
+            .set(LEGACY_KEYRING_SERVICE, &account, &encoded)
+            .unwrap();
+        assert_eq!(load_from(&store, SERVER).unwrap(), Some(credentials));
+        assert_eq!(store.get(KEYRING_SERVICE, &account).unwrap(), encoded);
+        assert_eq!(
+            store.get(LEGACY_KEYRING_SERVICE, &account).unwrap(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn corrupt_legacy_cloudflare_entry_is_not_migrated() {
+        let store = MemoryStore::default();
+        let account = server_account(SERVER).unwrap();
+        store
+            .set(LEGACY_KEYRING_SERVICE, &account, "invalid")
+            .unwrap();
+        assert!(load_from(&store, SERVER).is_err());
+        assert!(matches!(
+            store.get(KEYRING_SERVICE, &account),
+            Err(KeyringError::NoEntry)
+        ));
+    }
+
+    #[test]
     fn server_account_is_canonical_and_secret_free() {
         assert_eq!(
             server_account("https://OpenCode.Example.com/").unwrap(),
@@ -608,6 +694,46 @@ mod tests {
         remove_password(&store, SERVER, "opencode").unwrap();
         assert_eq!(load_password(&store, SERVER, "opencode").unwrap(), None);
         remove_password(&store, SERVER, "opencode").unwrap();
+    }
+
+    #[test]
+    fn legacy_cosmic_password_is_copied_then_removed_with_new_entry() {
+        let store = MemoryStore::default();
+        let account = password_account(SERVER, "opencode").unwrap();
+        store
+            .set(
+                LEGACY_PASSWORD_KEYRING_SERVICE,
+                &account,
+                r#"{"version":1,"password":"existing-password"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            load_password(&store, SERVER, "opencode").unwrap(),
+            Some("existing-password".into())
+        );
+        assert!(store.get(PASSWORD_KEYRING_SERVICE, &account).is_ok());
+        assert!(store.get(LEGACY_PASSWORD_KEYRING_SERVICE, &account).is_ok());
+        remove_password(&store, SERVER, "opencode").unwrap();
+        assert_eq!(load_password(&store, SERVER, "opencode").unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_legacy_password_is_not_copied_to_the_new_service() {
+        let store = MemoryStore::default();
+        let account = password_account(SERVER, "opencode").unwrap();
+        store
+            .set(
+                LEGACY_PASSWORD_KEYRING_SERVICE,
+                &account,
+                "broken legacy entry",
+            )
+            .unwrap();
+        let error = load_password(&store, SERVER, "opencode").unwrap_err();
+        assert!(!format!("{error:#}").contains("broken legacy entry"));
+        assert!(matches!(
+            store.get(PASSWORD_KEYRING_SERVICE, &account),
+            Err(KeyringError::NoEntry)
+        ));
     }
 
     #[test]

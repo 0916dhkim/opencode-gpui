@@ -14,7 +14,7 @@ use crate::{
     protocol,
 };
 
-pub const SERVER_KEY: &str = "preview://opencode-cosmic";
+pub const SERVER_KEY: &str = "preview://opencode-gpui";
 
 const DIRECTORY: &str = "/repo";
 const ACTIVE_ID: &str = "ses_preview";
@@ -326,7 +326,7 @@ impl State {
             projects: vec![Project::from_info(&decode(json!({
                 "id": "prj_preview",
                 "canonical": DIRECTORY,
-                "name": "opencode-cosmic",
+                "name": "opencode-gpui",
                 "sandboxes": []
             })))],
             statuses,
@@ -670,6 +670,12 @@ impl State {
     }
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -847,7 +853,7 @@ fn idle(id: &str, created: u64) -> protocol::SessionMessage {
 }
 
 fn active_messages() -> Vec<protocol::SessionMessage> {
-    vec![
+    let mut messages = vec![
         user_text(
             "msg_user",
             CREATED,
@@ -897,7 +903,14 @@ fn active_messages() -> Vec<protocol::SessionMessage> {
                 "source": { "type": "inline" }
             }]
         })),
-    ]
+    ];
+    // The GTK 14d24ae fixture ends after the assistant tool call. The extra
+    // image turn exercises GPUI's attachment renderer, but must be omitted
+    // for a like-for-like main-window screenshot of the reference fixture.
+    if std::env::var_os("OPENCODE_PREVIEW_MATCH_GTK").is_some() {
+        messages.pop();
+    }
+    messages
 }
 
 fn other_messages() -> Vec<protocol::SessionMessage> {
