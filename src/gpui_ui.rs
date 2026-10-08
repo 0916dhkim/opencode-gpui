@@ -12,6 +12,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
@@ -3512,7 +3513,12 @@ impl Client {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.choose_attachments(cx);
                             }))
-                            .child("♧"),
+                            .child(
+                                Icon::default()
+                                    .data(include_bytes!("icons/paperclip.svg"))
+                                    .with_size(px(22.))
+                                    .text_color(self.tone(0x555b5c, 0xc8c4bd)),
+                            ),
                     )
                     .child(
                         div()
@@ -3594,8 +3600,12 @@ impl Client {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(self.tone(0xffffff, 0x17130e))
-                            .child("➤"),
+                            .text_color(rgb(0x17130e))
+                            .child(
+                                Icon::default()
+                                    .data(include_bytes!("icons/send.svg"))
+                                    .with_size(px(22.)),
+                            ),
                     ),
             )
             .into_any_element()
