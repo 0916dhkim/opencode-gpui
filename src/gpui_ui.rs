@@ -2,6 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -11,7 +12,7 @@ use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
-    api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, UiEvent},
+    api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ServerEnvelope, UiEvent},
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
     jobs::{self, JobRow, Jobs},
     model::{
@@ -31,6 +32,13 @@ struct Client {
     api: Option<ApiHandle>,
     preview_api: bool,
     connection_generation: u64,
+    bootstrap_in_flight: bool,
+    bootstrap_after_load: bool,
+    bootstrap_retry_scheduled: bool,
+    bootstrap_retry_count: u8,
+    bootstrap_events: Vec<ServerEnvelope>,
+    bootstrap_directories: Vec<String>,
+    refresh_open_tabs: bool,
     settings: SettingsFields,
     saved_active: Option<String>,
     connection_status: String,
@@ -64,6 +72,8 @@ struct Client {
     forms: Forms,
     permissions: Vec<PendingPermission>,
     permission_in_flight: HashSet<String>,
+    permission_focus: [FocusHandle; 3],
+    permission_presented: bool,
     child_parents: HashMap<String, String>,
     next_prompt_request_id: u64,
     next_session_request_id: u64,
@@ -433,6 +443,13 @@ impl Client {
             api: None,
             preview_api: false,
             connection_generation: 0,
+            bootstrap_in_flight: false,
+            bootstrap_after_load: false,
+            bootstrap_retry_scheduled: false,
+            bootstrap_retry_count: 0,
+            bootstrap_events: Vec::new(),
+            bootstrap_directories: Vec::new(),
+            refresh_open_tabs: false,
             settings: SettingsFields::new(window, cx, state.clone(), config.clone()),
             saved_active: None,
             connection_status: "Connecting".into(),
@@ -471,6 +488,8 @@ impl Client {
             forms: Forms::default(),
             permissions: Vec::new(),
             permission_in_flight: HashSet::new(),
+            permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            permission_presented: false,
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
@@ -519,16 +538,12 @@ impl Client {
                 client.open_tabs = saved
                     .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
                     .unwrap_or_default();
+                client.bootstrap_directories = saved
+                    .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
+                    .unwrap_or_default();
                 client.unread = saved.map(|saved| saved.unread.clone()).unwrap_or_default();
-                api.send(Command::Bootstrap {
-                    sessions: saved
-                        .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
-                        .unwrap_or_default(),
-                    directories: saved
-                        .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
-                        .unwrap_or_default(),
-                });
                 client.api = Some(api);
+                client.request_bootstrap();
                 cx.spawn(async move |this, cx| {
                     while let Ok(event) = receiver.recv().await {
                         if this
@@ -800,7 +815,7 @@ impl Client {
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
-        if self.preview_api || self.api.is_none() {
+        if self.preview_api {
             self.modal = None;
             cx.notify();
             return;
@@ -930,6 +945,12 @@ impl Client {
             .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
             .unwrap_or_default();
         self.bootstrapped = false;
+        self.bootstrap_in_flight = false;
+        self.bootstrap_after_load = false;
+        self.bootstrap_retry_scheduled = false;
+        self.bootstrap_retry_count = 0;
+        self.bootstrap_events.clear();
+        self.refresh_open_tabs = false;
         self.projects.clear();
         self.active.clear();
         self.composer_session = "reset".into();
@@ -949,22 +970,17 @@ impl Client {
         self.forms.clear();
         self.permissions.clear();
         self.permission_in_flight.clear();
+        self.permission_presented = false;
         self.child_parents.clear();
         self.tray_in_flight.clear();
         self.jobs.clear();
         self.running_jobs = Jobs::default();
         let saved = persisted.servers.get(&key);
         self.saved_active = saved.and_then(|saved| saved.active.clone());
-        if let Some(api) = &self.api {
-            api.send(Command::Bootstrap {
-                sessions: saved
-                    .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
-                    .unwrap_or_default(),
-                directories: saved
-                    .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
-                    .unwrap_or_default(),
-            });
-        }
+        self.bootstrap_directories = saved
+            .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
+            .unwrap_or_default();
+        self.request_bootstrap();
         cx.spawn(async move |this, cx| {
             while let Ok(event) = receiver.recv().await {
                 if this
@@ -1240,9 +1256,59 @@ impl Client {
     fn active_directories(&self) -> Vec<String> {
         self.sessions
             .iter()
-            .filter(|session| session.id == self.active)
+            .filter(|session| self.open_tabs.contains(&session.id))
             .map(|session| session.directory.clone())
             .collect()
+    }
+
+    fn request_bootstrap(&mut self) {
+        if self.bootstrap_in_flight {
+            self.bootstrap_after_load = true;
+            return;
+        }
+        let Some(api) = &self.api else { return };
+        self.bootstrap_in_flight = true;
+        self.bootstrap_events.clear();
+        let mut directories = self.bootstrap_directories.clone();
+        directories.extend(self.active_directories());
+        directories.sort();
+        directories.dedup();
+        api.send(Command::Bootstrap {
+            sessions: self.open_tabs.clone(),
+            directories,
+        });
+    }
+
+    fn schedule_bootstrap_retry(&mut self, cx: &mut Context<Self>) {
+        if self.bootstrap_retry_scheduled || self.api.is_none() {
+            return;
+        }
+        self.bootstrap_retry_scheduled = true;
+        let generation = self.connection_generation;
+        let seconds = 1u64 << self.bootstrap_retry_count.min(5);
+        self.bootstrap_retry_count = self.bootstrap_retry_count.saturating_add(1).min(5);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(seconds))
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if this.connection_generation == generation && this.bootstrap_retry_scheduled {
+                    this.bootstrap_retry_scheduled = false;
+                    this.request_bootstrap();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn replay_bootstrap_events(&mut self, cx: &mut Context<Self>) {
+        self.bootstrap_in_flight = false;
+        for envelope in std::mem::take(&mut self.bootstrap_events) {
+            self.handle_live_event(UiEvent::ServerEvent(envelope), cx);
+        }
+        if std::mem::take(&mut self.bootstrap_after_load) {
+            self.request_bootstrap();
+        }
     }
 
     fn upsert_permission(
@@ -1337,6 +1403,10 @@ impl Client {
     }
 
     fn choose_attachments(&mut self, cx: &mut Context<Self>) {
+        let session_id = self.active.clone();
+        if session_id.is_empty() {
+            return;
+        }
         let supports_attachments = self
             .selected_model()
             .as_ref()
@@ -1351,10 +1421,20 @@ impl Client {
             let picked = rfd::AsyncFileDialog::new().pick_files().await;
             if let Some(files) = picked {
                 let _ = this.update(cx, |this, cx| {
+                    if !this.open_tabs.contains(&session_id) {
+                        return;
+                    }
+                    let draft = if this.active == session_id {
+                        &mut this.attachments_draft
+                    } else {
+                        this.attachment_drafts
+                            .entry(session_id.clone())
+                            .or_default()
+                    };
                     for file in files {
                         let path = file.path().to_path_buf();
-                        if !this.attachments_draft.contains(&path) {
-                            this.attachments_draft.push(path);
+                        if !draft.contains(&path) {
+                            draft.push(path);
                         }
                     }
                     cx.notify();
@@ -1452,12 +1532,8 @@ impl Client {
                     .unwrap_or_else(|| "Connected".into());
                 // The stream reconnects independently of request workers; resync after outages.
                 if self.disconnected {
-                    if let Some(api) = &self.api {
-                        api.send(Command::Bootstrap {
-                            sessions: vec![self.active.clone()],
-                            directories: self.active_directories(),
-                        });
-                    }
+                    self.refresh_open_tabs = true;
+                    self.request_bootstrap();
                     self.disconnected = false;
                 }
             }
@@ -1469,8 +1545,11 @@ impl Client {
                 self.connection_status = "Disconnected · reconnecting".into();
             }
             UiEvent::Bootstrap(Ok(data)) => {
+                let retry_needed = data.retry_needed;
                 self.server_version = Some(data.version.clone());
-                self.projects = data.projects.clone();
+                if data.projects_complete {
+                    self.projects = data.projects;
+                }
                 if !self.disconnected {
                     self.connection_status = if data.warnings.is_empty() {
                         format!("Connected · {}", data.version)
@@ -1482,6 +1561,7 @@ impl Client {
                     self.sessions = data.sessions;
                     self.open_tabs
                         .retain(|id| self.sessions.iter().any(|session| &session.id == id));
+                    self.bootstrap_directories = self.active_directories();
                 } else {
                     for session in data.sessions {
                         if let Some(existing) = self
@@ -1542,24 +1622,42 @@ impl Client {
                             .find(|session| session.parent_id.is_none())
                             .map(|session| session.id.clone())
                     });
-                if let Some(id) = desired {
-                    self.conversations.remove(&id);
-                    if let Some(directory) = self
-                        .sessions
-                        .iter()
-                        .find(|session| session.id == id)
-                        .map(|session| session.directory.clone())
-                    {
-                        self.catalogs.remove(&directory);
+                let refresh_tabs = std::mem::take(&mut self.refresh_open_tabs);
+                if refresh_tabs {
+                    for id in &self.open_tabs {
+                        if let Some(conversation) = self.conversations.get_mut(id) {
+                            conversation.loaded = false;
+                        }
                     }
+                    self.catalogs.clear();
+                }
+                if let Some(id) = desired {
                     self.select_session(id);
                 } else {
                     self.active.clear();
                     self.catalog = ModelCatalog::default();
                 }
                 self.bootstrapped = true;
+                if refresh_tabs {
+                    for id in self.open_tabs.clone() {
+                        if id != self.active {
+                            self.request_newest(&id);
+                        }
+                    }
+                }
+                self.replay_bootstrap_events(cx);
+                if retry_needed {
+                    self.schedule_bootstrap_retry(cx);
+                } else {
+                    self.bootstrap_retry_count = 0;
+                    self.bootstrap_retry_scheduled = false;
+                }
             }
-            UiEvent::Bootstrap(Err(_)) => self.connection_status = "Refresh failed".into(),
+            UiEvent::Bootstrap(Err(_)) => {
+                self.connection_status = "Refresh failed · retrying".into();
+                self.replay_bootstrap_events(cx);
+                self.schedule_bootstrap_retry(cx);
+            }
             UiEvent::MessagesLoaded {
                 session_id,
                 cursor,
@@ -1750,6 +1848,10 @@ impl Client {
                 }
             }
             UiEvent::ServerEvent(envelope) => {
+                if self.bootstrap_in_flight {
+                    self.bootstrap_events.push(envelope);
+                    return;
+                }
                 if let Ok(event) = protocol::Event::deserialize(&envelope.payload) {
                     let kind = protocol::decode_event(&event);
                     if let Some((child, parent)) = pending::subagent_child(&kind) {
@@ -1976,6 +2078,13 @@ impl Client {
             api: None,
             preview_api: false,
             connection_generation: 0,
+            bootstrap_in_flight: false,
+            bootstrap_after_load: false,
+            bootstrap_retry_scheduled: false,
+            bootstrap_retry_count: 0,
+            bootstrap_events: Vec::new(),
+            bootstrap_directories: Vec::new(),
+            refresh_open_tabs: false,
             settings: SettingsFields::new(
                 window,
                 cx,
@@ -2024,6 +2133,8 @@ impl Client {
             forms,
             permissions,
             permission_in_flight: HashSet::new(),
+            permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            permission_presented: false,
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
@@ -2111,11 +2222,8 @@ impl Client {
         client.message_events_during_load.clear();
         client.forms.clear();
         client.permissions.clear();
-        api.send(Command::Bootstrap {
-            sessions: vec![],
-            directories: vec![],
-        });
         client.api = Some(api);
+        client.request_bootstrap();
         cx.subscribe(&client.composer, |this, _, event: &InputEvent, cx| {
             if let InputEvent::PressEnter { secondary, shift } = event
                 && !shift
@@ -2570,12 +2678,17 @@ impl Client {
             choices.push(("Always allow", protocol::PermissionDecision::Always));
         }
         let in_flight = self.permission_in_flight.contains(&request.id);
-        for (label, decision) in choices {
+        for (index, (label, decision)) in choices.into_iter().enumerate() {
             let id = request.id.clone();
             let session_id = request.session_id.clone();
             actions = actions.child(
                 div()
                     .id(format!("permission-{label}-{}", request.id))
+                    .role(Role::Button)
+                    .aria_label(label)
+                    .test_support()
+                    .track_focus(&self.permission_focus[index])
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
                     .px(px(12.))
                     .py(px(7.))
                     .rounded(px(6.))
@@ -3968,6 +4081,18 @@ impl Render for Client {
             }
         }
         self.clear_accepted_drafts = deferred;
+        let permission_visible = self.modal.is_none() && self.visible_permission().is_some();
+        if permission_visible && !self.permission_presented {
+            self.permission_presented = true;
+            let focus = self.permission_focus[0].clone();
+            window.on_next_frame(move |window, cx| focus.focus(window, cx));
+        } else if !permission_visible && self.permission_presented {
+            self.permission_presented = false;
+            if self.modal.is_none() {
+                let focus = self.composer.focus_handle(cx);
+                window.on_next_frame(move |window, cx| focus.focus(window, cx));
+            }
+        }
         let composer_slot = self
             .permission_card(cx)
             .unwrap_or_else(|| self.composer(cx));
@@ -4083,8 +4208,36 @@ pub fn run(args: Args) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarkdownBlock, markdown_blocks, sticky_user_index};
-    use gpui_kit::px;
+    use super::{Client, MarkdownBlock, markdown_blocks, sticky_user_index};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AppContext, Role, TestAppContext, WindowOptions, px};
+
+    #[gpui_kit::test]
+    fn permission_action_exposes_role_name_and_updates_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.select_session("ses_other".into());
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let deny = window.find("permission-Deny-per_preview");
+            assert_eq!(deny.role(), Some(Role::Button));
+            assert_eq!(deny.label(), Some("Deny"));
+            window.click("permission-Deny-per_preview", cx);
+            assert!(window.try_find("permission-Deny-per_preview").is_none());
+        })
+        .unwrap();
+        cx.update(|cx| assert!(client.read(cx).permissions.is_empty()));
+    }
 
     #[test]
     fn sticky_tracks_latest_user_past_top_and_hides_flush_row() {

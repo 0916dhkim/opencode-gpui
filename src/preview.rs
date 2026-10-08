@@ -336,6 +336,7 @@ impl State {
                 "name": "opencode-gpui",
                 "sandboxes": []
             })))],
+            projects_complete: true,
             statuses,
             statuses_complete: true,
             pending: self.pending.clone(),

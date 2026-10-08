@@ -23,6 +23,10 @@ cleanup() {
 trap cleanup EXIT
 for _ in {1..80}; do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.1; done
 export XDG_CONFIG_HOME="${TEST_CONFIG_DIR:-$(mktemp -d)}" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)"
+if [[ "$CLIENT" == gpui && "${TEST_INVALID_STATE:-0}" == 1 ]]; then
+  mkdir -p "$XDG_CONFIG_HOME/opencode-gpui"
+  printf '{"connection":{"server":"not-a-url","username":"opencode"}}\n' > "$XDG_CONFIG_HOME/opencode-gpui/state.json"
+fi
 export XDG_RUNTIME_DIR="$(mktemp -d)"
 chmod 700 "$XDG_RUNTIME_DIR"
 export GSETTINGS_BACKEND=memory GDK_BACKEND=x11 GTK_A11Y=none NO_AT_BRIDGE=1
@@ -118,12 +122,14 @@ fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == close-tab ]]; then
   xdotool mousemove --window "$win" 247 116 click 1
 fi
-if [[ "${INTERACTION:-}" == permission || "${INTERACTION:-}" == permission-deny || "${INTERACTION:-}" == permission-once ]]; then
+if [[ "${INTERACTION:-}" == permission || "${INTERACTION:-}" == permission-deny || "${INTERACTION:-}" == permission-once || "${INTERACTION:-}" == permission-tab-deny ]]; then
   if [[ "$CLIENT" == gpui ]]; then
+    if [[ "${INTERACTION:-}" == permission-tab-deny ]]; then xdotool mousemove --window "$win" 410 680 click 1; fi
     xdotool mousemove --window "$win" 92 148 click 1
     sleep 0.4
     if [[ "${INTERACTION:-}" == permission-deny ]]; then xdotool mousemove --window "$win" 492 737 click 1; fi
     if [[ "${INTERACTION:-}" == permission-once ]]; then xdotool mousemove --window "$win" 578 737 click 1; fi
+    if [[ "${INTERACTION:-}" == permission-tab-deny ]]; then sleep 0.5; xdotool key Tab shift+Tab space; fi
   else
     xdotool mousemove 92 148 click 1
   fi
@@ -166,6 +172,14 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
   xdotool mousemove --window "$win" 410 680 click 1
   xdotool type --clearmodifiers --delay 30 'RACE_MARKER_KEEP_THIS'
   xdotool key Return
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == repair-server ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool key ctrl+comma
+  sleep 0.4
+  xdotool mousemove --window "$win" 390 222 click 1 key ctrl+a
+  xdotool type --clearmodifiers --delay 25 'http://127.0.0.1:4096'
+  xdotool mousemove --window "$win" 760 727 click 1
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == copy-code ]]; then
   xdotool mousemove --window "$win" 720 392 click 1

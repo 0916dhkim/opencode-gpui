@@ -323,6 +323,7 @@ class Server:
         self.sse_count = 0
         self.pending_drop_after = args.drop_sse_after
         self.delays = {}
+        self.fail_routes = {}
         for item in args.delay or []:
             route, _, ms = item.partition("=")
             self.delays[route] = int(ms)
@@ -1114,6 +1115,7 @@ class Server:
                 "shells": sorted(shell_id for shell_id, shell in self.shells.items() if shell["info"]["status"] == "running"),
                 "sessions": len(self.sessions),
                 "delays": dict(self.delays),
+                "failRoutes": dict(self.fail_routes),
                 "races": dict(self.races),
                 "reply404": self.reply_404,
                 "modelsEmptyRemaining": self.models_empty_remaining,
@@ -1131,6 +1133,13 @@ class Server:
                     self.delays[route] = int(body["ms"])
                 else:
                     self.delays.pop(route, None)
+        elif action == "fail_route":
+            route = body["route"]
+            count = int(body.get("count", 1))
+            if count > 0:
+                self.fail_routes[route] = count
+            else:
+                self.fail_routes.pop(route, None)
         elif action == "race":
             self.races[body.get("route", "session.list")] = {
                 "kind": body.get("kind", "rename"),
@@ -2304,6 +2313,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, {"_tag": "RouteNotFoundError", "message": f"Route not found: {method} {path}"})
             if route == "method.not_allowed":
                 raise ApiError(405, {"_tag": "MethodNotAllowedError", "message": f"Method not allowed: {method} {path}"})
+            with self.app.lock:
+                remaining = self.app.fail_routes.get(route, 0)
+                if remaining:
+                    self.app.fail_routes[route] = remaining - 1
+            if remaining:
+                raise ApiError(503, {"_tag": "UnavailableError", "message": f"Injected transient failure for {route}"})
             status, value = self.route_request(route, params, query, body or {})
         except ApiError as error:
             status, value = error.status, error.body

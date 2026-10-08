@@ -168,6 +168,7 @@ pub struct Bootstrap {
     pub sessions: Vec<Session>,
     pub sessions_complete: bool,
     pub projects: Vec<Project>,
+    pub projects_complete: bool,
     pub statuses: HashMap<String, RunStatus>,
     pub statuses_complete: bool,
     pub pending: Vec<PendingRequest>,
@@ -629,13 +630,13 @@ impl Api {
         let mut retry_needed = false;
         let version = self.server_info()?.version;
 
-        let projects =
+        let (projects, projects_complete) =
             match self.get::<protocol::ProjectListResponse>(&protocol::projects_path(), &[]) {
-                Ok(projects) => projects.iter().map(Project::from_info).collect(),
+                Ok(projects) => (projects.iter().map(Project::from_info).collect(), true),
                 Err(error) => {
                     retry_needed = true;
                     warnings.push(format!("Could not list every project: {error:#}"));
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             };
 
@@ -679,6 +680,7 @@ impl Api {
             sessions,
             sessions_complete,
             projects,
+            projects_complete,
             statuses,
             statuses_complete,
             pending: pending.requests,
