@@ -122,6 +122,66 @@ fn filter_tab_sessions<'a>(sessions: &'a [Session], query: &str) -> Vec<&'a Sess
         .collect()
 }
 
+fn filter_models<'a>(models: &'a [model::ModelOption], query: &str) -> Vec<&'a model::ModelOption> {
+    let query = query.trim();
+    let mut scored: Vec<_> = models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, option)| {
+            let score = if query.is_empty() {
+                Some(0)
+            } else {
+                fuzzy_score(query, &option.label).max(fuzzy_score(
+                    query,
+                    &format!("{} / {}", option.provider_id, option.model_id),
+                ))
+            };
+            score.map(|score| (score, index, option))
+        })
+        .collect();
+    if !query.is_empty() {
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.label.cmp(&b.2.label)));
+    }
+    scored.into_iter().map(|(_, _, option)| option).collect()
+}
+
+fn filter_levels(variants: &[String], query: &str) -> Vec<Option<String>> {
+    let query = query.trim();
+    let mut scored: Vec<_> = std::iter::once(None)
+        .chain(variants.iter().cloned().map(Some))
+        .enumerate()
+        .filter_map(|(index, variant)| {
+            let label = variant.as_deref().unwrap_or("Default");
+            let score = if query.is_empty() {
+                Some(0)
+            } else {
+                fuzzy_score(query, label)
+            };
+            score.map(|score| (score, index, variant))
+        })
+        .collect();
+    if !query.is_empty() {
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0).then_with(|| {
+                a.2.as_deref()
+                    .unwrap_or("Default")
+                    .cmp(b.2.as_deref().unwrap_or("Default"))
+            })
+        });
+    }
+    scored.into_iter().map(|(_, _, variant)| variant).collect()
+}
+
+fn picker_list_height(model: bool, count: usize) -> f32 {
+    let (row, minimum, maximum) = if model {
+        (52., 100., 280.)
+    } else {
+        (33., 80., 240.)
+    };
+    let gap = if model { 8. } else { 0. };
+    (count as f32 * row + count.saturating_sub(1) as f32 * gap).clamp(minimum, maximum)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabAttention {
     Busy,
@@ -234,6 +294,7 @@ struct Client {
     overlay: Option<String>,
     scroll: ScrollHandle,
     sessions_picker_scroll: ScrollHandle,
+    picker_list_scroll: ScrollHandle,
     unread: HashSet<String>,
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
@@ -822,6 +883,7 @@ impl Client {
             overlay: None,
             scroll,
             sessions_picker_scroll: ScrollHandle::new(),
+            picker_list_scroll: ScrollHandle::new(),
             unread: HashSet::new(),
             statuses: HashMap::new(),
             jobs: Vec::new(),
@@ -860,6 +922,8 @@ impl Client {
                     if this.modal == Some(Modal::Sessions) {
                         this.sessions_picker_scroll
                             .set_offset(point(px(0.), px(0.)));
+                    } else if matches!(this.modal, Some(Modal::Model | Modal::Level)) {
+                        this.picker_list_scroll.set_offset(point(px(0.), px(0.)));
                     }
                     cx.notify();
                 }
@@ -1396,10 +1460,12 @@ impl Client {
                 if modal == Modal::Sessions {
                     self.sessions_picker_scroll
                         .set_offset(point(px(0.), px(0.)));
+                } else if matches!(modal, Modal::Model | Modal::Level) {
+                    self.picker_list_scroll.set_offset(point(px(0.), px(0.)));
                 }
                 let placeholder = match modal {
-                    Modal::Model => "Search models (fuzzy)…",
-                    Modal::Level => "Search levels (fuzzy)…",
+                    Modal::Model => "Search models (fuzzy)...",
+                    Modal::Level => "Search levels (fuzzy)...",
                     Modal::Sessions => "Search tabs...",
                     Modal::NewSession => "Search projects…",
                     _ => "Search…",
@@ -1451,16 +1517,7 @@ impl Client {
                             .contains(&query)
                 })
                 .count(),
-            Some(Modal::Model) => self
-                .catalog
-                .models
-                .iter()
-                .filter(|option| {
-                    option.label.to_lowercase().contains(&query)
-                        || option.model_id.to_lowercase().contains(&query)
-                })
-                .take(7)
-                .count(),
+            Some(Modal::Model) => filter_models(&self.catalog.models, &query).len(),
             Some(Modal::Level) => {
                 let variants = self
                     .selected_model()
@@ -1468,10 +1525,7 @@ impl Client {
                     .and_then(|selection| self.catalog.find(selection))
                     .map(|option| option.variants.as_slice())
                     .unwrap_or_default();
-                std::iter::once("Default")
-                    .chain(variants.iter().map(String::as_str))
-                    .filter(|level| level.to_lowercase().contains(&query))
-                    .count()
+                filter_levels(variants, &query).len()
             }
             _ => 0,
         }
@@ -1510,16 +1564,8 @@ impl Client {
                 }
             }
             Some(Modal::Model) => {
-                let choice = self
-                    .catalog
-                    .models
-                    .iter()
-                    .filter(|option| {
-                        option.label.to_lowercase().contains(&query)
-                            || option.model_id.to_lowercase().contains(&query)
-                    })
-                    .take(7)
-                    .nth(index)
+                let choice = filter_models(&self.catalog.models, &query)
+                    .get(index)
                     .map(|option| protocol::ModelRef {
                         id: option.model_id.clone(),
                         provider_id: option.provider_id.clone(),
@@ -1536,16 +1582,7 @@ impl Client {
                     .and_then(|selection| self.catalog.find(selection))
                     .map(|option| option.variants.as_slice())
                     .unwrap_or_default();
-                let variant = std::iter::once(None)
-                    .chain(variant.iter().cloned().map(Some))
-                    .filter(|variant| {
-                        variant
-                            .as_deref()
-                            .unwrap_or("Default")
-                            .to_lowercase()
-                            .contains(&query)
-                    })
-                    .nth(index);
+                let variant = filter_levels(variant, &query).get(index).cloned();
                 if let (Some(selection), Some(variant)) = (chosen, variant) {
                     self.choose_model(
                         protocol::ModelRef {
@@ -1626,6 +1663,9 @@ impl Client {
             });
             if self.modal == Some(Modal::Sessions) {
                 self.sessions_picker_scroll
+                    .scroll_to_item(self.picker_highlight.unwrap_or_default());
+            } else if matches!(self.modal, Some(Modal::Model | Modal::Level)) {
+                self.picker_list_scroll
                     .scroll_to_item(self.picker_highlight.unwrap_or_default());
             }
             cx.stop_propagation();
@@ -2592,6 +2632,7 @@ impl Client {
             overlay: if modal.is_none() { overlay } else { None },
             scroll,
             sessions_picker_scroll: ScrollHandle::new(),
+            picker_list_scroll: ScrollHandle::new(),
             unread: server.unread,
             statuses: bootstrap.statuses,
             jobs,
@@ -2613,8 +2654,8 @@ impl Client {
             picker_highlight: None,
             search: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(match modal {
-                    Some(Modal::Model) => "Search models (fuzzy)…",
-                    Some(Modal::Level) => "Search levels (fuzzy)…",
+                    Some(Modal::Model) => "Search models (fuzzy)...",
+                    Some(Modal::Level) => "Search levels (fuzzy)...",
                     Some(Modal::Sessions) => "Search tabs...",
                     Some(Modal::NewSession) => "Search projects…",
                     _ => "Search…",
@@ -2631,6 +2672,8 @@ impl Client {
                     if this.modal == Some(Modal::Sessions) {
                         this.sessions_picker_scroll
                             .set_offset(point(px(0.), px(0.)));
+                    } else if matches!(this.modal, Some(Modal::Model | Modal::Level)) {
+                        this.picker_list_scroll.set_offset(point(px(0.), px(0.)));
                     }
                     cx.notify();
                 }
@@ -4823,9 +4866,21 @@ impl Client {
             }
             Modal::Model | Modal::Level => {
                 let model = modal == Modal::Model;
-                let mut list = div()
+                let query = self.search.read(cx).value();
+                let count = if model {
+                    filter_models(&self.catalog.models, &query).len()
+                } else {
+                    let variants = self
+                        .selected_model()
+                        .as_ref()
+                        .and_then(|selection| self.catalog.find(selection))
+                        .map(|option| option.variants.as_slice())
+                        .unwrap_or_default();
+                    filter_levels(variants, &query).len()
+                };
+                let list = div()
                     .w(px(if model { 368. } else { 268. }))
-                    .h(px(if model { 178. } else { 204. }))
+                    .h(px(70. + picker_list_height(model, count)))
                     .rounded(px(8.))
                     .border_1()
                     .border_color(self.tone(0xc8c3ba, 0x30353a))
@@ -4846,23 +4901,30 @@ impl Client {
                             .border_1()
                             .border_color(self.tone(0x4f99ee, 0x62bceb))
                             .bg(self.tone(0xffffff, 0x181c21))
-                            .child("⌕")
+                            .child(
+                                Icon::default()
+                                    .data(include_bytes!("icons/search.svg"))
+                                    .with_size(px(16.))
+                                    .text_color(self.tone(0x8b918e, 0x71717a)),
+                            )
                             .child(Input::new(&self.search).appearance(false)),
                     );
+                let mut rows = div()
+                    .id("model-level-picker-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.picker_list_scroll)
+                    .flex()
+                    .flex_col()
+                    .gap(px(if model { 8. } else { 0. }));
                 if model {
-                    let query = self.search.read(cx).value().to_lowercase();
-                    for option in self
-                        .catalog
-                        .models
-                        .iter()
-                        .filter(|option| {
-                            option.label.to_lowercase().contains(&query)
-                                || option.model_id.to_lowercase().contains(&query)
-                        })
-                        .take(7)
-                        .enumerate()
-                    {
-                        let (index, option) = option;
+                    let query = self.search.read(cx).value();
+                    let choices = filter_models(&self.catalog.models, &query);
+                    if choices.is_empty() {
+                        rows = rows.child(div().my(px(16.)).child("No matching models"));
+                    }
+                    for (index, option) in choices.into_iter().enumerate() {
                         let selected = self.selected_model().as_ref().is_some_and(|preferred| {
                             preferred.provider_id == option.provider_id
                                 && preferred.model_id == option.model_id
@@ -4872,14 +4934,18 @@ impl Client {
                             provider_id: option.provider_id.clone(),
                             variant: None,
                         };
-                        list = list.child(
+                        rows = rows.child(
                             div()
-                                .id(format!("pick-model-{}", option.model_id))
+                                .id(format!(
+                                    "pick-model-{}-{}",
+                                    option.provider_id, option.model_id
+                                ))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.choose_model(selection.clone(), cx);
                                 }))
                                 .h(px(52.))
+                                .flex_shrink_0()
                                 .px(px(14.))
                                 .rounded(px(5.))
                                 .bg(self.tone(
@@ -4923,18 +4989,12 @@ impl Client {
                         .and_then(|selection| self.catalog.find(selection))
                         .map(|option| option.variants.clone())
                         .unwrap_or_default();
-                    let query = self.search.read(cx).value().to_lowercase();
-                    for (index, variant) in std::iter::once(None)
-                        .chain(variants.into_iter().map(Some))
-                        .filter(|variant| {
-                            variant
-                                .as_deref()
-                                .unwrap_or("Default")
-                                .to_lowercase()
-                                .contains(&query)
-                        })
-                        .enumerate()
-                    {
+                    let query = self.search.read(cx).value();
+                    let choices = filter_levels(&variants, &query);
+                    if choices.is_empty() {
+                        rows = rows.child(div().my(px(14.)).child("No matching levels"));
+                    }
+                    for (index, variant) in choices.into_iter().enumerate() {
                         let level = variant.as_deref().unwrap_or("Default");
                         let selected = chosen
                             .as_ref()
@@ -4944,7 +5004,7 @@ impl Client {
                             provider_id: selection.provider_id.clone(),
                             variant: variant.clone(),
                         });
-                        list = list.child(
+                        rows = rows.child(
                             div()
                                 .id(format!("pick-level-{level}"))
                                 .cursor_pointer()
@@ -4954,6 +5014,7 @@ impl Client {
                                     }
                                 }))
                                 .h(px(33.))
+                                .flex_shrink_0()
                                 .px(px(12.))
                                 .flex()
                                 .items_center()
@@ -4986,7 +5047,7 @@ impl Client {
                         );
                     }
                 }
-                list.into_any_element()
+                list.child(rows).into_any_element()
             }
         };
         let backdrop = if matches!(modal, Modal::Model | Modal::Level) {
@@ -5197,9 +5258,9 @@ mod tests {
 
     use super::{
         Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
-        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, filter_tab_sessions,
-        fuzzy_score, inline_image, markdown_blocks, model, reorder_tab_ids, sticky_user_index,
-        tab_indicator, tab_number_key,
+        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, filter_levels,
+        filter_models, filter_tab_sessions, fuzzy_score, inline_image, markdown_blocks, model,
+        picker_list_height, reorder_tab_ids, sticky_user_index, tab_indicator, tab_number_key,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -5747,6 +5808,135 @@ mod tests {
             "ses_209"
         );
         assert!(filter_tab_sessions(&sessions, "zqx").is_empty());
+    }
+
+    #[test]
+    fn model_and_level_filters_follow_gtk_fuzzy_ranking() {
+        assert_eq!(picker_list_height(true, 0), 100.);
+        assert_eq!(picker_list_height(true, 2), 112.);
+        assert_eq!(picker_list_height(true, 100), 280.);
+        assert_eq!(picker_list_height(false, 0), 80.);
+        assert_eq!(picker_list_height(false, 4), 132.);
+        assert_eq!(picker_list_height(false, 100), 240.);
+        let models = vec![
+            model::ModelOption {
+                provider_id: "openai".into(),
+                model_id: "gpt-5.6".into(),
+                label: "GPT-5.6".into(),
+                variants: vec!["medium".into(), "high".into()],
+                supports_attachments: true,
+                context_limit: Some(200_000),
+            },
+            model::ModelOption {
+                provider_id: "anthropic".into(),
+                model_id: "claude-sonnet-4.6".into(),
+                label: "Claude Sonnet 4.6".into(),
+                variants: vec![],
+                supports_attachments: true,
+                context_limit: Some(200_000),
+            },
+        ];
+        assert_eq!(
+            filter_models(&models, "cst")[0].model_id,
+            "claude-sonnet-4.6"
+        );
+        assert_eq!(
+            filter_models(&models, "anthropic / claude")[0].provider_id,
+            "anthropic"
+        );
+        assert!(filter_models(&models, "zqx").is_empty());
+        let levels = filter_levels(&models[0].variants, "hgh");
+        assert_eq!(levels, vec![Some("high".into())]);
+        assert_eq!(
+            filter_levels(&models[0].variants, ""),
+            vec![None, Some("medium".into()), Some("high".into())]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn model_picker_keyboard_reaches_scrolled_results(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                for index in 0..15 {
+                    let mut option = client.catalog.models[0].clone();
+                    option.model_id = format!("model-extra-{index}");
+                    option.label = format!("Extra model {index}");
+                    client.catalog.models.push(option);
+                }
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| client.show_modal(Modal::Model, window, cx));
+            window.render_frame(cx);
+            assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
+            for _ in 0..12 {
+                window.press("down", cx);
+            }
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).picker_highlight, Some(12));
+            assert!(client.read(cx).picker_list_scroll.offset().y < px(0.));
+            window.press("enter", cx);
+            assert_eq!(
+                client.read(cx).selected_model().unwrap().model_id,
+                "model-extra-10"
+            );
+            assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn level_picker_keyboard_reaches_scrolled_variants(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let model = client.selected_model().expect("preview model");
+                let option = client
+                    .catalog
+                    .models
+                    .iter_mut()
+                    .find(|option| {
+                        option.provider_id == model.provider_id && option.model_id == model.model_id
+                    })
+                    .expect("catalog model");
+                option
+                    .variants
+                    .extend((0..15).map(|index| format!("level-extra-{index}")));
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| client.show_modal(Modal::Level, window, cx));
+            window.render_frame(cx);
+            assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
+            for _ in 0..12 {
+                window.press("down", cx);
+            }
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).picker_highlight, Some(12));
+            assert!(client.read(cx).picker_list_scroll.offset().y < px(0.));
+            window.press("enter", cx);
+            assert_eq!(
+                client.read(cx).selected_model().unwrap().variant.as_deref(),
+                Some("level-extra-8")
+            );
+            assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
