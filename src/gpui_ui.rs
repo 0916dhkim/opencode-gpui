@@ -1,8 +1,8 @@
 //! GPUI Kit shell backed by the v2 transport, or its deterministic preview fixture.
-#[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use opencode_gpui::{
     jobs::{self, JobKind, JobRow, Jobs},
     model::{
         self, Conversation, ModelCatalog, ModelSelection, Project, RunStatus, Session,
-        SessionModel, TranscriptRow, TranscriptRowKind,
+        SessionModel, TranscriptRow, TranscriptRowKey, TranscriptRowKind,
     },
     pending::{self, Forms, PendingRequest},
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
@@ -220,8 +220,9 @@ struct Client {
     projects: Vec<Project>,
     active: String,
     transcript: HashMap<String, Vec<TranscriptRow>>,
+    row_heights: HashMap<String, Rc<RefCell<RowHeightCache>>>,
     #[cfg(test)]
-    measurement_probe: Option<(Pixels, std::rc::Rc<RefCell<Vec<Pixels>>>)>,
+    measurement_probe: Option<(Pixels, Rc<RefCell<Vec<Pixels>>>)>,
     attachments: HashMap<(String, usize, usize), Arc<Image>>,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
@@ -351,18 +352,83 @@ enum MarkdownBlock {
     Code(String, String),
 }
 
-/// A detached layout probe: rows are laid out at a definite width but are
-/// never prepainted, painted, or inserted into the transcript scroll area.
-/// GPUI only permits layout_as_root during its layout/prepaint/paint phases.
-#[cfg(test)]
-struct TranscriptMeasurementProbe {
-    rows: Vec<AnyElement>,
+// Increment this when the row's typography or layout rules change. The other
+// parts of the stamp follow the live width, theme and conversation snapshot.
+const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 1;
+const SIDEBAR_WIDTH: f32 = 270.;
+const TRANSCRIPT_SCROLLBAR_GUTTER: f32 = 14.;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RowLayoutStamp {
     width: Pixels,
-    heights: std::rc::Rc<RefCell<Vec<Pixels>>>,
+    dark: bool,
+    style_revision: u64,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRowHeight {
+    revision: u64,
+    height: Pixels,
+}
+
+#[derive(Default)]
+struct RowHeightCache {
+    stamp: Option<RowLayoutStamp>,
+    entries: HashMap<TranscriptRowKey, CachedRowHeight>,
+    #[cfg(test)]
+    layouts: usize,
+}
+
+impl RowHeightCache {
+    fn missing(&mut self, stamp: RowLayoutStamp, rows: &[TranscriptRow]) -> Vec<usize> {
+        if self.stamp != Some(stamp) {
+            self.entries.clear();
+            self.stamp = Some(stamp);
+        }
+        rows.iter()
+            .enumerate()
+            .filter_map(|(index, row)| self.height(row).is_none().then_some(index))
+            .collect()
+    }
+
+    fn record(
+        &mut self,
+        stamp: RowLayoutStamp,
+        key: TranscriptRowKey,
+        revision: u64,
+        height: Pixels,
+    ) {
+        // A superseding render can replace the snapshot before this layout runs.
+        if self.stamp == Some(stamp) {
+            self.entries
+                .insert(key, CachedRowHeight { revision, height });
+            #[cfg(test)]
+            {
+                self.layouts += 1;
+            }
+        }
+    }
+
+    fn height(&self, row: &TranscriptRow) -> Option<Pixels> {
+        self.entries
+            .get(&row.key)
+            .and_then(|entry| (entry.revision == row.render_revision()).then_some(entry.height))
+    }
+}
+
+/// Detached rows are laid out at a definite width during GPUI's layout phase,
+/// never prepainted, painted, or inserted into the transcript scroll area.
+/// `layout_as_root` panics if called from the view's render method instead.
+struct TranscriptMeasurementProbe {
+    rows: Vec<(TranscriptRowKey, u64, AnyElement)>,
+    stamp: RowLayoutStamp,
+    cache: Rc<RefCell<RowHeightCache>>,
+    #[cfg(test)]
+    heights: Option<Rc<RefCell<Vec<Pixels>>>>,
     spacer: Div,
 }
 
-#[cfg(test)]
 impl IntoElement for TranscriptMeasurementProbe {
     type Element = Self;
 
@@ -371,7 +437,6 @@ impl IntoElement for TranscriptMeasurementProbe {
     }
 }
 
-#[cfg(test)]
 impl Element for TranscriptMeasurementProbe {
     type RequestLayoutState = <Div as Element>::RequestLayoutState;
     type PrepaintState = <Div as Element>::PrepaintState;
@@ -391,21 +456,31 @@ impl Element for TranscriptMeasurementProbe {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        *self.heights.borrow_mut() = self
+        let measured: Vec<_> = self
             .rows
             .iter_mut()
-            .map(|row| {
-                row.layout_as_root(
-                    size(
-                        AvailableSpace::Definite(self.width),
-                        AvailableSpace::MinContent,
-                    ),
-                    window,
-                    cx,
-                )
-                .height
+            .map(|(key, revision, row)| {
+                let height = row
+                    .layout_as_root(
+                        size(
+                            AvailableSpace::Definite(self.stamp.width),
+                            AvailableSpace::MinContent,
+                        ),
+                        window,
+                        cx,
+                    )
+                    .height;
+                (key.clone(), *revision, height)
             })
             .collect();
+        #[cfg(test)]
+        if let Some(heights) = &self.heights {
+            *heights.borrow_mut() = measured.iter().map(|(_, _, height)| *height).collect();
+        }
+        let mut cache = self.cache.borrow_mut();
+        for (key, revision, height) in measured {
+            cache.record(self.stamp, key, revision, height);
+        }
         self.spacer
             .request_layout(global_id, inspector_id, window, cx)
     }
@@ -728,6 +803,7 @@ impl Client {
             projects: Vec::new(),
             active: String::new(),
             transcript: HashMap::new(),
+            row_heights: HashMap::new(),
             #[cfg(test)]
             measurement_probe: None,
             attachments: HashMap::new(),
@@ -982,6 +1058,7 @@ impl Client {
         self.message_events_during_load.remove(id);
         self.reload_after_load.remove(id);
         self.transcript.remove(id);
+        self.row_heights.remove(id);
         self.unread.remove(id);
         if self.active == id {
             let next = index
@@ -1271,6 +1348,7 @@ impl Client {
         self.pending_prompts.clear();
         self.clear_accepted_drafts.clear();
         self.transcript.clear();
+        self.row_heights.clear();
         self.conversations.clear();
         self.loading_messages.clear();
         self.message_events_during_load.clear();
@@ -2266,6 +2344,7 @@ impl Client {
                             self.open_tabs.retain(|tab| tab != &id);
                             self.conversations.remove(&id);
                             self.transcript.remove(&id);
+                            self.row_heights.remove(&id);
                             self.composers.remove(&id);
                             self.attachment_drafts.remove(&id);
                             self.pending_prompts.remove(&id);
@@ -2494,6 +2573,7 @@ impl Client {
             projects,
             active,
             transcript,
+            row_heights: HashMap::new(),
             #[cfg(test)]
             measurement_probe: None,
             attachments,
@@ -3014,7 +3094,7 @@ impl Client {
             }
         }
         div()
-            .w(px(270.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex()
             .flex_col()
@@ -3178,21 +3258,67 @@ impl Client {
         }
     }
 
-    /// Prepare detached copies of the exact rendered rows for the layout-phase
-    /// probe. Its width comes from a previously completed viewport layout.
-    #[cfg(test)]
-    fn row_measurement_probe(&self, cx: &Context<Self>) -> Option<TranscriptMeasurementProbe> {
-        let (width, heights) = self.measurement_probe.as_ref()?;
+    /// The fixed sidebar and gutter leave the same definite width for mounted
+    /// and detached rows, including the first frame after a window resize.
+    fn row_measurement_probe(
+        &mut self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<TranscriptMeasurementProbe> {
+        let transcript = self.transcript.get(&self.active)?;
+        let content_width =
+            window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        #[cfg(test)]
+        let (width, heights) = self
+            .measurement_probe
+            .as_ref()
+            .map(|(width, heights)| (*width, Some(heights.clone())))
+            .unwrap_or((content_width, None));
+        #[cfg(not(test))]
+        let width = content_width;
+        if width <= px(0.) {
+            return None;
+        }
+        let stamp = RowLayoutStamp {
+            width,
+            dark: self.dark,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: self
+                .conversations
+                .get(&self.active)
+                .map_or(0, Conversation::cache_epoch),
+        };
+        let cache = self
+            .row_heights
+            .entry(self.active.clone())
+            .or_default()
+            .clone();
+        let missing = cache.borrow_mut().missing(stamp, transcript);
+        #[cfg(test)]
+        let missing = if heights.is_some() {
+            (0..transcript.len()).collect::<Vec<_>>()
+        } else {
+            missing
+        };
+        if missing.is_empty() {
+            return None;
+        }
         Some(TranscriptMeasurementProbe {
-            rows: self
-                .transcript
-                .get(&self.active)?
-                .iter()
-                .enumerate()
-                .map(|(index, row)| self.message_row(row, index, cx).into_any_element())
+            rows: missing
+                .into_iter()
+                .map(|index| {
+                    let row = &transcript[index];
+                    (
+                        row.key.clone(),
+                        row.render_revision(),
+                        self.message_row(row, index, cx).into_any_element(),
+                    )
+                })
                 .collect(),
-            width: *width,
-            heights: heights.clone(),
+            stamp,
+            cache,
+            #[cfg(test)]
+            heights,
             spacer: div().size(px(0.)),
         })
     }
@@ -3440,7 +3566,7 @@ impl Client {
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .w_full()
-            .pr(px(14.))
+            .pr(px(TRANSCRIPT_SCROLLBAR_GUTTER))
             .flex()
             .flex_col();
         if let Some(cursor) = self
@@ -3482,7 +3608,7 @@ impl Client {
                 .absolute()
                 .top_0()
                 .left_0()
-                .right(px(14.))
+                .right(px(TRANSCRIPT_SCROLLBAR_GUTTER))
                 .h(px(106.))
                 .px(px(28.))
                 .pt(px(18.))
@@ -4937,8 +5063,7 @@ impl Render for Client {
             }
         }
         self.clear_accepted_drafts = deferred;
-        #[cfg(test)]
-        let row_probe = self.row_measurement_probe(cx);
+        let row_probe = self.row_measurement_probe(window, cx);
         let permission_visible = self.modal.is_none() && self.visible_permission().is_some();
         if permission_visible && !self.permission_presented {
             self.permission_presented = true;
@@ -5029,9 +5154,7 @@ impl Render for Client {
                     ),
             )
             .when_some(self.modal_view(cx), |view, modal| view.child(modal));
-        #[cfg(test)]
-        let root = root.when_some(row_probe, |view, probe| view.child(probe));
-        root
+        root.when_some(row_probe, |view, probe| view.child(probe))
     }
 }
 
@@ -5073,7 +5196,8 @@ mod tests {
     use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use super::{
-        Client, MarkdownBlock, Modal, SESSION_PICKER_LIMIT, TabAttention, filter_tab_sessions,
+        Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
+        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, filter_tab_sessions,
         fuzzy_score, inline_image, markdown_blocks, model, reorder_tab_ids, sticky_user_index,
         tab_indicator, tab_number_key,
     };
@@ -5084,6 +5208,268 @@ mod tests {
     };
     use opencode_gpui::model::RunStatus;
     use opencode_gpui::persist::PersistedState;
+
+    fn cache_row(id: &str, body: &str) -> model::TranscriptRow {
+        model::TranscriptRow {
+            key: model::TranscriptRowKey {
+                message_id: id.into(),
+                slot: model::TranscriptRowSlot::NormalAfter(None),
+            },
+            render_revision: 0,
+            role: model::Role::Assistant,
+            body: body.into(),
+            images: vec![],
+            time: 1,
+            kind: model::TranscriptRowKind::Normal,
+        }
+    }
+
+    #[test]
+    fn row_height_cache_retains_prepend_and_invalidates_stream_snapshot_width_theme_and_style() {
+        let stamp = RowLayoutStamp {
+            width: px(746.),
+            dark: false,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: 7,
+        };
+        let mut cache = RowHeightCache::default();
+        let old = cache_row("old", "wrapped Markdown");
+        assert_eq!(cache.missing(stamp, std::slice::from_ref(&old)), vec![0]);
+        cache.record(stamp, old.key.clone(), old.render_revision(), px(88.));
+        assert_eq!(
+            cache.missing(stamp, std::slice::from_ref(&old)),
+            Vec::<usize>::new()
+        );
+        assert_eq!(cache.height(&old), Some(px(88.)));
+
+        let earlier = cache_row("earlier", "history");
+        assert_eq!(
+            cache.missing(stamp, &[earlier.clone(), old.clone()]),
+            vec![0]
+        );
+        assert_eq!(
+            cache.height(&old),
+            Some(px(88.)),
+            "prepend preserves the old key"
+        );
+        let mut streamed = old.clone();
+        streamed.body.push_str(" and more text");
+        streamed.render_revision += 1;
+        assert_eq!(
+            cache.missing(stamp, &[earlier, streamed.clone()]),
+            vec![0, 1]
+        );
+        cache.record(
+            stamp,
+            streamed.key.clone(),
+            streamed.render_revision(),
+            px(112.),
+        );
+        assert_eq!(cache.height(&streamed), Some(px(112.)));
+
+        // Snapshot replacement can reuse the same ID and revision with different
+        // content; the epoch, rather than a content hash, guards that collision.
+        let replaced = cache_row("old", "new snapshot");
+        let snapshot = RowLayoutStamp { epoch: 8, ..stamp };
+        assert_eq!(
+            cache.missing(snapshot, std::slice::from_ref(&replaced)),
+            vec![0]
+        );
+        cache.record(
+            snapshot,
+            replaced.key.clone(),
+            replaced.render_revision(),
+            px(64.),
+        );
+        assert_eq!(cache.height(&replaced), Some(px(64.)));
+        for changed in [
+            RowLayoutStamp {
+                width: px(1116.),
+                ..snapshot
+            },
+            RowLayoutStamp {
+                dark: true,
+                ..snapshot
+            },
+            RowLayoutStamp {
+                style_revision: snapshot.style_revision + 1,
+                ..snapshot
+            },
+        ] {
+            assert_eq!(
+                cache.missing(changed, std::slice::from_ref(&replaced)),
+                vec![0]
+            );
+            cache.record(
+                changed,
+                replaced.key.clone(),
+                replaced.render_revision(),
+                px(80.),
+            );
+        }
+        let mut other_session = RowHeightCache::default();
+        assert_eq!(other_session.missing(stamp, &[old]), vec![0]);
+    }
+
+    #[gpui_kit::test]
+    fn runtime_row_cache_measures_only_misses_during_layout(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        let row = cache_row(
+            "runtime",
+            "A paragraph with **Markdown** that wraps in the viewport.",
+        );
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client
+                    .transcript
+                    .insert(client.active.clone(), vec![row.clone()]);
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            });
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("headless window stays open");
+        };
+        render(cx);
+        let initial = cx.update(|cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            assert_eq!(cache.layouts, 1);
+            cache.height(&row).expect("measured height")
+        });
+        cx.update_window(handle, |_, window, _| {
+            assert_eq!(
+                window.find(("message", 0usize)).bounds().size.height,
+                initial
+            );
+        })
+        .expect("headless window stays open");
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            assert_eq!(client.row_heights[&client.active].borrow().layouts, 1);
+        });
+
+        let earlier = cache_row("earlier", "older history");
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client
+                    .transcript
+                    .insert(client.active.clone(), vec![earlier.clone(), row.clone()]);
+                cx.notify();
+            });
+        });
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            assert_eq!(cache.layouts, 2, "only the prepended row is measured");
+            assert_eq!(cache.height(&row), Some(initial));
+        });
+
+        let mut streamed = row.clone();
+        streamed
+            .body
+            .push_str(" Additional streamed text changes the layout.");
+        streamed.render_revision += 1;
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client
+                    .transcript
+                    .insert(client.active.clone(), vec![earlier, streamed.clone()]);
+                cx.notify();
+            });
+        });
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            assert_eq!(cache.layouts, 3, "only the streamed row is remeasured");
+            assert!(cache.height(&streamed).is_some());
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.resize(size(px(1130.), px(900.)));
+            window.bounds_changed(cx);
+        })
+        .expect("headless window stays open");
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            assert_eq!(cache.layouts, 5, "both rows remeasure at the new width");
+            assert_eq!(
+                cache.stamp.unwrap().width,
+                client.scroll.bounds().size.width - px(14.)
+            );
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            for (index, row) in client.transcript[&client.active].iter().enumerate() {
+                let mounted = window.find(("message", index)).bounds();
+                assert_eq!(mounted.size.width, cache.stamp.unwrap().width);
+                assert_eq!(cache.height(row), Some(mounted.size.height));
+            }
+        })
+        .expect("headless window stays open");
+
+        let was_dark = cx.update(|cx| client.read(cx).dark);
+        cx.update(|cx| {
+            Theme::change(
+                if was_dark {
+                    ThemeMode::Light
+                } else {
+                    ThemeMode::Dark
+                },
+                None,
+                cx,
+            );
+        });
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            assert_eq!(cache.layouts, 7, "theme change invalidates both rows");
+            assert_eq!(cache.stamp.unwrap().dark, !was_dark);
+        });
+
+        let first_session = cx.update(|cx| client.read(cx).active.clone());
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.select_session("ses_other".into());
+                client.transcript.insert(
+                    client.active.clone(),
+                    vec![cache_row("other", "second session")],
+                );
+                cx.notify();
+            });
+        });
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            assert_eq!(client.row_heights["ses_other"].borrow().layouts, 1);
+            assert_eq!(client.row_heights[&first_session].borrow().layouts, 7);
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.select_session(first_session.clone());
+                cx.notify();
+            });
+        });
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            assert_eq!(client.row_heights[&first_session].borrow().layouts, 7);
+        });
+    }
 
     #[gpui_kit::test]
     fn detached_row_layout_matches_mounted_bounds_at_two_widths(cx: &mut TestAppContext) {
