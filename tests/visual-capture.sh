@@ -42,6 +42,9 @@ if [[ "${BG:-light}" == dark ]]; then
   mkdir -p "$XDG_CONFIG_HOME/gtk-4.0"
   printf '[Settings]\ngtk-application-prefer-dark-theme=1\n' > "$XDG_CONFIG_HOME/gtk-4.0/settings.ini"
 fi
+if [[ "$CLIENT" == gpui ]]; then
+  export OPENCODE_GPUI_THEME="${BG:-light}"
+fi
 if [[ "${TEST_LIVE:-0}" == 1 && "$CLIENT" == gpui ]]; then
   app_args=()
 elif [[ "${PREVIEW_API:-0}" == 1 && "$CLIENT" == gpui ]]; then

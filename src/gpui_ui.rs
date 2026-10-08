@@ -7,6 +7,7 @@ use base64::Engine;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::markdown;
+use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
@@ -26,6 +27,7 @@ use serde::Deserialize;
 use crate::Args;
 
 struct Client {
+    dark: bool,
     api: Option<ApiHandle>,
     preview_api: bool,
     connection_generation: u64,
@@ -181,11 +183,12 @@ fn timestamp(time: u64) -> String {
         .unwrap_or_default()
 }
 
-fn permission_detail(text: String) -> AnyElement {
+fn permission_detail(text: String, dark: bool) -> AnyElement {
     div()
         .p(px(8.))
         .rounded(px(5.))
-        .bg(rgb(0xefede8))
+        .bg(rgb(if dark { 0x15191c } else { 0xefede8 }))
+        .text_color(rgb(if dark { 0xd2cec7 } else { 0x34312d }))
         .font_family("DejaVu Sans Mono")
         .text_size(px(11.))
         .child(text)
@@ -269,6 +272,13 @@ fn inline_image(url: &str) -> Option<Arc<Image>> {
 }
 
 impl Client {
+    // Keep GTK light/dark design-token pairs at each call site. Distinct roles
+    // can share a light value (notably white text and white inputs) but differ
+    // in dark mode, so do not translate colors by looking up their light hex.
+    fn tone(&self, light: u32, dark: u32) -> Rgba {
+        rgb(if self.dark { dark } else { light })
+    }
+
     fn markdown_body(&self, source: &str, row_index: usize, cx: &Context<Self>) -> AnyElement {
         let mut content = div().w_full().flex().flex_col().gap(px(10.));
         for (block_index, block) in markdown_blocks(source).into_iter().enumerate() {
@@ -290,7 +300,12 @@ impl Client {
                             div()
                                 .flex()
                                 .gap(px(9.))
-                                .child(div().w(px(17.)).text_color(rgb(0x777e7d)).child("•"))
+                                .child(
+                                    div()
+                                        .w(px(17.))
+                                        .text_color(self.tone(0x777e7d, 0xaeb4b9))
+                                        .child("•"),
+                                )
                                 .child(markdown(item)),
                         );
                     }
@@ -302,7 +317,8 @@ impl Client {
                         .w_full()
                         .rounded(px(7.))
                         .border_1()
-                        .border_color(rgb(0xd2cdc5))
+                        .border_color(self.tone(0xd2cdc5, 0x30353a))
+                        .bg(self.tone(0xf7f5f1, 0x171a1d))
                         .overflow_hidden()
                         .child(
                             div()
@@ -310,12 +326,12 @@ impl Client {
                                 .px(px(12.))
                                 .flex()
                                 .items_center()
-                                .bg(rgb(0xece9e2))
+                                .bg(self.tone(0xece9e2, 0x14171a))
                                 .border_b_1()
-                                .border_color(rgb(0xd2cdc5))
+                                .border_color(self.tone(0xd2cdc5, 0x282c30))
                                 .text_size(px(10.))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0x777e7d))
+                                .text_color(self.tone(0x777e7d, 0x899198))
                                 .child(language)
                                 .child(div().flex_1())
                                 .child(
@@ -396,6 +412,7 @@ impl Client {
         };
         let scroll = ScrollHandle::new();
         let mut client = Self {
+            dark: Theme::global(cx).is_dark(),
             api: None,
             preview_api: false,
             connection_generation: 0,
@@ -1938,6 +1955,7 @@ impl Client {
             window.refresh();
         });
         let mut client = Self {
+            dark: Theme::global(cx).is_dark(),
             api: None,
             preview_api: false,
             connection_generation: 0,
@@ -2112,11 +2130,11 @@ impl Client {
         let unread = self.unread.contains(&session.id);
         let has_jobs = self.running_jobs.sessions_with_jobs().contains(&session.id);
         let dot_color = if busy {
-            0xa46910
+            if self.dark { 0xe5b567 } else { 0xa46910 }
         } else if unread {
-            0x176899
+            if self.dark { 0x62bceb } else { 0x176899 }
         } else {
-            0x7c8682
+            if self.dark { 0x68736f } else { 0x7c8682 }
         };
         let title = session.title.clone();
         let id = session.id.clone();
@@ -2133,9 +2151,9 @@ impl Client {
             .gap(px(7.))
             .rounded(px(6.))
             .bg(if selected {
-                rgb(0xe3e0da)
+                self.tone(0xe3e0da, 0x22262a)
             } else {
-                rgb(0xf4f1eb)
+                self.tone(0xf4f1eb, 0x0d0f11)
             })
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2150,7 +2168,7 @@ impl Client {
                         .left_0()
                         .right_0()
                         .h(px(1.))
-                        .bg(rgb(0xc8c3ba)),
+                        .bg(self.tone(0xc8c3ba, 0x2b3034)),
                 )
             })
             .child(div().text_color(rgb(dot_color)).child(if has_jobs || busy {
@@ -2164,7 +2182,11 @@ impl Client {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .text_color(rgb(if unread || busy { dot_color } else { 0x555b5c }))
+                    .text_color(if unread || busy {
+                        rgb(dot_color)
+                    } else {
+                        self.tone(0x555b5c, 0xe8e5df)
+                    })
                     .font_weight(if unread || busy {
                         FontWeight::BOLD
                     } else {
@@ -2175,7 +2197,11 @@ impl Client {
             .child(
                 div()
                     .id(format!("rename-{}", session.id))
-                    .text_color(rgb(if selected { 0x555b5c } else { 0xa3a9a8 }))
+                    .text_color(if selected {
+                        self.tone(0x555b5c, 0xc8c4bd)
+                    } else {
+                        self.tone(0xa3a9a8, 0x899097)
+                    })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
@@ -2187,7 +2213,11 @@ impl Client {
             .child(
                 div()
                     .id(format!("close-{}", session.id))
-                    .text_color(rgb(if selected { 0x555b5c } else { 0xa3a9a8 }))
+                    .text_color(if selected {
+                        self.tone(0x555b5c, 0xc8c4bd)
+                    } else {
+                        self.tone(0xa3a9a8, 0x899097)
+                    })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -2215,13 +2245,13 @@ impl Client {
             .py(px(12.))
             .gap(px(8.))
             .border_t_1()
-            .border_color(rgb(0xc8c3ba));
+            .border_color(self.tone(0xc8c3ba, 0x24282c));
         if !self.jobs.is_empty() {
             jobs_panel = jobs_panel.child(
                 div()
                     .text_size(px(10.))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0x737a78))
+                    .text_color(self.tone(0x737a78, 0x8d959d))
                     .child(format!("BACKGROUND  {}", self.jobs.len())),
             );
             for job in &self.jobs {
@@ -2230,11 +2260,16 @@ impl Client {
                         .flex()
                         .flex_col()
                         .px(px(6.))
-                        .child(div().text_size(px(12.)).child(job.title.clone()))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(self.tone(0x252829, 0xd4d8dc))
+                                .child(job.title.clone()),
+                        )
                         .child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(0x87908d))
+                                .text_color(self.tone(0x87908d, 0x6a7279))
                                 .child(job.subtitle(1_704_067_320_000)),
                         ),
                 );
@@ -2245,9 +2280,9 @@ impl Client {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(0xf4f1eb))
+            .bg(self.tone(0xf4f1eb, 0x0d0f11))
             .border_r_1()
-            .border_color(rgb(0xc8c3ba))
+            .border_color(self.tone(0xc8c3ba, 0x24282c))
             .child(
                 div()
                     .id("new-session")
@@ -2255,7 +2290,7 @@ impl Client {
                     .px(px(16.))
                     .flex()
                     .items_center()
-                    .text_color(rgb(0x667078))
+                    .text_color(self.tone(0x667078, 0x92999f))
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.show_modal(Modal::NewSession, window, cx);
@@ -2269,7 +2304,7 @@ impl Client {
                 div()
                     .p(px(14.))
                     .border_t_1()
-                    .border_color(rgb(0xded8cb))
+                    .border_color(self.tone(0xded8cb, 0x2b3034))
                     .flex()
                     .flex_col()
                     .gap(px(12.))
@@ -2297,7 +2332,11 @@ impl Client {
 
     fn message(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> AnyElement {
         let user = row.role.label() == "YOU";
-        let shade = if user { rgb(0xe4ddd0) } else { rgb(0xf4f1eb) };
+        let shade = if user {
+            self.tone(0xe4ddd0, 0x1c242b)
+        } else {
+            self.tone(0xf4f1eb, 0x101214)
+        };
         let mut body = div().flex().flex_col().gap(px(10.));
         match row.kind {
             TranscriptRowKind::Tool => {
@@ -2308,8 +2347,8 @@ impl Client {
                     div()
                         .p(px(12.))
                         .border_l_4()
-                        .border_color(rgb(0xcf222e))
-                        .bg(rgb(0xf8eae7))
+                        .border_color(self.tone(0xcf222e, 0xf85149))
+                        .bg(self.tone(0xf8eae7, 0x271a1b))
                         .child(row.body.clone()),
                 )
             }
@@ -2327,7 +2366,7 @@ impl Client {
                 .w(px(200.))
                 .rounded(px(5.))
                 .border_1()
-                .border_color(rgb(0xd8d1c6))
+                .border_color(self.tone(0xd8d1c6, 0x343a40))
                 .overflow_hidden();
             body = body.child(match source {
                 Some(source) => thumbnail
@@ -2357,20 +2396,24 @@ impl Client {
             .pb(px(20.))
             .bg(shade)
             .border_b_1()
-            .border_color(rgb(0xc8c3ba))
+            .border_color(self.tone(0xc8c3ba, 0x24282c))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .text_size(px(11.))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0x666f76))
+                    .text_color(if user {
+                        self.tone(0x666f76, 0xd7c4a3)
+                    } else {
+                        self.tone(0x666f76, 0x8d959d)
+                    })
                     .child(row.role.label().to_owned())
                     .child(div().flex_1())
                     .child(
                         div()
                             .font_weight(FontWeight::NORMAL)
-                            .text_color(rgb(0x9da5a4))
+                            .text_color(self.tone(0x9da5a4, 0x6a7279))
                             .child(timestamp(row.time)),
                     ),
             )
@@ -2390,16 +2433,20 @@ impl Client {
             .px(px(12.))
             .rounded(px(9.))
             .border_1()
-            .border_color(rgb(0xc8c3ba))
-            .bg(rgb(0xf5f3ef))
+            .border_color(self.tone(0xc8c3ba, 0x2d3236))
+            .bg(self.tone(0xf5f3ef, 0x15181b))
             .child(
                 div()
                     .flex_1()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0x98600f))
+                    .text_color(self.tone(0x98600f, 0xd8a55f))
                     .child(notice.text),
             )
-            .child(div().text_color(rgb(0x4d5354)).child("Open web UI"));
+            .child(
+                div()
+                    .text_color(self.tone(0x4d5354, 0xc4c8ca))
+                    .child("Open web UI"),
+            );
         if let Some(target) = notice.cancel {
             bar = bar.child(
                 div()
@@ -2417,7 +2464,7 @@ impl Client {
                     }))
                     .rounded(px(6.))
                     .border_1()
-                    .border_color(rgb(0xc8c3ba))
+                    .border_color(self.tone(0xc8c3ba, 0x353b40))
                     .px(px(10.))
                     .py(px(4.))
                     .child("Cancel"),
@@ -2473,14 +2520,14 @@ impl Client {
             has_details = true;
         }
         if !request.resources.is_empty() {
-            details = details.child(permission_detail(request.resources.join("\n")));
+            details = details.child(permission_detail(request.resources.join("\n"), self.dark));
             has_details = true;
         }
         if let Some(metadata) = pending::metadata_text(request.metadata.as_ref()) {
             details = details.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(0x626764))
+                    .text_color(self.tone(0x626764, 0x9da4aa))
                     .child(metadata),
             );
             has_details = true;
@@ -2490,10 +2537,10 @@ impl Client {
             details = details
                 .child(
                     div()
-                        .text_color(rgb(0x8b5918))
+                        .text_color(self.tone(0x8b5918, 0xd8a55f))
                         .child("Always allow would remember:"),
                 )
-                .child(permission_detail(patterns.clone()));
+                .child(permission_detail(patterns.clone(), self.dark));
             has_details = true;
         }
         let mut actions = div().flex().justify_end().gap(px(8.));
@@ -2515,12 +2562,19 @@ impl Client {
                     .py(px(7.))
                     .rounded(px(6.))
                     .border_1()
-                    .border_color(rgb(0xc8c3ba))
-                    .bg(rgb(if decision == protocol::PermissionDecision::Once {
-                        0xc59535
-                    } else {
-                        0xfffdfa
-                    }))
+                    .border_color(self.tone(0xc8c3ba, 0x353b40))
+                    .bg(self.tone(
+                        if decision == protocol::PermissionDecision::Once {
+                            0xc59535
+                        } else {
+                            0xfffdfa
+                        },
+                        if decision == protocol::PermissionDecision::Once {
+                            0xd29b52
+                        } else {
+                            0x1d2124
+                        },
+                    ))
                     .when(!in_flight, |button| {
                         button
                             .cursor_pointer()
@@ -2546,8 +2600,8 @@ impl Client {
             .gap(px(12.))
             .rounded(px(11.))
             .border_1()
-            .border_color(rgb(0xc8c3ba))
-            .bg(rgb(0xfffdfa))
+            .border_color(self.tone(0xc8c3ba, 0x2d3236))
+            .bg(self.tone(0xfffdfa, 0x15181b))
             .child(
                 div()
                     .text_size(px(16.))
@@ -2557,7 +2611,7 @@ impl Client {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(0x737875))
+                    .text_color(self.tone(0x737875, 0x899097))
                     .child(context),
             );
         if has_details {
@@ -2587,10 +2641,10 @@ impl Client {
                     .gap(px(8.))
                     .rounded_full()
                     .border_1()
-                    .border_color(rgb(0xc8c3ba))
-                    .bg(rgb(0xfffdfa))
+                    .border_color(self.tone(0xc8c3ba, 0x34393e))
+                    .bg(self.tone(0xfffdfa, 0x171a1d))
                     .text_size(px(12.))
-                    .text_color(rgb(0x555b5c))
+                    .text_color(self.tone(0x555b5c, 0xc4c8ca))
                     .child("◌")
                     .child("OpenCode is working")
                     .into_any_element()
@@ -2616,9 +2670,9 @@ impl Client {
                     .py(px(8.))
                     .rounded(px(6.))
                     .border_1()
-                    .border_color(rgb(0xc8c3ba))
-                    .bg(rgb(0xfffdfa))
-                    .text_color(rgb(0x555b5c))
+                    .border_color(self.tone(0xc8c3ba, 0x30353a))
+                    .bg(self.tone(0xfffdfa, 0x191c1f))
+                    .text_color(self.tone(0x555b5c, 0xe8e5df))
                     .when(!loading, |button| {
                         button
                             .cursor_pointer()
@@ -2650,22 +2704,22 @@ impl Client {
                     .flex()
                     .flex_col()
                     .gap(px(10.))
-                    .bg(rgb(0xf4f1eb))
+                    .bg(self.tone(0xf4f1eb, 0x101214))
                     .border_b_1()
-                    .border_color(rgb(0xc8c3ba))
+                    .border_color(self.tone(0xc8c3ba, 0x343a3f))
                     .shadow_sm()
                     .child(
                         div()
                             .flex()
                             .text_size(px(11.))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0x666f76))
+                            .text_color(self.tone(0x666f76, 0x8d959d))
                             .child("YOU")
                             .child(div().flex_1())
                             .child(
                                 div()
                                     .font_weight(FontWeight::NORMAL)
-                                    .text_color(rgb(0x9da5a4))
+                                    .text_color(self.tone(0x9da5a4, 0x6a7279))
                                     .child(timestamp(row.time)),
                             ),
                     )
@@ -2714,8 +2768,8 @@ impl Client {
             .p(px(5.))
             .rounded(px(9.))
             .border_1()
-            .border_color(rgb(0xc8c3ba))
-            .bg(rgb(0xf5f0e7))
+            .border_color(self.tone(0xc8c3ba, 0x2d3236))
+            .bg(self.tone(0xf5f0e7, 0x15181b))
             .child(
                 div()
                     .px(px(8.))
@@ -2723,7 +2777,12 @@ impl Client {
                     .flex()
                     .items_center()
                     .when(paused, |header| {
-                        header.child(div().mr(px(5.)).text_color(rgb(0x858e8c)).child("▪"))
+                        header.child(
+                            div()
+                                .mr(px(5.))
+                                .text_color(self.tone(0x858e8c, 0x7d837f))
+                                .child("▪"),
+                        )
                     })
                     .child(
                         div()
@@ -2748,9 +2807,9 @@ impl Client {
                                     .px(px(10.))
                                     .py(px(4.))
                                     .rounded_full()
-                                    .bg(rgb(0xc59535))
+                                    .bg(self.tone(0xc59535, 0xd29b52))
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(0x252829))
+                                    .text_color(self.tone(0x252829, 0x17130e))
                                     .child("▶ Resume"),
                             )
                         },
@@ -2763,10 +2822,10 @@ impl Client {
                     .pt(px(3.))
                     .pl(px(11.))
                     .border_t_1()
-                    .border_color(rgb(0xd8d1c6))
+                    .border_color(self.tone(0xd8d1c6, 0x262b2f))
                     .font_weight(FontWeight::BOLD)
                     .text_size(px(10.))
-                    .text_color(rgb(0x7c8582))
+                    .text_color(self.tone(0x7c8582, 0x8e938f))
                     .child(group.label),
             );
             for row in group.rows {
@@ -2787,11 +2846,18 @@ impl Client {
                             .rounded_full()
                             .font_weight(FontWeight::BOLD)
                             .text_size(px(10.))
-                            .bg(rgb(if row.delivery == protocol::Delivery::Queue {
-                                0xe8e3d8
-                            } else {
-                                0xe8f2e8
-                            }))
+                            .bg(self.tone(
+                                if row.delivery == protocol::Delivery::Queue {
+                                    0xe8e3d8
+                                } else {
+                                    0xe8f2e8
+                                },
+                                if row.delivery == protocol::Delivery::Queue {
+                                    0x23272b
+                                } else {
+                                    0x3a2d19
+                                },
+                            ))
                             .child(badge),
                     )
                     .child(
@@ -2815,7 +2881,7 @@ impl Client {
                             .py(px(4.))
                             .rounded(px(5.))
                             .border_1()
-                            .border_color(rgb(0xc8c3ba))
+                            .border_color(self.tone(0xc8c3ba, 0x353b40))
                             .child(label),
                     );
                 }
@@ -2832,7 +2898,7 @@ impl Client {
                             .py(px(4.))
                             .rounded(px(5.))
                             .border_1()
-                            .border_color(rgb(0xc8c3ba))
+                            .border_color(self.tone(0xc8c3ba, 0x353b40))
                             .child("×"),
                     );
                 }
@@ -2885,7 +2951,7 @@ impl Client {
                     .px(px(8.))
                     .py(px(4.))
                     .rounded(px(5.))
-                    .bg(rgb(0xf4f1eb))
+                    .bg(self.tone(0xf4f1eb, 0x262b30))
                     .flex()
                     .gap(px(6.))
                     .child(label)
@@ -2906,8 +2972,8 @@ impl Client {
             .mb(px(17.))
             .rounded(px(12.))
             .border_1()
-            .border_color(rgb(0xc8c3ba))
-            .bg(rgb(0xffffff))
+            .border_color(self.tone(0xc8c3ba, 0x30353a))
+            .bg(self.tone(0xffffff, 0x191c1f))
             .child(Textarea::new(&self.composer).bordered(false).h(px(89.)))
             .when(!self.attachments_draft.is_empty(), |composer| {
                 composer.child(files)
@@ -2967,7 +3033,7 @@ impl Client {
                         div()
                             .whitespace_nowrap()
                             .text_size(px(11.))
-                            .text_color(rgb(0x858e8c))
+                            .text_color(self.tone(0x858e8c, 0x899097))
                             .child(context),
                     )
                     .when(running, |footer| {
@@ -2987,7 +3053,7 @@ impl Client {
                                 .h(px(32.))
                                 .rounded_full()
                                 .border_1()
-                                .border_color(rgb(0x555b5c))
+                                .border_color(self.tone(0x555b5c, 0x6b7176))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -3004,11 +3070,11 @@ impl Client {
                             .w(px(32.))
                             .h(px(32.))
                             .rounded_full()
-                            .bg(rgb(0xc59535))
+                            .bg(self.tone(0xc59535, 0xd29b52))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(rgb(0xffffff))
+                            .text_color(self.tone(0xffffff, 0x17130e))
                             .child("➤"),
                     ),
             )
@@ -3045,8 +3111,14 @@ impl Client {
                     .py(px(8.))
                     .rounded(px(7.))
                     .border_1()
-                    .border_color(rgb(if open { 0xcbbba4 } else { 0xded8cb }))
-                    .bg(rgb(if open { 0xf3ede3 } else { 0xfffdfa }))
+                    .border_color(self.tone(
+                        if open { 0xcbbba4 } else { 0xded8cb },
+                        if open { 0x3c4a5f } else { 0x242a34 },
+                    ))
+                    .bg(self.tone(
+                        if open { 0xf3ede3 } else { 0xfffdfa },
+                        if open { 0x222b38 } else { 0x1a1f26 },
+                    ))
                     .child(
                         div()
                             .flex()
@@ -3062,11 +3134,20 @@ impl Client {
                                     .py(px(2.))
                                     .rounded(px(2.))
                                     .border_1()
-                                    .border_color(rgb(if open { 0xa5dbb4 } else { 0xded8cb }))
-                                    .bg(rgb(if open { 0xe4f7e9 } else { 0xf4f1eb }))
+                                    .border_color(self.tone(
+                                        if open { 0xa5dbb4 } else { 0xded8cb },
+                                        if open { 0x34d399 } else { 0x60a5fa },
+                                    ))
+                                    .bg(self.tone(
+                                        if open { 0xe4f7e9 } else { 0xf4f1eb },
+                                        if open { 0x173329 } else { 0x1b2a40 },
+                                    ))
                                     .font_weight(FontWeight::BOLD)
                                     .text_size(px(9.))
-                                    .text_color(rgb(if open { 0x167e49 } else { 0x77817e }))
+                                    .text_color(self.tone(
+                                        if open { 0x167e49 } else { 0x77817e },
+                                        if open { 0x34d399 } else { 0x60a5fa },
+                                    ))
                                     .child(if open { "OPEN TAB" } else { "SERVER" }),
                             ),
                     )
@@ -3075,7 +3156,7 @@ impl Client {
                             .mt(px(5.))
                             .flex()
                             .text_size(px(11.))
-                            .text_color(rgb(0x858e8c))
+                            .text_color(self.tone(0x858e8c, 0x7f878e))
                             .child(div().flex_1().child(session.directory.clone()))
                             .child(timestamp(session.time.updated)),
                     ),
@@ -3089,14 +3170,14 @@ impl Client {
             .min_h_0()
             .flex()
             .flex_col()
-            .bg(rgb(0xfffdfa))
+            .bg(self.tone(0xfffdfa, 0x15181b))
             .child(
                 div()
                     .px(px(22.))
                     .pt(px(17.))
                     .pb(px(7.))
                     .border_b_1()
-                    .border_color(rgb(0xded8cb))
+                    .border_color(self.tone(0xded8cb, 0x232932))
                     .child(
                         div()
                             .font_weight(FontWeight::BOLD)
@@ -3107,7 +3188,7 @@ impl Client {
                         div()
                             .mt(px(2.))
                             .text_size(px(11.))
-                            .text_color(rgb(0x818984))
+                            .text_color(self.tone(0x818984, 0x899097))
                             .child(format!(
                                 "Search all {} workspace sessions on this server",
                                 self.sessions.len()
@@ -3125,9 +3206,9 @@ impl Client {
                     .items_center()
                     .rounded(px(5.))
                     .border_1()
-                    .border_color(rgb(0x4f99ee))
+                    .border_color(self.tone(0x4f99ee, 0x3b82f6))
                     .child("⌕")
-                    .child(Input::new(&self.settings.session_search).bordered(false)),
+                    .child(Input::new(&self.settings.session_search).appearance(false)),
             )
             .child(
                 div()
@@ -3151,7 +3232,7 @@ impl Client {
             .items_center()
             .justify_center()
             .pt(px(46.))
-            .bg(rgba(0x00000066))
+            .bg(rgba(if self.dark { 0x000000a6 } else { 0x00000066 }))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.modal = None;
                 cx.notify();
@@ -3164,8 +3245,8 @@ impl Client {
                     .h(px(if sessions { 410. } else { 319. }))
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(rgb(0xc8c3ba))
-                    .bg(rgb(0xffffff))
+                    .border_color(self.tone(0xc8c3ba, if sessions { 0x27272a } else { 0x2a3038 }))
+                    .bg(self.tone(0xffffff, if sessions { 0x18181b } else { 0x15181c }))
                     .shadow_lg()
                     .flex()
                     .flex_col()
@@ -3174,11 +3255,14 @@ impl Client {
                             .h(px(if sessions { 48. } else { 55. }))
                             .px(px(12.))
                             .border_b_1()
-                            .border_color(rgb(if sessions { 0xded8cb } else { 0x4f99ee }))
+                            .border_color(self.tone(
+                                if sessions { 0xded8cb } else { 0x4f99ee },
+                                if sessions { 0x27272a } else { 0x62bceb },
+                            ))
                             .flex()
                             .items_center()
                             .when(sessions, |view| view.child("⌕"))
-                            .child(Input::new(&self.search).bordered(false)),
+                            .child(Input::new(&self.search).appearance(false)),
                     );
                 if sessions {
                     let query = self.search.read(cx).value().to_lowercase();
@@ -3201,11 +3285,18 @@ impl Client {
                                 .flex()
                                 .items_center()
                                 .rounded(px(6.))
-                                .bg(rgb(if self.picker_highlight == Some(index) || selected {
-                                    0xf1efec
-                                } else {
-                                    0xffffff
-                                }))
+                                .bg(self.tone(
+                                    if self.picker_highlight == Some(index) || selected {
+                                        0xf1efec
+                                    } else {
+                                        0xffffff
+                                    },
+                                    if self.picker_highlight == Some(index) || selected {
+                                        0x27272a
+                                    } else {
+                                        0x18181b
+                                    },
+                                ))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_session(id.clone());
@@ -3221,14 +3312,14 @@ impl Client {
                                 .child(
                                     div()
                                         .text_size(px(11.))
-                                        .text_color(rgb(0x85909a))
+                                        .text_color(self.tone(0x85909a, 0xa1a1aa))
                                         .child(session.directory.clone()),
                                 ),
                         );
                     }
                     card = card.child(div().flex_1()).child(div().h(px(28.))
-                        .border_t_1().border_color(rgb(0xded8cb)).px(px(12.))
-                        .text_size(px(11.)).text_color(rgb(0x87908d))
+                        .border_t_1().border_color(self.tone(0xded8cb, 0x27272a)).px(px(12.))
+                        .text_size(px(11.)).text_color(self.tone(0x87908d, 0xa1a1aa))
                         .child("↑ ↓ navigate     ↵ switch                                      esc close"));
                 } else {
                     let query = self.search.read(cx).value().to_lowercase();
@@ -3268,18 +3359,25 @@ impl Client {
                                 .flex()
                                 .items_center()
                                 .rounded(px(6.))
-                                .bg(rgb(if self.picker_highlight.is_none_or(|at| at == index) {
-                                    0xece9e2
-                                } else {
-                                    0xffffff
-                                }))
+                                .bg(self.tone(
+                                    if self.picker_highlight.is_none_or(|at| at == index) {
+                                        0xece9e2
+                                    } else {
+                                        0xffffff
+                                    },
+                                    if self.picker_highlight.is_none_or(|at| at == index) {
+                                        0x252d37
+                                    } else {
+                                        0x15181c
+                                    },
+                                ))
                                 .font_weight(FontWeight::BOLD)
                                 .child(div().flex_1().child(label))
                                 .child(
                                     div()
                                         .text_size(px(11.))
                                         .font_weight(FontWeight::NORMAL)
-                                        .text_color(rgb(0x758080))
+                                        .text_color(self.tone(0x758080, 0x7d8590))
                                         .child(project.worktree.clone()),
                                 ),
                         );
@@ -3296,24 +3394,24 @@ impl Client {
                 .flex_col()
                 .rounded(px(11.))
                 .border_1()
-                .border_color(rgb(0xc8c3ba))
-                .bg(rgb(0xfffdfa))
+                .border_color(self.tone(0xc8c3ba, 0x2a3038))
+                .bg(self.tone(0xfffdfa, 0x15181c))
                 .shadow_lg()
                 .child("Session title")
                 .child(
                     div()
                         .h(px(34.))
                         .border_1()
-                        .border_color(rgb(0x4f99ee))
+                        .border_color(self.tone(0x4f99ee, 0x62bceb))
                         .rounded(px(5.))
-                        .child(Input::new(&self.rename).bordered(false)),
+                        .child(Input::new(&self.rename).appearance(false)),
                 )
                 .child("Session ID")
                 .child(
                     div()
                         .h(px(38.))
                         .border_1()
-                        .border_color(rgb(0xd3cec5))
+                        .border_color(self.tone(0xd3cec5, 0x282c32))
                         .rounded(px(5.))
                         .px(px(10.))
                         .flex()
@@ -3343,7 +3441,7 @@ impl Client {
                                 .px(px(14.))
                                 .py(px(7.))
                                 .border_1()
-                                .border_color(rgb(0xd3cec5))
+                                .border_color(self.tone(0xd3cec5, 0x30353a))
                                 .rounded(px(5.))
                                 .child("Cancel"),
                         )
@@ -3356,9 +3454,9 @@ impl Client {
                                 }))
                                 .px(px(14.))
                                 .py(px(7.))
-                                .bg(rgb(0xc59535))
+                                .bg(self.tone(0xc59535, 0xd29b52))
                                 .border_1()
-                                .border_color(rgb(0x1f5c99))
+                                .border_color(self.tone(0x1f5c99, 0x5a4424))
                                 .rounded(px(5.))
                                 .child("Save"),
                         ),
@@ -3373,14 +3471,17 @@ impl Client {
                     ("Client secret", &self.settings.client_secret),
                 ];
                 let mut content = div()
+                    .id("settings-content")
                     .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .px(px(22.))
-                    .pt(px(17.))
+                    .pt(px(12.))
                     .pb(px(22.))
                     .gap(px(8.))
-                    .bg(rgb(0xfffdfa))
+                    .bg(self.tone(0xfffdfa, 0x15181b))
                     .child(
                         div()
                             .font_weight(FontWeight::BOLD)
@@ -3389,9 +3490,9 @@ impl Client {
                     )
                     .child(
                         div()
-                            .mb(px(15.))
+                            .mb(px(5.))
                             .text_size(px(11.))
-                            .text_color(rgb(0x737c7a))
+                            .text_color(self.tone(0x737c7a, 0x899097))
                             .child("Configure server endpoint, credentials, and Cloudflare tokens"),
                     );
                 for (index, (label, input)) in fields.into_iter().enumerate() {
@@ -3401,7 +3502,7 @@ impl Client {
                                 .mt(px(3.))
                                 .pt(px(14.))
                                 .border_t_1()
-                                .border_color(rgb(0xded8cb))
+                                .border_color(self.tone(0xded8cb, 0x232932))
                                 .child("Cloudflare Access service token"),
                         );
                     }
@@ -3413,10 +3514,13 @@ impl Client {
                             .items_center()
                             .rounded(px(5.))
                             .border_1()
-                            .border_color(rgb(if index == 0 { 0x4f99ee } else { 0xd3cec5 }))
-                            .bg(rgb(0xffffff))
-                            .text_color(rgb(0x5a6261))
-                            .child(Input::new(input).bordered(false)),
+                            .border_color(self.tone(
+                                if index == 0 { 0x4f99ee } else { 0xd3cec5 },
+                                if index == 0 { 0x3b82f6 } else { 0x262c36 },
+                            ))
+                            .bg(self.tone(0xffffff, 0x2e2e2e))
+                            .text_color(self.tone(0x5a6261, 0xf0ede7))
+                            .child(Input::new(input).appearance(false)),
                     );
                     if index == 2 {
                         content = content.child(
@@ -3432,18 +3536,22 @@ impl Client {
                                     if self.settings.remember_password { "☑" } else { "☐" }
                                 )),
                         )
-                            .child(div().mt(px(5.)).text_size(px(10.)).text_color(rgb(0x818984))
+                            .child(div().mt(px(5.)).text_size(px(10.)).text_color(self.tone(0x818984, 0x899097))
                                 .child("Remote servers require HTTPS. Loopback HTTP is supported for SSH tunnels. A remembered password is used only for this server URL and username; uncheck Remember to remove it."));
                     }
                 }
                 content = content.child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(0x818984))
+                        .text_color(self.tone(0x818984, 0x899097))
                         .child("The token is sent only to HTTPS servers and stored in the Linux system keyring. Clear the client ID to remove it."),
                 );
                 if let Some(error) = &self.settings.error {
-                    content = content.child(div().text_color(rgb(0xa6332b)).child(error.clone()));
+                    content = content.child(
+                        div()
+                            .text_color(self.tone(0xa6332b, 0xe68178))
+                            .child(error.clone()),
+                    );
                 }
                 let content = if self.settings.tab == SettingsTab::Connection {
                     content.into_any_element()
@@ -3452,20 +3560,20 @@ impl Client {
                 };
                 div()
                     .w(px(820.))
-                    .h(px(675.))
+                    .h(px(640.))
                     .flex()
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(rgb(0xc8c3ba))
-                    .bg(rgb(0xf5f0e7))
+                    .border_color(self.tone(0xc8c3ba, 0x232930))
+                    .bg(self.tone(0xf5f0e7, 0x111418))
                     .shadow_lg()
                     .child(
                         div()
-                            .w(px(280.))
+                            .w(px(264.))
                             .flex()
                             .flex_col()
                             .px(px(8.))
-                            .pt(px(16.))
+                            .pt(px(11.))
                             .pb(px(16.))
                             .child(
                                 div()
@@ -3486,11 +3594,18 @@ impl Client {
                                     .mt(px(12.))
                                     .px(px(9.))
                                     .py(px(5.))
-                                    .bg(rgb(if self.settings.tab == SettingsTab::Connection {
-                                        0xe3e0da
-                                    } else {
-                                        0xf5f0e7
-                                    }))
+                                    .bg(self.tone(
+                                        if self.settings.tab == SettingsTab::Connection {
+                                            0xe3e0da
+                                        } else {
+                                            0xf5f0e7
+                                        },
+                                        if self.settings.tab == SettingsTab::Connection {
+                                            0x25292e
+                                        } else {
+                                            0x111418
+                                        },
+                                    ))
                                     .child("⌁   Connection"),
                             )
                             .child(
@@ -3508,11 +3623,18 @@ impl Client {
                                     .mt(px(2.))
                                     .px(px(9.))
                                     .py(px(5.))
-                                    .bg(rgb(if self.settings.tab == SettingsTab::Sessions {
-                                        0xe3e0da
-                                    } else {
-                                        0xf5f0e7
-                                    }))
+                                    .bg(self.tone(
+                                        if self.settings.tab == SettingsTab::Sessions {
+                                            0xe3e0da
+                                        } else {
+                                            0xf5f0e7
+                                        },
+                                        if self.settings.tab == SettingsTab::Sessions {
+                                            0x25292e
+                                        } else {
+                                            0x111418
+                                        },
+                                    ))
                                     .child("≡   Sessions"),
                             )
                             .child(div().flex_1())
@@ -3520,25 +3642,26 @@ impl Client {
                                 div()
                                     .pl(px(6.))
                                     .text_size(px(11.))
-                                    .text_color(rgb(0x929a9a))
+                                    .text_color(self.tone(0x929a9a, 0x6a7482))
                                     .child("127.0.0.1  ·  opencode-gpui v0.1.0"),
                             ),
                     )
                     .child(
-                        div().w(px(540.)).flex().flex_col().child(content).child(
+                        div().w(px(556.)).flex().flex_col().child(content).child(
                             div()
                                 .h(px(56.))
+                                .flex_shrink_0()
                                 .px(px(22.))
                                 .flex()
                                 .items_center()
                                 .border_t_1()
-                                .border_color(rgb(0xded8cb))
-                                .bg(rgb(0xf9f7f3))
+                                .border_color(self.tone(0xded8cb, 0x232932))
+                                .bg(self.tone(0xf9f7f3, 0x14171d))
                                 .child(
                                     div()
                                         .flex_1()
                                         .text_size(px(11.))
-                                        .text_color(rgb(0x818984))
+                                        .text_color(self.tone(0x818984, 0x899097))
                                         .child(if self.settings.tab == SettingsTab::Connection {
                                             "Secrets stay out of the state file"
                                         } else {
@@ -3557,7 +3680,7 @@ impl Client {
                                         .py(px(7.))
                                         .mr(px(9.))
                                         .border_1()
-                                        .border_color(rgb(0xd3cec5))
+                                        .border_color(self.tone(0xd3cec5, 0x30353a))
                                         .rounded(px(5.))
                                         .child(if self.settings.tab == SettingsTab::Connection {
                                             "Cancel"
@@ -3576,7 +3699,7 @@ impl Client {
                                             .px(px(14.))
                                             .py(px(7.))
                                             .rounded(px(5.))
-                                            .bg(rgb(0xc59535))
+                                            .bg(self.tone(0xc59535, 0xd29b52))
                                             .child("Apply"),
                                     )
                                 }),
@@ -3591,8 +3714,8 @@ impl Client {
                     .h(px(if model { 178. } else { 204. }))
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(rgb(0xc8c3ba))
-                    .bg(rgb(0xfffdfa))
+                    .border_color(self.tone(0xc8c3ba, 0x30353a))
+                    .bg(self.tone(0xfffdfa, 0x191c1f))
                     .shadow_lg()
                     .p(px(14.))
                     .flex()
@@ -3607,10 +3730,10 @@ impl Client {
                             .items_center()
                             .rounded(px(5.))
                             .border_1()
-                            .border_color(rgb(0x4f99ee))
-                            .bg(rgb(0xffffff))
+                            .border_color(self.tone(0x4f99ee, 0x62bceb))
+                            .bg(self.tone(0xffffff, 0x181c21))
                             .child("⌕")
-                            .child(Input::new(&self.search).bordered(false)),
+                            .child(Input::new(&self.search).appearance(false)),
                     );
                 if model {
                     let query = self.search.read(cx).value().to_lowercase();
@@ -3645,11 +3768,18 @@ impl Client {
                                 .h(px(52.))
                                 .px(px(14.))
                                 .rounded(px(5.))
-                                .bg(rgb(if selected || self.picker_highlight == Some(index) {
-                                    0xece9e2
-                                } else {
-                                    0xfffdfa
-                                }))
+                                .bg(self.tone(
+                                    if selected || self.picker_highlight == Some(index) {
+                                        0xece9e2
+                                    } else {
+                                        0xfffdfa
+                                    },
+                                    if selected || self.picker_highlight == Some(index) {
+                                        0x22262b
+                                    } else {
+                                        0x191c1f
+                                    },
+                                ))
                                 .flex()
                                 .items_center()
                                 .child(
@@ -3662,7 +3792,7 @@ impl Client {
                                         .child(
                                             div()
                                                 .text_size(px(11.))
-                                                .text_color(rgb(0x777e7d))
+                                                .text_color(self.tone(0x777e7d, 0x899097))
                                                 .child(format!(
                                                     "{}/{}",
                                                     option.provider_id, option.model_id
@@ -3713,16 +3843,28 @@ impl Client {
                                 .px(px(12.))
                                 .flex()
                                 .items_center()
-                                .bg(rgb(if selected || self.picker_highlight == Some(index) {
-                                    0x3584df
-                                } else {
-                                    0xfffdfa
-                                }))
-                                .text_color(rgb(
+                                .bg(self.tone(
+                                    if selected || self.picker_highlight == Some(index) {
+                                        0x3584df
+                                    } else {
+                                        0xfffdfa
+                                    },
+                                    if selected || self.picker_highlight == Some(index) {
+                                        0x2563eb
+                                    } else {
+                                        0x191c1f
+                                    },
+                                ))
+                                .text_color(self.tone(
                                     if selected || self.picker_highlight == Some(index) {
                                         0xffffff
                                     } else {
                                         0x252829
+                                    },
+                                    if selected || self.picker_highlight == Some(index) {
+                                        0xffffff
+                                    } else {
+                                        0xe8e5df
                                     },
                                 ))
                                 .child(div().flex_1().child(level.to_owned()))
@@ -3741,7 +3883,7 @@ impl Client {
                 .pb(px(77.))
                 .bg(rgba(0x00000000))
         } else if modal == Modal::Settings {
-            backdrop.items_start().justify_start().pt(px(80.))
+            backdrop.items_start().justify_start().pt(px(99.))
         } else {
             backdrop
         };
@@ -3760,6 +3902,7 @@ impl Client {
 
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.dark = Theme::global(cx).is_dark();
         self.sync_composer(window, cx);
         if let Some((old_offset, old_max)) = self.preserve_scroll.take() {
             let scroll = self.scroll.clone();
@@ -3797,8 +3940,8 @@ impl Render for Client {
             .flex_col()
             .font_family("Noto Sans")
             .text_size(px(13.))
-            .text_color(rgb(0x252829))
-            .bg(rgb(0xf4f1eb))
+            .text_color(self.tone(0x252829, 0xe8e5df))
+            .bg(self.tone(0xf4f1eb, 0x101214))
             .child(
                 div()
                     .h(px(46.))
@@ -3806,7 +3949,8 @@ impl Render for Client {
                     .flex()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(0xc8c3ba))
+                    .border_color(self.tone(0xc8c3ba, 0x2a2e32))
+                    .bg(self.tone(0xf4f1eb, 0x14171a))
                     .child(div().w(px(270.)).pl(px(16.)).child("◫"))
                     .child(
                         div()
@@ -3824,7 +3968,7 @@ impl Render for Client {
                                     .whitespace_nowrap()
                                     .text_ellipsis()
                                     .text_size(px(11.))
-                                    .text_color(rgb(0x77817e))
+                                    .text_color(self.tone(0x77817e, 0x899097))
                                     .child(self.connection_status.clone()),
                             ),
                     )
@@ -3869,6 +4013,12 @@ pub fn run(args: Args) {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            Theme::sync_system_appearance(None, cx);
+            match std::env::var("OPENCODE_GPUI_THEME").as_deref() {
+                Ok("dark") => Theme::change(ThemeMode::Dark, None, cx),
+                Ok("light") => Theme::change(ThemeMode::Light, None, cx),
+                _ => {}
+            }
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("OpenCode".into()),
