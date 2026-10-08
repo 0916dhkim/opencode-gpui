@@ -12,7 +12,15 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 cargo build --manifest-path "${ROOT}/Cargo.toml" --release --locked
-install -Dm755 "${ROOT}/target/release/opencode-gpui" "${BIN_DIR}/opencode-gpui"
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  case "${CARGO_TARGET_DIR}" in
+    /*) TARGET_ROOT="${CARGO_TARGET_DIR}" ;;
+    *) TARGET_ROOT="${PWD}/${CARGO_TARGET_DIR}" ;;
+  esac
+else
+  TARGET_ROOT="${ROOT}/target"
+fi
+install -Dm755 "${TARGET_ROOT}/release/opencode-gpui" "${BIN_DIR}/opencode-gpui"
 install -d "${APPLICATION_DIR}"
 sed "s|@EXEC@|${BIN_DIR}/opencode-gpui|g" \
   "${ROOT}/data/ai.opencode.Gpui.desktop" \
