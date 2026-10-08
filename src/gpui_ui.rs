@@ -46,6 +46,82 @@ fn tab_number_key(key: &str) -> Option<usize> {
     }
 }
 
+fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q_lower: Vec<char> = query.to_lowercase().chars().collect();
+    let t_lower: Vec<char> = target.to_lowercase().chars().collect();
+    let original: Vec<char> = target.chars().collect();
+    let mut q_idx = 0;
+    let mut score = 0;
+    let mut previous = None;
+    let mut first = None;
+    for (index, &character) in t_lower.iter().enumerate() {
+        if q_idx < q_lower.len() && character == q_lower[q_idx] {
+            first.get_or_insert(index);
+            score += 10;
+            if previous.is_some_and(|last| last + 1 == index) {
+                score += 15;
+            }
+            if index == 0 {
+                score += 30;
+            } else {
+                let prior = original[index - 1];
+                if matches!(prior, ' ' | '-' | '_' | '/' | '.' | ':') {
+                    score += 25;
+                } else if prior.is_lowercase() && original[index].is_uppercase() {
+                    score += 20;
+                }
+            }
+            previous = Some(index);
+            q_idx += 1;
+        }
+    }
+    if q_idx < q_lower.len() {
+        return None;
+    }
+    let lowered = target.to_lowercase();
+    let query_lowered = query.to_lowercase();
+    if let Some(index) = lowered.find(&query_lowered) {
+        score += 50;
+        if index == 0 {
+            score += 25;
+        }
+    }
+    if let (Some(first), Some(last)) = (first, previous) {
+        score -= last.saturating_sub(first) as i64;
+    }
+    score -= t_lower.len() as i64 / 4;
+    Some(score)
+}
+
+const SESSION_PICKER_LIMIT: usize = 200;
+
+fn filter_tab_sessions<'a>(sessions: &'a [Session], query: &str) -> Vec<&'a Session> {
+    let query = query.trim();
+    let mut scored: Vec<_> = sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| {
+            let score = if query.is_empty() {
+                Some(0)
+            } else {
+                fuzzy_score(query, &session.title).max(fuzzy_score(query, &session.directory))
+            };
+            score.map(|score| (score, index, session))
+        })
+        .collect();
+    if !query.is_empty() {
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
+    scored
+        .into_iter()
+        .take(SESSION_PICKER_LIMIT)
+        .map(|(_, _, session)| session)
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabAttention {
     Busy,
@@ -156,6 +232,7 @@ struct Client {
     attachment_drafts: HashMap<String, Vec<PathBuf>>,
     overlay: Option<String>,
     scroll: ScrollHandle,
+    sessions_picker_scroll: ScrollHandle,
     unread: HashSet<String>,
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
@@ -668,6 +745,7 @@ impl Client {
             attachment_drafts: HashMap::new(),
             overlay: None,
             scroll,
+            sessions_picker_scroll: ScrollHandle::new(),
             unread: HashSet::new(),
             statuses: HashMap::new(),
             jobs: Vec::new(),
@@ -703,6 +781,10 @@ impl Client {
             |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Change => {
                     this.picker_highlight = None;
+                    if this.modal == Some(Modal::Sessions) {
+                        this.sessions_picker_scroll
+                            .set_offset(point(px(0.), px(0.)));
+                    }
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => this.accept_modal_choice(cx),
@@ -1233,6 +1315,10 @@ impl Client {
         self.picker_highlight = None;
         match modal {
             Modal::Sessions | Modal::NewSession | Modal::Model | Modal::Level => {
+                if modal == Modal::Sessions {
+                    self.sessions_picker_scroll
+                        .set_offset(point(px(0.), px(0.)));
+                }
                 let placeholder = match modal {
                     Modal::Model => "Search models (fuzzy)…",
                     Modal::Level => "Search levels (fuzzy)…",
@@ -1273,12 +1359,7 @@ impl Client {
     fn modal_choice_count(&self, cx: &Context<Self>) -> usize {
         let query = self.search.read(cx).value().to_lowercase();
         match self.modal {
-            Some(Modal::Sessions) => self
-                .sessions
-                .iter()
-                .filter(|session| session.title.to_lowercase().contains(&query))
-                .take(8)
-                .count(),
+            Some(Modal::Sessions) => filter_tab_sessions(&self.sessions, &query).len(),
             Some(Modal::NewSession) => self
                 .projects
                 .iter()
@@ -1323,12 +1404,8 @@ impl Client {
         let index = self.picker_highlight.unwrap_or_default();
         match self.modal {
             Some(Modal::Sessions) => {
-                let id = self
-                    .sessions
-                    .iter()
-                    .filter(|session| session.title.to_lowercase().contains(&query))
-                    .take(8)
-                    .nth(index)
+                let id = filter_tab_sessions(&self.sessions, &query)
+                    .get(index)
                     .map(|session| session.id.clone());
                 if let Some(id) = id {
                     self.select_session(id);
@@ -1469,8 +1546,17 @@ impl Client {
             } else {
                 (current + 1).min(len - 1)
             });
+            if self.modal == Some(Modal::Sessions) {
+                self.sessions_picker_scroll
+                    .scroll_to_item(self.picker_highlight.unwrap_or_default());
+            }
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if matches!(key.as_str(), "enter" | "return") && self.modal_choice_count(cx) > 0 {
+            self.accept_modal_choice(cx);
+            cx.stop_propagation();
             return;
         }
         if modifiers.alt
@@ -2425,6 +2511,7 @@ impl Client {
             attachment_drafts: HashMap::new(),
             overlay: if modal.is_none() { overlay } else { None },
             scroll,
+            sessions_picker_scroll: ScrollHandle::new(),
             unread: server.unread,
             statuses: bootstrap.statuses,
             jobs,
@@ -2461,6 +2548,10 @@ impl Client {
             |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Change => {
                     this.picker_highlight = None;
+                    if this.modal == Some(Modal::Sessions) {
+                        this.sessions_picker_scroll
+                            .set_offset(point(px(0.), px(0.)));
+                    }
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => this.accept_modal_choice(cx),
@@ -4000,21 +4091,26 @@ impl Client {
                             .child(Input::new(&self.search).appearance(false)),
                     );
                 if sessions {
-                    let query = self.search.read(cx).value().to_lowercase();
-                    for session in self
-                        .sessions
-                        .iter()
-                        .filter(|session| session.title.to_lowercase().contains(&query))
-                        .take(8)
+                    let query = self.search.read(cx).value();
+                    let mut list = div()
+                        .id("session-picker-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.sessions_picker_scroll)
+                        .flex()
+                        .flex_col();
+                    for (index, session) in filter_tab_sessions(&self.sessions, &query)
+                        .into_iter()
                         .enumerate()
                     {
-                        let (index, session) = session;
                         let selected = session.id == self.active;
                         let id = session.id.clone();
-                        card = card.child(
+                        list = list.child(
                             div()
                                 .id(format!("session-choice-{}", session.id))
                                 .h(px(44.))
+                                .flex_shrink_0()
                                 .mx(px(10.))
                                 .px(px(12.))
                                 .flex()
@@ -4052,6 +4148,7 @@ impl Client {
                                 ),
                         );
                     }
+                    card = card.child(list);
                     let key_chip = |label| {
                         div()
                             .h(px(14.))
@@ -4068,7 +4165,7 @@ impl Client {
                             .text_size(px(9.))
                             .child(label)
                     };
-                    card = card.child(div().flex_1()).child(
+                    card = card.child(
                         div()
                             .h(px(28.))
                             .border_t_1()
@@ -4976,8 +5073,9 @@ mod tests {
     use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use super::{
-        Client, MarkdownBlock, Modal, TabAttention, inline_image, markdown_blocks, model,
-        reorder_tab_ids, sticky_user_index, tab_indicator, tab_number_key,
+        Client, MarkdownBlock, Modal, SESSION_PICKER_LIMIT, TabAttention, filter_tab_sessions,
+        fuzzy_score, inline_image, markdown_blocks, model, reorder_tab_ids, sticky_user_index,
+        tab_indicator, tab_number_key,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -5231,6 +5329,90 @@ mod tests {
         assert_eq!(tab_number_key("0"), None);
         assert_eq!(tab_number_key("10"), None);
         assert_eq!(tab_number_key("x"), None);
+    }
+
+    #[test]
+    fn session_picker_fuzzy_ranks_title_or_directory_and_caps_results() {
+        assert!(fuzzy_score("rtrl", "Refactor the retry logic").is_some());
+        assert!(fuzzy_score("zqx", "Refactor the retry logic").is_none());
+        let mut sessions = Vec::new();
+        for index in 0..210 {
+            sessions.push(model::Session {
+                id: format!("ses_{index}"),
+                directory: format!("/workspace/project-{index}"),
+                title: format!("Session {index}"),
+                time: model::SessionTime {
+                    created: 0,
+                    updated: 0,
+                    archived: None,
+                },
+                parent_id: None,
+                model: None,
+            });
+        }
+        sessions[150].title = "Refactor the retry logic".into();
+        assert_eq!(
+            filter_tab_sessions(&sessions, "").len(),
+            SESSION_PICKER_LIMIT
+        );
+        assert_eq!(filter_tab_sessions(&sessions, "rtrl")[0].id, "ses_150");
+        assert_eq!(
+            filter_tab_sessions(&sessions, "project-209")[0].id,
+            "ses_209"
+        );
+        assert!(filter_tab_sessions(&sessions, "zqx").is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn sessions_picker_keyboard_reaches_scrolled_results(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                for index in 0..15 {
+                    let mut session = client.sessions[0].clone();
+                    session.id = format!("ses_extra_{index}");
+                    session.title = format!("Extra session {index}");
+                    client.sessions.push(session);
+                }
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::Sessions, window, cx)
+            });
+            window.render_frame(cx);
+            assert!(
+                client.read(cx).search.focus_handle(cx).is_focused(window),
+                "sessions picker search must receive focus when opened"
+            );
+            assert_eq!(filter_tab_sessions(&client.read(cx).sessions, "").len(), 20);
+            for _ in 0..12 {
+                window.press("down", cx);
+            }
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).picker_highlight, Some(12));
+            assert!(
+                client.read(cx).sessions_picker_scroll.offset().y < px(0.),
+                "offset {:?}, max {:?}, bounds {:?}, child12 {:?}, children {}",
+                client.read(cx).sessions_picker_scroll.offset(),
+                client.read(cx).sessions_picker_scroll.max_offset(),
+                client.read(cx).sessions_picker_scroll.bounds(),
+                client.read(cx).sessions_picker_scroll.bounds_for_item(12),
+                client.read(cx).sessions_picker_scroll.children_count()
+            );
+            window.press("enter", cx);
+            assert_eq!(client.read(cx).active, "ses_extra_7");
+            assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
     }
 
     #[test]
