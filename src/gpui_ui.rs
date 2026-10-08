@@ -46,6 +46,26 @@ fn tab_number_key(key: &str) -> Option<usize> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabAttention {
+    Busy,
+    Unread,
+    Read,
+}
+
+/// Activity shape and attention color are independent: a background job can
+/// keep the gear visible while an idle, read tab stays gray.
+fn tab_indicator(busy: bool, unread: bool, has_jobs: bool) -> (bool, TabAttention) {
+    let attention = if busy {
+        TabAttention::Busy
+    } else if unread {
+        TabAttention::Unread
+    } else {
+        TabAttention::Read
+    };
+    (busy || has_jobs, attention)
+}
+
 #[derive(Clone)]
 struct TabDrag(String);
 
@@ -753,7 +773,6 @@ impl Client {
             self.attachments_draft = self.attachment_drafts.remove(&id).unwrap_or_default();
             self.active = id.clone();
         }
-        self.unread.remove(&id);
         self.scroll.scroll_to_bottom();
         self.jobs = self.running_jobs.rows(Some(&id));
         if !self
@@ -2542,12 +2561,29 @@ impl Client {
             .is_some_and(RunStatus::is_busy);
         let unread = self.unread.contains(&session.id);
         let has_jobs = self.running_jobs.sessions_with_jobs().contains(&session.id);
-        let dot_color = if busy {
-            if self.dark { 0xe5b567 } else { 0xa46910 }
-        } else if unread {
-            if self.dark { 0x62bceb } else { 0x176899 }
-        } else {
-            if self.dark { 0x68736f } else { 0x7c8682 }
+        let (gear, attention) = tab_indicator(busy, unread, has_jobs);
+        let dot_color = match attention {
+            TabAttention::Busy => {
+                if self.dark {
+                    0xe5b567
+                } else {
+                    0xa46910
+                }
+            }
+            TabAttention::Unread => {
+                if self.dark {
+                    0x62bceb
+                } else {
+                    0x176899
+                }
+            }
+            TabAttention::Read => {
+                if self.dark {
+                    0x68736f
+                } else {
+                    0x7c8682
+                }
+            }
         };
         let title = session.title.clone();
         let id = session.id.clone();
@@ -2566,12 +2602,26 @@ impl Client {
             .as_ref()
             .filter(|(target, _)| target == &session.id)
             .map(|(_, after)| *after);
-        let indicator = if self.tab_shortcut_hint && index < 9 {
-            (index + 1).to_string()
-        } else if has_jobs || busy {
-            "✿".to_owned()
+        let indicator: AnyElement = if self.tab_shortcut_hint && index < 9 {
+            div()
+                .w(px(14.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(dot_color))
+                .child((index + 1).to_string())
+                .into_any_element()
+        } else if gear {
+            Icon::default()
+                .data(include_bytes!("icons/settings.svg"))
+                .with_size(px(14.))
+                .text_color(rgb(dot_color))
+                .into_any_element()
         } else {
-            "●".to_owned()
+            div()
+                .w(px(9.))
+                .h(px(9.))
+                .rounded_full()
+                .bg(rgb(dot_color))
+                .into_any_element()
         };
         div()
             .id(format!("tab-{id}"))
@@ -2666,7 +2716,7 @@ impl Client {
                             })
                         })
                     })
-                    .child(div().text_color(rgb(dot_color)).child(indicator))
+                    .child(indicator)
                     .child(
                         div()
                             .flex_1()
@@ -2674,12 +2724,12 @@ impl Client {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_color(if unread || busy {
+                            .text_color(if attention != TabAttention::Read {
                                 rgb(dot_color)
                             } else {
                                 self.tone(0x555b5c, 0xe8e5df)
                             })
-                            .font_weight(if unread || busy {
+                            .font_weight(if attention != TabAttention::Read {
                                 FontWeight::BOLD
                             } else {
                                 FontWeight::NORMAL
@@ -4919,8 +4969,8 @@ mod tests {
     use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use super::{
-        Client, MarkdownBlock, Modal, inline_image, markdown_blocks, model, reorder_tab_ids,
-        sticky_user_index, tab_number_key,
+        Client, MarkdownBlock, Modal, TabAttention, inline_image, markdown_blocks, model,
+        reorder_tab_ids, sticky_user_index, tab_indicator, tab_number_key,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -5174,6 +5224,19 @@ mod tests {
         assert_eq!(tabs, ["a", "b", "c"]);
     }
 
+    #[test]
+    fn background_activity_and_attention_have_gtk_precedence() {
+        use TabAttention::{Busy, Read, Unread};
+        assert_eq!(tab_indicator(false, false, false), (false, Read));
+        assert_eq!(tab_indicator(false, true, false), (false, Unread));
+        assert_eq!(tab_indicator(false, false, true), (true, Read));
+        assert_eq!(tab_indicator(false, true, true), (true, Unread));
+        assert_eq!(tab_indicator(true, false, false), (true, Busy));
+        assert_eq!(tab_indicator(true, true, false), (true, Busy));
+        assert_eq!(tab_indicator(true, false, true), (true, Busy));
+        assert_eq!(tab_indicator(true, true, true), (true, Busy));
+    }
+
     #[gpui_kit::test]
     fn dragging_session_tabs_keeps_drafts_and_persists_order(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -5410,11 +5473,14 @@ mod tests {
                     .insert(client.active.clone(), RunStatus::Busy);
                 client.update_tab_status(client.active.clone(), RunStatus::Idle);
                 assert!(client.unread.contains(&client.active));
+                client.select_session(client.active.clone());
+                assert!(client.unread.contains(&client.active));
                 client.statuses.insert("ses_closed".into(), RunStatus::Busy);
                 client.update_tab_status("ses_closed".into(), RunStatus::Idle);
                 assert!(!client.unread.contains("ses_closed"));
+                client.unread.insert("ses_other".into());
                 client.select_session("ses_other".into());
-                assert!(!client.unread.contains("ses_other"));
+                assert!(client.unread.contains("ses_other"));
             });
         });
     }
