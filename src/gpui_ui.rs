@@ -12,7 +12,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::component::{Icon, Sizable};
+use gpui_kit::component::{Icon, Sizable, VirtualListScrollHandle, v_virtual_list};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
@@ -317,7 +317,8 @@ struct Client {
     loading_messages: HashMap<String, Option<String>>,
     message_events_during_load: HashMap<String, Vec<protocol::Event>>,
     reload_after_load: HashSet<String>,
-    preserve_scroll: Option<(Point<Pixels>, Point<Pixels>)>,
+    preserve_scroll: Option<TranscriptAnchor>,
+    follow_bottom: Option<(String, Point<Pixels>)>,
     catalogs: HashMap<String, ModelCatalog>,
     running_jobs: Jobs,
     sessions: Vec<Session>,
@@ -330,8 +331,11 @@ struct Client {
     active: String,
     transcript: HashMap<String, Vec<TranscriptRow>>,
     row_heights: HashMap<String, Rc<RefCell<RowHeightCache>>>,
+    virtual_scrolls: HashMap<String, VirtualListScrollHandle>,
     #[cfg(test)]
     measurement_probe: Option<(Pixels, Rc<RefCell<Vec<Pixels>>>)>,
+    #[cfg(test)]
+    rendered_rows: Rc<RefCell<Vec<usize>>>,
     attachments: HashMap<(String, usize, usize), Arc<Image>>,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
@@ -341,7 +345,7 @@ struct Client {
     attachments_draft: Vec<PathBuf>,
     attachment_drafts: HashMap<String, Vec<PathBuf>>,
     overlay: Option<String>,
-    scroll: ScrollHandle,
+    scroll: VirtualListScrollHandle,
     sessions_picker_scroll: ScrollHandle,
     picker_list_scroll: ScrollHandle,
     projects_picker_scroll: ScrollHandle,
@@ -485,10 +489,19 @@ struct CachedRowHeight {
     height: Pixels,
 }
 
+#[derive(Clone)]
+struct TranscriptAnchor {
+    session: String,
+    key: TranscriptRowKey,
+    within: Pixels,
+    offset: Point<Pixels>,
+}
+
 #[derive(Default)]
 struct RowHeightCache {
     stamp: Option<RowLayoutStamp>,
     entries: HashMap<TranscriptRowKey, CachedRowHeight>,
+    load_height: Option<(bool, Pixels)>,
     #[cfg(test)]
     layouts: usize,
 }
@@ -497,6 +510,7 @@ impl RowHeightCache {
     fn missing(&mut self, stamp: RowLayoutStamp, rows: &[TranscriptRow]) -> Vec<usize> {
         if self.stamp != Some(stamp) {
             self.entries.clear();
+            self.load_height = None;
             self.stamp = Some(stamp);
         }
         rows.iter()
@@ -528,6 +542,79 @@ impl RowHeightCache {
             .get(&row.key)
             .and_then(|entry| (entry.revision == row.render_revision()).then_some(entry.height))
     }
+
+    fn prefix(&self, rows: &[TranscriptRow], index: usize, has_load: bool) -> Option<Pixels> {
+        let mut top = if has_load {
+            self.load_height?.1
+        } else {
+            px(0.)
+        };
+        for row in rows.iter().take(index) {
+            top += self.height(row)?;
+        }
+        Some(top)
+    }
+
+    fn sizes(
+        &self,
+        rows: &[TranscriptRow],
+        has_load: bool,
+        width: Pixels,
+    ) -> Option<Rc<Vec<Size<Pixels>>>> {
+        let mut sizes = Vec::with_capacity(rows.len() + usize::from(has_load));
+        if has_load {
+            sizes.push(size(width, self.load_height?.1));
+        }
+        for row in rows {
+            sizes.push(size(width, self.height(row)?));
+        }
+        Some(Rc::new(sizes))
+    }
+
+    /// A miss is represented by an empty placeholder for precisely one layout
+    /// frame. The old measured height (or a small new-row placeholder) is only
+    /// used for scroll geometry: no unmeasured content is laid out in that
+    /// definite-height virtual slot, so a growing Markdown row cannot clip.
+    fn provisional_sizes(
+        &self,
+        rows: &[TranscriptRow],
+        has_load: bool,
+        width: Pixels,
+    ) -> Rc<Vec<Size<Pixels>>> {
+        let mut sizes = Vec::with_capacity(rows.len() + usize::from(has_load));
+        if has_load {
+            sizes.push(size(
+                width,
+                self.load_height.map_or(px(48.), |(_, height)| height),
+            ));
+        }
+        for row in rows {
+            let height = self
+                .entries
+                .get(&row.key)
+                .map_or(px(64.), |entry| entry.height);
+            sizes.push(size(width, height));
+        }
+        Rc::new(sizes)
+    }
+
+    fn provisional_positions(&self, rows: &[TranscriptRow], has_load: bool) -> Vec<Pixels> {
+        let mut top = if has_load {
+            self.load_height.map_or(px(48.), |(_, height)| height)
+        } else {
+            px(0.)
+        };
+        rows.iter()
+            .map(|row| {
+                let origin = top;
+                top += self
+                    .entries
+                    .get(&row.key)
+                    .map_or(px(64.), |entry| entry.height);
+                origin
+            })
+            .collect()
+    }
 }
 
 /// Detached rows are laid out at a definite width during GPUI's layout phase,
@@ -535,6 +622,7 @@ impl RowHeightCache {
 /// `layout_as_root` panics if called from the view's render method instead.
 struct TranscriptMeasurementProbe {
     rows: Vec<(TranscriptRowKey, u64, AnyElement)>,
+    load: Option<(bool, AnyElement)>,
     stamp: RowLayoutStamp,
     cache: Rc<RefCell<RowHeightCache>>,
     #[cfg(test)]
@@ -569,6 +657,22 @@ impl Element for TranscriptMeasurementProbe {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        if let Some((loading, control)) = &mut self.load {
+            let height = control
+                .layout_as_root(
+                    size(
+                        AvailableSpace::Definite(self.stamp.width),
+                        AvailableSpace::MinContent,
+                    ),
+                    window,
+                    cx,
+                )
+                .height;
+            let mut cache = self.cache.borrow_mut();
+            if cache.stamp == Some(self.stamp) {
+                cache.load_height = Some((*loading, height));
+            }
+        }
         let measured: Vec<_> = self
             .rows
             .iter_mut()
@@ -594,6 +698,13 @@ impl Element for TranscriptMeasurementProbe {
         for (key, revision, height) in measured {
             cache.record(self.stamp, key, revision, height);
         }
+        // Re-render once the provisional virtual slots have exact heights.
+        #[cfg(test)]
+        if self.heights.is_none() {
+            window.refresh();
+        }
+        #[cfg(not(test))]
+        window.refresh();
         self.spacer
             .request_layout(global_id, inspector_id, window, cx)
     }
@@ -882,7 +993,7 @@ impl Client {
             password: password.password,
             cloudflare_access,
         };
-        let scroll = ScrollHandle::new();
+        let scroll = VirtualListScrollHandle::new();
         let mut client = Self {
             dark: Theme::global(cx).is_dark(),
             api: None,
@@ -905,6 +1016,7 @@ impl Client {
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
             preserve_scroll: None,
+            follow_bottom: None,
             catalogs: HashMap::new(),
             running_jobs: Jobs::default(),
             sessions: Vec::new(),
@@ -917,8 +1029,11 @@ impl Client {
             active: String::new(),
             transcript: HashMap::new(),
             row_heights: HashMap::new(),
+            virtual_scrolls: HashMap::new(),
             #[cfg(test)]
             measurement_probe: None,
+            #[cfg(test)]
+            rendered_rows: Rc::new(RefCell::new(Vec::new())),
             attachments: HashMap::new(),
             catalog: ModelCatalog::default(),
             composer: cx.new(|cx| {
@@ -1060,9 +1175,18 @@ impl Client {
                 );
             }
             self.attachments_draft = self.attachment_drafts.remove(&id).unwrap_or_default();
+            let first_visit = !self.virtual_scrolls.contains_key(&id);
+            self.scroll = self
+                .virtual_scrolls
+                .entry(id.clone())
+                .or_insert_with(VirtualListScrollHandle::new)
+                .clone();
+            self.preserve_scroll = None;
+            self.follow_bottom = first_visit.then(|| (id.clone(), self.scroll.offset()));
             self.active = id.clone();
+            // First visits pin after exact heights arrive. Returning to a
+            // previously viewed tab retains its own scroll offset.
         }
-        self.scroll.scroll_to_bottom();
         self.jobs = self.running_jobs.rows(Some(&id));
         if !self
             .conversations
@@ -1190,6 +1314,7 @@ impl Client {
         self.reload_after_load.remove(id);
         self.transcript.remove(id);
         self.row_heights.remove(id);
+        self.virtual_scrolls.remove(id);
         self.unread.remove(id);
         if self.active == id {
             let next = index
@@ -1502,11 +1627,14 @@ impl Client {
         self.clear_accepted_drafts.clear();
         self.transcript.clear();
         self.row_heights.clear();
+        self.virtual_scrolls.clear();
+        self.scroll = VirtualListScrollHandle::new();
         self.conversations.clear();
         self.loading_messages.clear();
         self.message_events_during_load.clear();
         self.reload_after_load.clear();
         self.preserve_scroll = None;
+        self.follow_bottom = None;
         self.catalogs.clear();
         self.statuses.clear();
         self.forms.clear();
@@ -2104,6 +2232,7 @@ impl Client {
     }
 
     fn update_transcript(&mut self, session_id: &str) {
+        self.prepare_follow_bottom(session_id);
         let Some(conversation) = self.conversations.get(session_id) else {
             return;
         };
@@ -2123,6 +2252,98 @@ impl Client {
             }
         }
         self.transcript.insert(session_id.to_owned(), rows);
+    }
+
+    fn prepare_follow_bottom(&mut self, session_id: &str) {
+        if session_id == self.active
+            && self.preserve_scroll.is_none()
+            && self.transcript.contains_key(session_id)
+        {
+            let offset = self.scroll.offset();
+            if offset.y + self.scroll.max_offset().y <= px(16.) {
+                self.follow_bottom = Some((session_id.to_owned(), offset));
+            } else {
+                self.follow_bottom = None;
+            }
+        }
+    }
+
+    fn transcript_anchor(&self) -> Option<TranscriptAnchor> {
+        let rows = self.transcript.get(&self.active)?;
+        let offset = self.scroll.offset();
+        let has_load = self
+            .conversations
+            .get(&self.active)
+            .is_some_and(|conversation| conversation.next_cursor.is_some());
+        let cache = self.row_heights.get(&self.active)?.borrow();
+        let mut top = if has_load {
+            cache.load_height?.1
+        } else {
+            px(0.)
+        };
+        let visible_top = -offset.y;
+        for row in rows {
+            let bottom = top + cache.height(row)?;
+            if bottom > visible_top {
+                return Some(TranscriptAnchor {
+                    session: self.active.clone(),
+                    key: row.key.clone(),
+                    // A viewport in the load-earlier control anchors the
+                    // first message at its existing on-screen position.
+                    within: visible_top - top,
+                    offset,
+                });
+            }
+            top = bottom;
+        }
+        None
+    }
+
+    fn correct_scroll(&mut self, window: &mut Window) {
+        let Some(rows) = self.transcript.get(&self.active) else {
+            return;
+        };
+        let width = window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        let stamp = RowLayoutStamp {
+            width,
+            dark: self.dark,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: self
+                .conversations
+                .get(&self.active)
+                .map_or(0, Conversation::cache_epoch),
+        };
+        let has_load = self
+            .conversations
+            .get(&self.active)
+            .is_some_and(|conversation| conversation.next_cursor.is_some());
+        let Some(cache) = self.row_heights.get(&self.active) else {
+            return;
+        };
+        let cache = cache.borrow();
+        if cache.stamp != Some(stamp) || cache.sizes(rows, has_load, width).is_none() {
+            return;
+        }
+        if let Some(anchor) = self.preserve_scroll.take() {
+            if anchor.session == self.active
+                && let Some(index) = rows.iter().position(|row| row.key == anchor.key)
+                && let Some(top) = cache.prefix(rows, index, has_load)
+                && self.scroll.offset() == anchor.offset
+            {
+                self.scroll
+                    .set_offset(point(anchor.offset.x, -(top + anchor.within)));
+            }
+        } else if let Some((session, offset)) = self.follow_bottom.take()
+            && session == self.active
+            && self.scroll.offset() == offset
+        {
+            let content_height = cache.prefix(rows, rows.len(), has_load).unwrap_or(px(0.));
+            let viewport_height = self.scroll.bounds().size.height;
+            self.scroll.set_offset(point(
+                offset.x,
+                -(content_height - viewport_height).max(px(0.)),
+            ));
+        }
     }
 
     fn handle_live_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
@@ -2274,13 +2495,13 @@ impl Client {
                     if self.open_tabs.contains(&session_id) {
                         match result {
                             Ok(page) => {
+                                if cursor.is_some() && self.active == session_id {
+                                    self.preserve_scroll = self.transcript_anchor();
+                                    self.follow_bottom = None;
+                                }
                                 let conversation =
                                     self.conversations.entry(session_id.clone()).or_default();
                                 if cursor.is_some() {
-                                    if self.active == session_id {
-                                        self.preserve_scroll =
-                                            Some((self.scroll.offset(), self.scroll.max_offset()));
-                                    }
                                     conversation.prepend_from_api(&page.messages, page.next_cursor);
                                 } else {
                                     conversation.replace_from_api(&page.messages, page.next_cursor);
@@ -2506,6 +2727,7 @@ impl Client {
                             self.conversations.remove(&id);
                             self.transcript.remove(&id);
                             self.row_heights.remove(&id);
+                            self.virtual_scrolls.remove(&id);
                             self.composers.remove(&id);
                             self.attachment_drafts.remove(&id);
                             self.pending_prompts.remove(&id);
@@ -2684,13 +2906,7 @@ impl Client {
             } => catalog,
             _ => ModelCatalog::default(),
         };
-        let scroll = ScrollHandle::new();
-        scroll.scroll_to_bottom();
-        let after_first_layout = scroll.clone();
-        window.on_next_frame(move |window, _| {
-            after_first_layout.scroll_to_bottom();
-            window.refresh();
-        });
+        let scroll = VirtualListScrollHandle::new();
         let mut client = Self {
             dark: Theme::global(cx).is_dark(),
             api: None,
@@ -2723,6 +2939,7 @@ impl Client {
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
             preserve_scroll: None,
+            follow_bottom: Some((active.clone(), scroll.offset())),
             catalogs: HashMap::new(),
             running_jobs,
             sessions,
@@ -2732,11 +2949,14 @@ impl Client {
             tab_drop_target: None,
             bootstrapped: true,
             projects,
-            active,
+            active: active.clone(),
             transcript,
             row_heights: HashMap::new(),
+            virtual_scrolls: HashMap::from([(active, scroll.clone())]),
             #[cfg(test)]
             measurement_probe: None,
+            #[cfg(test)]
+            rendered_rows: Rc::new(RefCell::new(Vec::new())),
             attachments,
             catalog,
             composer: cx.new(|cx| {
@@ -3425,6 +3645,8 @@ impl Client {
     }
 
     fn message(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> AnyElement {
+        #[cfg(test)]
+        self.rendered_rows.borrow_mut().push(index);
         let element = self.message_row(row, index, cx);
         #[cfg(test)]
         {
@@ -3473,13 +3695,24 @@ impl Client {
             .or_default()
             .clone();
         let missing = cache.borrow_mut().missing(stamp, transcript);
+        let load = self
+            .conversations
+            .get(&self.active)
+            .and_then(|conversation| conversation.next_cursor.clone());
+        let loading = self.loading_messages.contains_key(&self.active);
+        let measure_load = load.as_ref().is_some_and(|_| {
+            cache
+                .borrow()
+                .load_height
+                .is_none_or(|(was_loading, _)| was_loading != loading)
+        });
         #[cfg(test)]
         let missing = if heights.is_some() {
             (0..transcript.len()).collect::<Vec<_>>()
         } else {
             missing
         };
-        if missing.is_empty() {
+        if missing.is_empty() && !measure_load {
             return None;
         }
         Some(TranscriptMeasurementProbe {
@@ -3494,12 +3727,71 @@ impl Client {
                     )
                 })
                 .collect(),
+            load: if measure_load {
+                load.map(|cursor| {
+                    (
+                        loading,
+                        self.load_earlier_row(cursor, loading, cx)
+                            .into_any_element(),
+                    )
+                })
+            } else {
+                None
+            },
             stamp,
             cache,
             #[cfg(test)]
             heights,
             spacer: div().size(px(0.)),
         })
+    }
+
+    fn load_earlier_row(&self, cursor: String, loading: bool, cx: &Context<Self>) -> Stateful<Div> {
+        let id = self.active.clone();
+        div()
+            .id("load-earlier")
+            .font_family("Noto Sans")
+            .text_size(px(13.))
+            .flex_shrink_0()
+            .mx(px(28.))
+            .my(px(12.))
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(self.tone(0xc8c3ba, 0x30353a))
+            .bg(self.tone(0xfffdfa, 0x191c1f))
+            .text_color(self.tone(0x555b5c, 0xe8e5df))
+            .when(!loading, |button| {
+                button
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.load_earlier(&id, &cursor, cx);
+                    }))
+            })
+            .child(if loading {
+                "Loading earlier messages…"
+            } else {
+                "Load earlier messages"
+            })
+    }
+
+    fn load_earlier_element(
+        &self,
+        cursor: String,
+        loading: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let element = self.load_earlier_row(cursor, loading, cx);
+        #[cfg(test)]
+        {
+            use gpui_kit::base::TestSupportExt as _;
+            element.test_support().into_any_element()
+        }
+        #[cfg(not(test))]
+        {
+            element.into_any_element()
+        }
     }
 
     fn form_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -3737,13 +4029,13 @@ impl Client {
             })
     }
 
-    fn chat(&self, cx: &Context<Self>) -> AnyElement {
+    fn chat(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         // GTK reserves a permanent 14px gutter for the transcript scrollbar.
         let mut rows = div()
             .id("transcript")
             .size_full()
             .overflow_y_scroll()
-            .track_scroll(&self.scroll)
+            .track_scroll(self.scroll.base_handle())
             .w_full()
             .pr(px(TRANSCRIPT_SCROLLBAR_GUTTER))
             .flex()
@@ -3753,36 +4045,10 @@ impl Client {
             .get(&self.active)
             .and_then(|conversation| conversation.next_cursor.clone())
         {
-            let id = self.active.clone();
-            let loading = self.loading_messages.contains_key(&id);
-            rows = rows.child(
-                div()
-                    .id("load-earlier")
-                    .flex_shrink_0()
-                    .mx(px(28.))
-                    .my(px(12.))
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(self.tone(0xc8c3ba, 0x30353a))
-                    .bg(self.tone(0xfffdfa, 0x191c1f))
-                    .text_color(self.tone(0x555b5c, 0xe8e5df))
-                    .when(!loading, |button| {
-                        button
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.load_earlier(&id, &cursor, cx);
-                            }))
-                    })
-                    .child(if loading {
-                        "Loading earlier messages…"
-                    } else {
-                        "Load earlier messages"
-                    }),
-            );
+            let loading = self.loading_messages.contains_key(&self.active);
+            rows = rows.child(self.load_earlier_element(cursor, loading, cx));
         }
-        let sticky = self.sticky_user_row().map(|row| {
+        let sticky = self.sticky_user_row(window).map(|row| {
             div()
                 .absolute()
                 .top_0()
@@ -3816,22 +4082,101 @@ impl Client {
                 .child(row.body.clone())
                 .into_any_element()
         });
-        if let Some(transcript) = self.transcript.get(&self.active) {
-            for (index, row) in transcript.iter().enumerate() {
-                rows = rows.child(self.message(row, index, cx));
+        let has_load = self
+            .conversations
+            .get(&self.active)
+            .is_some_and(|conversation| conversation.next_cursor.is_some());
+        let width = window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        let stamp = RowLayoutStamp {
+            width,
+            dark: self.dark,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: self
+                .conversations
+                .get(&self.active)
+                .map_or(0, Conversation::cache_epoch),
+        };
+        let layout = self.transcript.get(&self.active).and_then(|transcript| {
+            self.row_heights.get(&self.active).and_then(|cache| {
+                let cache = cache.borrow();
+                (cache.stamp == Some(stamp)).then(|| {
+                    let load_current = !has_load
+                        || cache.load_height.map(|(loading, _)| loading)
+                            == Some(self.loading_messages.contains_key(&self.active));
+                    // Freeze which slots had exact heights at render time.
+                    // The probe records misses during request_layout, before
+                    // virtual prepaint. Reading the live cache in the renderer
+                    // would paint freshly measured content into *old* sizes.
+                    let mut ready = Vec::with_capacity(transcript.len() + usize::from(has_load));
+                    if has_load {
+                        ready.push(load_current);
+                    }
+                    ready.extend(transcript.iter().map(|row| cache.height(row).is_some()));
+                    let sizes = if ready.iter().all(|ready| *ready) {
+                        cache.sizes(transcript, has_load, width)
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| cache.provisional_sizes(transcript, has_load, width));
+                    (sizes, ready)
+                })
+            })
+        });
+        let content: AnyElement = if let Some((sizes, ready)) = layout {
+            let session = self.active.clone();
+            v_virtual_list(
+                cx.entity(),
+                "transcript",
+                sizes,
+                move |client, range, _, cx| {
+                    let Some(transcript) = client.transcript.get(&session) else {
+                        return Vec::new();
+                    };
+                    let has_load = client
+                        .conversations
+                        .get(&session)
+                        .is_some_and(|conversation| conversation.next_cursor.is_some());
+                    range
+                        .map(|index| {
+                            if !ready[index] {
+                                div().into_any_element()
+                            } else if has_load && index == 0 {
+                                let loading = client.loading_messages.contains_key(&session);
+                                let cursor =
+                                    client.conversations[&session].next_cursor.clone().unwrap();
+                                client.load_earlier_element(cursor, loading, cx)
+                            } else {
+                                let row_index = index - usize::from(has_load);
+                                client.message(&transcript[row_index], row_index, cx)
+                            }
+                        })
+                        .collect()
+                },
+            )
+            .track_scroll(&self.scroll)
+            .pr(px(TRANSCRIPT_SCROLLBAR_GUTTER))
+            .into_any_element()
+        } else {
+            // A first layout or width/style change has no usable measurements.
+            // Natural rows avoid guessing their geometry while the probe runs.
+            if let Some(transcript) = self.transcript.get(&self.active) {
+                for (index, row) in transcript.iter().enumerate() {
+                    rows = rows.child(self.message(row, index, cx));
+                }
             }
-        }
+            rows.into_any_element()
+        };
         div()
             .flex_1()
             .min_h_0()
             .relative()
-            .child(rows)
+            .child(content)
             .when_some(sticky, |view, sticky| view.child(sticky))
             .vertical_scrollbar(&self.scroll)
             .into_any_element()
     }
 
-    fn sticky_user_row(&self) -> Option<&TranscriptRow> {
+    fn sticky_user_row(&self, window: &Window) -> Option<&TranscriptRow> {
         if self.scroll.offset().y >= px(-1.) {
             return None;
         }
@@ -3844,14 +4189,38 @@ impl Client {
                 .get(&self.active)
                 .is_some_and(|conversation| conversation.next_cursor.is_some()),
         );
+        let measured = self
+            .row_heights
+            .get(&self.active)
+            .map(|cache| cache.borrow());
+        let measured = measured.as_ref().filter(|cache| {
+            cache.stamp.is_some_and(|stamp| {
+                stamp.dark == self.dark
+                    && stamp.style_revision == TRANSCRIPT_ROW_STYLE_REVISION
+                    && stamp.width
+                        == window.viewport_size().width
+                            - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER)
+                    && stamp.epoch
+                        == self
+                            .conversations
+                            .get(&self.active)
+                            .map_or(0, Conversation::cache_epoch)
+            })
+        });
+        let positions =
+            measured.map(|cache| cache.provisional_positions(transcript, first_child != 0));
         let users = transcript.iter().enumerate().filter_map(|(index, row)| {
             if row.role.label() != "YOU" {
                 return None;
             }
-            let bounds = self.scroll.bounds_for_item(index + first_child)?;
-            // GPUI keeps child bounds in unscrolled content coordinates.
-            let row_top = bounds.origin.y + self.scroll.offset().y;
-            Some((index, row_top, row_top + bounds.size.height))
+            if let (Some(cache), Some(positions)) = (measured, &positions) {
+                let row_top = top + self.scroll.offset().y + positions[index];
+                Some((index, row_top, row_top + cache.height(row)?))
+            } else {
+                let bounds = self.scroll.bounds_for_item(index + first_child)?;
+                let row_top = bounds.origin.y + self.scroll.offset().y;
+                Some((index, row_top, row_top + bounds.size.height))
+            }
         });
         sticky_user_index(users, top, bottom).and_then(|index| transcript.get(index))
     }
@@ -5272,14 +5641,6 @@ impl Render for Client {
                 .entry(id.clone())
                 .or_insert_with(|| std::array::from_fn(|_| cx.focus_handle().tab_stop(true)));
         }
-        if let Some((old_offset, old_max)) = self.preserve_scroll.take() {
-            let scroll = self.scroll.clone();
-            window.on_next_frame(move |window, _| {
-                let new_max = scroll.max_offset();
-                scroll.set_offset(point(old_offset.x, old_offset.y - (new_max.y - old_max.y)));
-                window.refresh();
-            });
-        }
         let mut deferred = Vec::new();
         for (id, text, attachments) in std::mem::take(&mut self.clear_accepted_drafts) {
             if self.active == id {
@@ -5297,6 +5658,9 @@ impl Render for Client {
         }
         self.clear_accepted_drafts = deferred;
         let row_probe = self.row_measurement_probe(window, cx);
+        if row_probe.is_none() {
+            self.correct_scroll(window);
+        }
         let permission_visible = self.modal.is_none() && self.visible_permission().is_some();
         if permission_visible && !self.permission_presented {
             self.permission_presented = true;
@@ -5376,7 +5740,7 @@ impl Render for Client {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(self.chat(cx))
+                            .child(self.chat(window, cx))
                             .when_some(self.overlay.as_ref(), |view, overlay| {
                                 view.child(overlay.clone())
                             })
@@ -5430,10 +5794,10 @@ mod tests {
 
     use super::{
         Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
-        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, filter_levels,
-        filter_models, filter_new_session_projects, filter_tab_sessions, fuzzy_score, inline_image,
-        markdown_blocks, model, new_session_choice, picker_list_height, reorder_tab_ids,
-        sticky_user_index, tab_indicator, tab_number_key,
+        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, VirtualListScrollHandle,
+        filter_levels, filter_models, filter_new_session_projects, filter_tab_sessions,
+        fuzzy_score, inline_image, markdown_blocks, model, new_session_choice, picker_list_height,
+        reorder_tab_ids, sticky_user_index, tab_indicator, tab_number_key,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -5543,6 +5907,515 @@ mod tests {
         }
         let mut other_session = RowHeightCache::default();
         assert_eq!(other_session.missing(stamp, &[old]), vec![0]);
+    }
+
+    #[gpui_kit::test]
+    fn first_measured_virtual_frame_pins_to_the_actual_tail(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                assert_eq!(
+                    client.follow_bottom.as_ref().map(|(id, _)| id),
+                    Some(&client.active)
+                );
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..100)
+                        .map(|index| cache_row(&format!("initial_{index}"), "Transcript text"))
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            client.read(cx).rendered_rows.borrow_mut().clear();
+            window.render_frame(cx);
+            let state = client.read(cx);
+            assert!(state.scroll.offset().y < px(0.));
+            assert!(state.rendered_rows.borrow().contains(&99));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn measured_virtual_list_only_renders_visible_rows_and_uses_exact_control_height(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let rows: Vec<_> = (0..300)
+                    .map(|index| {
+                        let mut row = cache_row(
+                            &format!("long_{index}"),
+                            "A transcript line with enough words to render.",
+                        );
+                        if matches!(index, 50 | 170 | 260) {
+                            row.role = model::Role::User;
+                            row.body = format!("Prompt {index}");
+                        }
+                        row
+                    })
+                    .collect();
+                client.transcript.insert(client.active.clone(), rows);
+                client.row_heights.remove(&client.active);
+                client
+                    .conversations
+                    .get_mut(&client.active)
+                    .unwrap()
+                    .next_cursor = Some("older".into());
+                client.scroll = VirtualListScrollHandle::new();
+                client
+                    .virtual_scrolls
+                    .insert(client.active.clone(), client.scroll.clone());
+                client.follow_bottom = None;
+                cx.notify();
+            });
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.simulate_next_frame(cx);
+            })
+            .expect("headless window stays open");
+        };
+        render(cx); // natural-height fallback and detached measurements
+        cx.update_window(handle, |_, window, cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            assert_eq!(cache.layouts, 300);
+            assert_eq!(
+                cache.load_height.unwrap().1,
+                window.find("load-earlier").bounds().size.height
+            );
+        })
+        .expect("headless window stays open");
+        render(cx); // first virtual frame
+        cx.update(|cx| client.read(cx).rendered_rows.borrow_mut().clear());
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            let rendered = client.rendered_rows.borrow();
+            assert!(
+                rendered.len() < 30,
+                "only a viewport plus the measuring item: {rendered:?}"
+            );
+            assert!(rendered.iter().all(|index| *index < 30));
+            drop(rendered);
+            client.rendered_rows.borrow_mut().clear();
+            let rows = &client.transcript[&client.active];
+            let top = client.row_heights[&client.active]
+                .borrow()
+                .prefix(rows, 185, true)
+                .unwrap();
+            client.scroll.set_offset(point(px(0.), -(top + px(5.))));
+        });
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            let rendered = client.rendered_rows.borrow();
+            assert!(
+                rendered.iter().any(|index| *index > 170),
+                "scroll reaches offscreen rows: {rendered:?}"
+            );
+            assert!(
+                rendered
+                    .iter()
+                    .rev()
+                    .take(30)
+                    .all(|index| *index == 0 || *index > 170)
+            );
+        });
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(
+                client
+                    .read(cx)
+                    .sticky_user_row(window)
+                    .unwrap()
+                    .key
+                    .message_id,
+                "long_170"
+            );
+        })
+        .unwrap();
+        let anchor = cx.update(|cx| {
+            client
+                .read(cx)
+                .transcript_anchor()
+                .expect("visible identity")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.preserve_scroll = Some(anchor.clone());
+                client.follow_bottom = None;
+                let rows = client.transcript.get_mut(&client.active).unwrap();
+                rows.splice(
+                    0..0,
+                    [
+                        cache_row("prepended_a", "older first"),
+                        cache_row("prepended_b", "older second"),
+                    ],
+                );
+                cx.notify();
+            })
+        });
+        for _ in 0..4 {
+            render(cx);
+            cx.run_until_parked();
+        }
+        cx.update(|cx| {
+            let client = client.read(cx);
+            let rows = &client.transcript[&client.active];
+            let cache = client.row_heights[&client.active].borrow();
+            let index = rows.iter().position(|row| row.key == anchor.key).unwrap();
+            let top = cache.prefix(rows, index, true).unwrap();
+            assert_eq!(
+                client.scroll.offset().y,
+                -(top + anchor.within),
+                "prepend retains row identity and local offset"
+            );
+        });
+    }
+
+    #[test]
+    fn measured_prefix_preserves_row_identity_and_local_offset_across_prepend() {
+        let stamp = RowLayoutStamp {
+            width: px(746.),
+            dark: false,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: 1,
+        };
+        let mut cache = RowHeightCache::default();
+        let old = [
+            cache_row("a", "first"),
+            cache_row("b", "anchor"),
+            cache_row("c", "last"),
+        ];
+        cache.missing(stamp, &old);
+        for (row, height) in old.iter().zip([px(40.), px(90.), px(200.)]) {
+            cache.record(stamp, row.key.clone(), row.render_revision(), height);
+        }
+        cache.load_height = Some((false, px(35.)));
+        let old_top = cache.prefix(&old, 1, true).unwrap();
+        let within = px(23.);
+        let old_offset = -(old_top + within);
+        let earlier = cache_row("older", "earlier");
+        cache.record(
+            stamp,
+            earlier.key.clone(),
+            earlier.render_revision(),
+            px(55.),
+        );
+        let new = [earlier, old[0].clone(), old[1].clone(), old[2].clone()];
+        let index = new.iter().position(|row| row.key == old[1].key).unwrap();
+        let new_top = cache.prefix(&new, index, true).unwrap();
+        let new_offset = -(new_top + within);
+        assert_eq!(new_offset - old_offset, px(-55.));
+        assert_eq!(new_top + new_offset, old_top + old_offset);
+        assert_eq!(cache.provisional_positions(&new, true)[index], new_top);
+    }
+
+    #[gpui_kit::test]
+    fn long_stream_remeasures_one_row_without_remounting_history(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..300)
+                        .map(|i| {
+                            let mut row = cache_row(&format!("history_{i}"), "previous message");
+                            if i == 170 {
+                                row.role = model::Role::User;
+                            }
+                            row
+                        })
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            });
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+        };
+        render(cx);
+        render(cx);
+        for token in 1..=12 {
+            cx.update(|cx| {
+                client.update(cx, |client, cx| {
+                    let tail = client
+                        .transcript
+                        .get_mut(&client.active)
+                        .unwrap()
+                        .last_mut()
+                        .unwrap();
+                    tail.body
+                        .push_str(" More streamed Markdown with wrapping words.");
+                    tail.render_revision += 1;
+                    client.rendered_rows.borrow_mut().clear();
+                    cx.notify();
+                });
+            });
+            render(cx);
+            cx.update(|cx| {
+                let client = client.read(cx);
+                let rendered = client.rendered_rows.borrow();
+                assert!(
+                    rendered.len() < 50,
+                    "token {token} mounted history: {rendered:?}"
+                );
+                assert!(
+                    rendered.iter().all(|index| *index == 0 || *index > 280),
+                    "only near-tail rows were requested"
+                );
+                assert_eq!(
+                    client.row_heights[&client.active].borrow().layouts,
+                    300 + token
+                );
+            });
+            cx.update_window(handle, |_, window, cx| {
+                assert_eq!(
+                    client
+                        .read(cx)
+                        .sticky_user_row(window)
+                        .unwrap()
+                        .key
+                        .message_id,
+                    "history_170",
+                    "the offscreen sticky prompt persists during tail remeasurement"
+                );
+            })
+            .unwrap();
+            render(cx);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn stream_follows_true_bottom_of_tall_tail_but_preserves_scrolled_up_position(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let mut rows: Vec<_> = (0..30)
+                    .map(|i| cache_row(&format!("stream_{i}"), "short row"))
+                    .collect();
+                rows.push(cache_row(
+                    "tail",
+                    &"A wrapped paragraph with words.\n\n".repeat(90),
+                ));
+                client.transcript.insert(client.active.clone(), rows);
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            })
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+        };
+        render(cx);
+        render(cx);
+        cx.update(|cx| client.read(cx).scroll.base_handle().scroll_to_bottom());
+        render(cx);
+        render(cx);
+        cx.update(|cx| {
+            let client = client.read(cx);
+            assert!(client.scroll.max_offset().y > px(500.));
+            assert_eq!(client.scroll.offset().y, -client.scroll.max_offset().y);
+            assert!(
+                client.row_heights[&client.active]
+                    .borrow()
+                    .height(client.transcript[&client.active].last().unwrap())
+                    .unwrap()
+                    > client.scroll.bounds().size.height
+            );
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let id = client.active.clone();
+                client.prepare_follow_bottom(&id);
+                let tail = client.transcript.get_mut(&id).unwrap().last_mut().unwrap();
+                tail.body
+                    .push_str(&"\n\nMore wrapped words in a paragraph.".repeat(35));
+                tail.render_revision += 1;
+                assert!(client.follow_bottom.is_some());
+                cx.notify();
+            })
+        });
+        // One provisional frame measures the changed tail. The corrected
+        // frame must render the tail itself, not merely update scroll state
+        // after an old visible range has already been painted.
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update(|cx| client.read(cx).rendered_rows.borrow_mut().clear());
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update(|cx| {
+            let client = client.read(cx);
+            assert!(
+                client.rendered_rows.borrow().contains(&30),
+                "the corrected frame must actually render the tall tail"
+            );
+            assert_eq!(client.scroll.offset().y, -client.scroll.max_offset().y);
+        });
+        cx.update(|cx| {
+            let client = client.read(cx);
+            assert_eq!(
+                client.scroll.offset().y,
+                -client.scroll.max_offset().y,
+                "stream follows the real bottom, not just the last item's top"
+            );
+        });
+        cx.update(|cx| client.read(cx).scroll.set_offset(point(px(0.), px(-120.))));
+        render(cx);
+        let parked = cx.update(|cx| client.read(cx).scroll.offset());
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let id = client.active.clone();
+                client.prepare_follow_bottom(&id);
+                assert!(client.follow_bottom.is_none());
+                let tail = client.transcript.get_mut(&id).unwrap().last_mut().unwrap();
+                tail.body.push_str(" more");
+                tail.render_revision += 1;
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            render(cx);
+            cx.run_until_parked();
+        }
+        cx.update(|cx| assert_eq!(client.read(cx).scroll.offset(), parked));
+    }
+
+    #[gpui_kit::test]
+    fn tab_switch_retains_previous_scroll_after_prepend_correction(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..80)
+                        .map(|i| cache_row(&format!("tab_{i}"), "same row text"))
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| client.read(cx).scroll.set_offset(point(px(0.), px(-550.))));
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        let (old_session, old_handle) = cx.update(|cx| {
+            let client = client.read(cx);
+            (client.active.clone(), client.scroll.clone())
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let anchor = client.transcript_anchor().unwrap();
+                let first = &client.transcript[&client.active][0];
+                let cache = client.row_heights[&client.active].clone();
+                let stamp = cache.borrow().stamp.unwrap();
+                let height = cache.borrow().height(first).unwrap();
+                let added = cache_row("new_before_tab_switch", "same row text");
+                cache.borrow_mut().record(
+                    stamp,
+                    added.key.clone(),
+                    added.render_revision(),
+                    height,
+                );
+                client
+                    .transcript
+                    .get_mut(&client.active)
+                    .unwrap()
+                    .insert(0, added);
+                client.preserve_scroll = Some(anchor);
+                cx.notify();
+            })
+        });
+        // Correction runs before range selection, not in a delayed callback.
+        // Switching tabs must retain the old handle's resolved offset.
+        let retained_offset = cx.update(|cx| client.read(cx).scroll.offset());
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.select_session("ses_other".into());
+                cx.notify();
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.simulate_next_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(client.read(cx).active, "ses_other");
+            assert_eq!(
+                old_handle.offset(),
+                retained_offset,
+                "switching cannot move the old tab"
+            );
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.select_session(old_session.clone());
+                cx.notify();
+            })
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        assert_eq!(
+            old_handle.offset(),
+            retained_offset,
+            "returning to a tab retains its scroll offset"
+        );
     }
 
     #[gpui_kit::test]
