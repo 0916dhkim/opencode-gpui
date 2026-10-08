@@ -123,6 +123,11 @@ fi
 if [[ "$CLIENT" == gtk && "$case_name" == main && "${SCROLL_BOTTOM:-0}" == 1 ]]; then
   xdotool mousemove 710 350 click --repeat 30 --delay 20 5
 fi
+if [[ "$CLIENT" == gpui && "$case_name" == main && -z "${INTERACTION:-}" && "${PREVIEW_API:-0}" != 1 ]]; then
+  # GTK's reference main screenshot has an empty, focused composer. Match its
+  # input state instead of misreporting GPUI's unfocused placeholder as a UI gap.
+  xdotool mousemove --window "$win" 410 680 click 1
+fi
 if [[ "$CLIENT" == gpui && ( "${INTERACTION:-}" == send || "${INTERACTION:-}" == type ) ]]; then
   xdotool mousemove --window "$win" 410 680 click 1
   sleep 0.2
