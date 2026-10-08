@@ -1236,7 +1236,7 @@ impl Client {
                 let placeholder = match modal {
                     Modal::Model => "Search models (fuzzy)…",
                     Modal::Level => "Search levels (fuzzy)…",
-                    Modal::Sessions => "Search tabs…",
+                    Modal::Sessions => "Search tabs...",
                     Modal::NewSession => "Search projects…",
                     _ => "Search…",
                 };
@@ -2448,7 +2448,7 @@ impl Client {
                 InputState::new(window, cx).placeholder(match modal {
                     Some(Modal::Model) => "Search models (fuzzy)…",
                     Some(Modal::Level) => "Search levels (fuzzy)…",
-                    Some(Modal::Sessions) => "Search tabs…",
+                    Some(Modal::Sessions) => "Search tabs...",
                     Some(Modal::NewSession) => "Search projects…",
                     _ => "Search…",
                 })
@@ -3989,7 +3989,14 @@ impl Client {
                             ))
                             .flex()
                             .items_center()
-                            .when(sessions, |view| view.child("⌕"))
+                            .when(sessions, |view| {
+                                view.child(
+                                    Icon::default()
+                                        .data(include_bytes!("icons/search.svg"))
+                                        .with_size(px(16.))
+                                        .text_color(self.tone(0x8b918e, 0x71717a)),
+                                )
+                            })
                             .child(Input::new(&self.search).appearance(false)),
                     );
                 if sessions {
