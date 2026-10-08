@@ -152,6 +152,14 @@ fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == middle-close ]]; then
   xdotool mousemove --window "$win" 110 148 click 2
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == drag-reorder ]]; then
+  xdotool mousemove --window "$win" 105 110 mousedown 1
+  xdotool mousemove --window "$win" 105 135
+  xdotool mousemove --window "$win" 105 185
+  sleep 0.4
+  import -window "$win" "${OUTPUT%.png}-cue.png"
+  xdotool mouseup 1
+fi
 if [[ "${INTERACTION:-}" == permission || "${INTERACTION:-}" == permission-deny || "${INTERACTION:-}" == permission-once || "${INTERACTION:-}" == permission-tab-deny ]]; then
   if [[ "$CLIENT" == gpui ]]; then
     if [[ "${INTERACTION:-}" == permission-tab-deny ]]; then xdotool mousemove --window "$win" 410 680 click 1; fi

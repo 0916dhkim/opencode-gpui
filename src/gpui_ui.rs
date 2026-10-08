@@ -46,6 +46,51 @@ fn tab_number_key(key: &str) -> Option<usize> {
     }
 }
 
+#[derive(Clone)]
+struct TabDrag(String);
+
+struct TabDragPreview {
+    title: String,
+    dark: bool,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(34.))
+            .min_w(px(180.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .bg(rgb(if self.dark { 0x22262a } else { 0xe3e0da }))
+            .text_color(rgb(if self.dark { 0xe8e5df } else { 0x555b5c }))
+            .child(self.title.clone())
+    }
+}
+
+/// Insert relative to the target's midpoint, accounting for removal of the source.
+fn reorder_tab_ids(tabs: &mut Vec<String>, source: &str, target: &str, after: bool) -> bool {
+    if source == target || !tabs.iter().any(|id| id == target) {
+        return false;
+    }
+    let Some(source_index) = tabs.iter().position(|id| id == source) else {
+        return false;
+    };
+    let moved = tabs.remove(source_index);
+    let target_index = tabs
+        .iter()
+        .position(|id| id == target)
+        .expect("target checked");
+    let destination = target_index + usize::from(after);
+    if destination == source_index {
+        tabs.insert(source_index, moved);
+        return false;
+    }
+    tabs.insert(destination, moved);
+    true
+}
+
 struct Client {
     dark: bool,
     api: Option<ApiHandle>,
@@ -74,6 +119,7 @@ struct Client {
     open_tabs: Vec<String>,
     tab_focus: HashMap<String, [FocusHandle; 3]>,
     tab_shortcut_hint: bool,
+    tab_drop_target: Option<(String, bool)>,
     bootstrapped: bool,
     projects: Vec<Project>,
     active: String,
@@ -580,6 +626,7 @@ impl Client {
             open_tabs: Vec::new(),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
+            tab_drop_target: None,
             bootstrapped: false,
             projects: Vec::new(),
             active: String::new(),
@@ -771,9 +818,6 @@ impl Client {
     }
 
     fn persist_tabs(&mut self) {
-        if self.api.is_none() || self.preview_api {
-            return;
-        }
         let key = self
             .settings
             .current
@@ -793,9 +837,26 @@ impl Client {
             .collect();
         server.active = (!self.active.is_empty()).then(|| self.active.clone());
         server.unread = self.unread.clone();
+        if self.api.is_none() || self.preview_api {
+            return;
+        }
         if let Err(error) = self.settings.persisted.save(&persist::default_path()) {
             self.connection_status = format!("State save failed: {error}");
         }
+    }
+
+    fn drop_tab(&mut self, source: &str, target: &str, cx: &mut Context<Self>) {
+        let Some((destination, after)) = self.tab_drop_target.take() else {
+            return;
+        };
+        if self.tab_shortcut_hint || destination != target {
+            cx.notify();
+            return;
+        }
+        if reorder_tab_ids(&mut self.open_tabs, source, target, after) {
+            self.persist_tabs();
+        }
+        cx.notify();
     }
 
     fn update_tab_status(&mut self, id: String, status: RunStatus) {
@@ -811,6 +872,7 @@ impl Client {
     }
 
     fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.tab_drop_target = None;
         let index = self.open_tabs.iter().position(|tab| tab == id);
         self.open_tabs.retain(|tab| tab != id);
         self.tab_focus.remove(id);
@@ -1091,6 +1153,7 @@ impl Client {
             .get(&key)
             .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
             .unwrap_or_default();
+        self.tab_drop_target = None;
         self.bootstrapped = false;
         self.bootstrap_in_flight = false;
         self.bootstrap_after_load = false;
@@ -2321,6 +2384,7 @@ impl Client {
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
+            tab_drop_target: None,
             bootstrapped: true,
             projects,
             active,
@@ -2493,6 +2557,15 @@ impl Client {
         let close_id = id.clone();
         let close_key_id = id.clone();
         let activate_id = id.clone();
+        let drop_id = id.clone();
+        let motion_id = id.clone();
+        let drag_title = title.clone();
+        let dark = self.dark;
+        let drop_cue = self
+            .tab_drop_target
+            .as_ref()
+            .filter(|(target, _)| target == &session.id)
+            .map(|(_, after)| *after);
         let indicator = if self.tab_shortcut_hint && index < 9 {
             (index + 1).to_string()
         } else if has_jobs || busy {
@@ -2529,6 +2602,29 @@ impl Client {
                 self.tone(0xf4f1eb, 0x0d0f11)
             })
             .cursor_pointer()
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                    let bounds = event.bounds;
+                    if !bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    let destination = if !this.tab_shortcut_hint && event.drag(cx).0 != motion_id {
+                        Some((
+                            motion_id.clone(),
+                            event.event.position.y >= bounds.origin.y + bounds.size.height / 2.,
+                        ))
+                    } else {
+                        None
+                    };
+                    if this.tab_drop_target != destination {
+                        this.tab_drop_target = destination;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                this.drop_tab(&drag.0, &drop_id, cx);
+            }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_session(id.clone());
                 this.focus_selected_composer(window, cx);
@@ -2553,24 +2649,43 @@ impl Client {
                         .bg(self.tone(0xc8c3ba, 0x2b3034)),
                 )
             })
-            .child(div().text_color(rgb(dot_color)).child(indicator))
             .child(
                 div()
+                    .id(format!("drag-tab-{}", session.id))
+                    .test_support()
+                    .flex()
                     .flex_1()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_color(if unread || busy {
-                        rgb(dot_color)
-                    } else {
-                        self.tone(0x555b5c, 0xe8e5df)
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(7.))
+                    .when(!self.tab_shortcut_hint, |handle| {
+                        handle.on_drag(TabDrag(session.id.clone()), move |_, _, _, cx| {
+                            cx.new(|_| TabDragPreview {
+                                title: drag_title.clone(),
+                                dark,
+                            })
+                        })
                     })
-                    .font_weight(if unread || busy {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .child(title),
+                    .child(div().text_color(rgb(dot_color)).child(indicator))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(if unread || busy {
+                                rgb(dot_color)
+                            } else {
+                                self.tone(0x555b5c, 0xe8e5df)
+                            })
+                            .font_weight(if unread || busy {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(title),
+                    ),
             )
             .child(
                 div()
@@ -2628,11 +2743,42 @@ impl Client {
                     }))
                     .child("×"),
             )
+            .when_some(drop_cue, |tab, after| {
+                tab.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .when(after, |cue| cue.bottom_0())
+                        .when(!after, |cue| cue.top_0())
+                        .h(px(2.))
+                        .bg(self.tone(0xa46910, 0xe5b567)),
+                )
+            })
             .into_any_element()
     }
 
     fn sidebar(&self, cx: &Context<Self>) -> AnyElement {
-        let mut tabs = div().flex().flex_col().p(px(8.)).gap(px(5.));
+        let mut tabs = div()
+            .flex()
+            .flex_col()
+            .p(px(8.))
+            .gap(px(5.))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                if !event.bounds.contains(&event.event.position)
+                    && this.tab_drop_target.take().is_some()
+                {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.tab_drop_target.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            );
         let mut previous_inactive = false;
         for (index, id) in self.open_tabs.iter().enumerate() {
             if let Some(session) = self.sessions.iter().find(|session| &session.id == id) {
@@ -4770,11 +4916,11 @@ pub fn run(args: Args) {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use super::{
-        Client, MarkdownBlock, Modal, inline_image, markdown_blocks, model, sticky_user_index,
-        tab_number_key,
+        Client, MarkdownBlock, Modal, inline_image, markdown_blocks, model, reorder_tab_ids,
+        sticky_user_index, tab_number_key,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -4782,6 +4928,7 @@ mod tests {
         px, size,
     };
     use opencode_gpui::model::RunStatus;
+    use opencode_gpui::persist::PersistedState;
 
     #[gpui_kit::test]
     fn detached_row_layout_matches_mounted_bounds_at_two_widths(cx: &mut TestAppContext) {
@@ -5012,6 +5159,162 @@ mod tests {
         assert_eq!(tab_number_key("0"), None);
         assert_eq!(tab_number_key("10"), None);
         assert_eq!(tab_number_key("x"), None);
+    }
+
+    #[test]
+    fn tab_reorder_inserts_before_or_after_without_losing_tabs() {
+        let mut tabs = vec!["a".into(), "b".into(), "c".into()];
+        assert!(reorder_tab_ids(&mut tabs, "a", "c", true));
+        assert_eq!(tabs, ["b", "c", "a"]);
+        assert!(reorder_tab_ids(&mut tabs, "a", "b", false));
+        assert_eq!(tabs, ["a", "b", "c"]);
+        assert!(!reorder_tab_ids(&mut tabs, "a", "b", false));
+        assert!(!reorder_tab_ids(&mut tabs, "missing", "b", true));
+        assert!(!reorder_tab_ids(&mut tabs, "a", "missing", true));
+        assert_eq!(tabs, ["a", "b", "c"]);
+    }
+
+    #[gpui_kit::test]
+    fn dragging_session_tabs_keeps_drafts_and_persists_order(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        let original = cx.update(|cx| client.read(cx).open_tabs.clone());
+        assert!(original.len() >= 2);
+        let first = &original[0];
+        let second = &original[1];
+        let mut reordered = original.clone();
+        reordered.swap(0, 1);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let composer = client.read(cx).composer.clone();
+            composer.update(cx, |input, cx| {
+                input.set_value("Unsent first draft", window, cx)
+            });
+            client.update(cx, |client, cx| {
+                client.select_session(second.clone());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let composer = client.read(cx).composer.clone();
+            composer.update(cx, |input, cx| {
+                input.set_value("Unsent second draft", window, cx)
+            });
+            client.update(cx, |client, cx| {
+                client.select_session(first.clone());
+                client
+                    .attachment_drafts
+                    .insert(first.clone(), vec!["first.txt".into()]);
+                client
+                    .attachment_drafts
+                    .insert(second.clone(), vec!["second.txt".into()]);
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.drag_to(format!("drag-tab-{first}"), format!("tab-{second}"), cx);
+            assert_eq!(client.read(cx).open_tabs, reordered);
+            assert_eq!(client.read(cx).active, *first);
+            assert_eq!(
+                client.read(cx).composer.read(cx).value().as_ref(),
+                "Unsent first draft"
+            );
+            assert_eq!(
+                client.read(cx).composers[second].read(cx).value().as_ref(),
+                "Unsent second draft"
+            );
+            assert_eq!(
+                client.read(cx).attachment_drafts.get(first).unwrap(),
+                &vec![PathBuf::from("first.txt")]
+            );
+            assert_eq!(
+                client.read(cx).attachment_drafts.get(second).unwrap(),
+                &vec![PathBuf::from("second.txt")]
+            );
+        })
+        .unwrap();
+
+        // The same snapshot used by the real state writer round-trips in tab order.
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.json");
+        cx.update(|cx| {
+            let saved = &client.read(cx).settings.persisted;
+            saved.save(&path).unwrap();
+            let (restored, warning) = PersistedState::load(&path).unwrap();
+            assert!(warning.is_none());
+            let server = restored.servers.get("http://127.0.0.1:4096").unwrap();
+            assert_eq!(
+                server
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.id.as_str())
+                    .collect::<Vec<_>>(),
+                reordered.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+            assert_eq!(server.active.as_deref(), Some(first.as_str()));
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let from = window.find(format!("drag-tab-{first}")).bounds().center();
+            let first_row = window.find(format!("tab-{second}")).bounds();
+            window.drag(from, first_row.origin + point(px(30.), px(6.)), cx);
+            assert_eq!(client.read(cx).open_tabs, original);
+            window.render_frame(cx);
+            window.drag_to(format!("rename-{second}"), format!("tab-{first}"), cx);
+            window.drag_to(format!("close-{second}"), format!("tab-{first}"), cx);
+            assert_eq!(client.read(cx).open_tabs, original);
+            assert_eq!(client.read(cx).active, *first);
+            assert!(client.read(cx).modal.is_none());
+            client.update(cx, |client, cx| {
+                client.tab_shortcut_hint = true;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.drag_to(format!("drag-tab-{first}"), format!("tab-{second}"), cx);
+            assert_eq!(client.read(cx).open_tabs, original);
+            client.update(cx, |client, cx| {
+                client.tab_shortcut_hint = false;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.drag_to(format!("drag-tab-{first}"), format!("tab-{second}"), cx);
+            assert_eq!(client.read(cx).open_tabs, reordered);
+            window.render_frame(cx);
+            window.click(format!("close-{second}"), cx);
+            client.update(cx, |client, cx| {
+                client.select_session(second.clone());
+                cx.notify();
+            });
+            let mut reopened = original.clone();
+            reopened.remove(1);
+            reopened.push(second.clone());
+            assert_eq!(client.read(cx).open_tabs, reopened);
+            assert_eq!(client.read(cx).active, *second);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            client.read(cx).settings.persisted.save(&path).unwrap();
+            let (restored, _) = PersistedState::load(&path).unwrap();
+            let server = restored.servers.get("http://127.0.0.1:4096").unwrap();
+            assert_eq!(
+                server
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.id.as_str())
+                    .collect::<Vec<_>>(),
+                client
+                    .read(cx)
+                    .open_tabs
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(server.active.as_deref(), Some(second.as_str()));
+        });
     }
 
     #[gpui_kit::test]
