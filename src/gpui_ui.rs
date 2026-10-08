@@ -46,7 +46,10 @@ struct Client {
     attachments: HashMap<(String, usize, usize), Arc<Image>>,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
+    composer_session: String,
+    composers: HashMap<String, Entity<TextareaState>>,
     attachments_draft: Vec<PathBuf>,
+    attachment_drafts: HashMap<String, Vec<PathBuf>>,
     overlay: Option<String>,
     scroll: ScrollHandle,
     unread: HashSet<String>,
@@ -59,9 +62,9 @@ struct Client {
     next_prompt_request_id: u64,
     next_session_request_id: u64,
     next_model_request_id: u64,
-    pending_prompt: Option<(u64, String, String, Vec<PathBuf>)>,
+    pending_prompts: HashMap<String, (u64, String, Vec<PathBuf>)>,
     tray_in_flight: HashSet<String>,
-    clear_accepted_draft: Option<(String, String, Vec<PathBuf>)>,
+    clear_accepted_drafts: Vec<(String, String, Vec<PathBuf>)>,
     modal: Option<Modal>,
     picker_highlight: Option<usize>,
     search: Entity<InputState>,
@@ -414,7 +417,10 @@ impl Client {
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
+            composer_session: String::new(),
+            composers: HashMap::new(),
             attachments_draft: Vec::new(),
+            attachment_drafts: HashMap::new(),
             overlay: None,
             scroll,
             unread: HashSet::new(),
@@ -427,9 +433,9 @@ impl Client {
             next_prompt_request_id: 0,
             next_session_request_id: 0,
             next_model_request_id: 0,
-            pending_prompt: None,
+            pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
-            clear_accepted_draft: None,
+            clear_accepted_drafts: Vec::new(),
             modal: None,
             picker_highlight: None,
             search: cx.new(|cx| InputState::new(window, cx).placeholder("Search models (fuzzy)…")),
@@ -512,7 +518,16 @@ impl Client {
         if !self.open_tabs.contains(&id) {
             self.open_tabs.push(id.clone());
         }
-        self.active = id.clone();
+        if self.active != id {
+            if !self.active.is_empty() {
+                self.attachment_drafts.insert(
+                    self.active.clone(),
+                    std::mem::take(&mut self.attachments_draft),
+                );
+            }
+            self.attachments_draft = self.attachment_drafts.remove(&id).unwrap_or_default();
+            self.active = id.clone();
+        }
         self.unread.remove(&id);
         self.scroll.scroll_to_bottom();
         self.jobs = self.running_jobs.rows(Some(&id));
@@ -591,10 +606,50 @@ impl Client {
             } else {
                 self.active.clear();
                 self.jobs.clear();
+                self.attachments_draft.clear();
             }
         }
+        self.composers.remove(id);
+        self.attachment_drafts.remove(id);
+        self.pending_prompts.remove(id);
+        self.clear_accepted_drafts
+            .retain(|(session, _, _)| session != id);
         self.persist_tabs();
         cx.notify();
+    }
+
+    fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_session == self.active {
+            return;
+        }
+        if self.active.is_empty() {
+            self.composer = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(2, 8)
+                    .submit_on_enter(true)
+                    .placeholder("Ask OpenCode anything…")
+            });
+        } else if let Some(existing) = self.composers.get(&self.active) {
+            self.composer = existing.clone();
+        } else {
+            let composer = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(2, 8)
+                    .submit_on_enter(true)
+                    .placeholder("Ask OpenCode anything…")
+            });
+            cx.subscribe(&composer, |this, _, event: &InputEvent, cx| {
+                if let InputEvent::PressEnter { secondary, shift } = event
+                    && !shift
+                {
+                    this.send_prompt(*secondary, cx);
+                }
+            })
+            .detach();
+            self.composers.insert(self.active.clone(), composer.clone());
+            self.composer = composer;
+        }
+        self.composer_session = self.active.clone();
     }
 
     fn selected_model(&self) -> Option<ModelSelection> {
@@ -800,6 +855,12 @@ impl Client {
         self.bootstrapped = false;
         self.projects.clear();
         self.active.clear();
+        self.composer_session = "reset".into();
+        self.composers.clear();
+        self.attachments_draft.clear();
+        self.attachment_drafts.clear();
+        self.pending_prompts.clear();
+        self.clear_accepted_drafts.clear();
         self.transcript.clear();
         self.conversations.clear();
         self.catalogs.clear();
@@ -1241,7 +1302,8 @@ impl Client {
         let text = self.composer.read(cx).value().to_string();
         if (text.trim().is_empty() && self.attachments_draft.is_empty())
             || self.active.is_empty()
-            || self.pending_prompt.is_some()
+            || self.composer_session != self.active
+            || self.pending_prompts.contains_key(&self.active)
             || self.visible_permission().is_some()
         {
             return;
@@ -1268,12 +1330,10 @@ impl Client {
             attachments: self.attachments_draft.clone(),
             delivery,
         });
-        self.pending_prompt = Some((
-            request_id,
+        self.pending_prompts.insert(
             self.active.clone(),
-            text,
-            self.attachments_draft.clone(),
-        ));
+            (request_id, text, self.attachments_draft.clone()),
+        );
         cx.notify();
     }
 
@@ -1496,13 +1556,15 @@ impl Client {
                 result,
             } => {
                 if self
-                    .pending_prompt
-                    .as_ref()
-                    .is_some_and(|(pending, id, _, _)| *pending == request_id && *id == session_id)
-                    && let Some((_, id, text, attachments)) = self.pending_prompt.take()
+                    .pending_prompts
+                    .get(&session_id)
+                    .is_some_and(|(pending, _, _)| *pending == request_id)
+                    && let Some((_, text, attachments)) = self.pending_prompts.remove(&session_id)
                 {
                     match result {
-                        Ok(()) => self.clear_accepted_draft = Some((id, text, attachments)),
+                        Ok(()) => self
+                            .clear_accepted_drafts
+                            .push((session_id, text, attachments)),
                         Err(error) => self.connection_status = format!("Send failed: {error}"),
                     }
                 }
@@ -1593,7 +1655,7 @@ impl Client {
                         if self.active.is_empty()
                             && self.sessions.iter().any(|session| session.id == id)
                         {
-                            self.select_session(id);
+                            self.select_session(id.clone());
                         } else if id == self.active
                             && !self.sessions.iter().any(|session| session.id == id)
                         {
@@ -1604,7 +1666,19 @@ impl Client {
                             } else {
                                 self.active.clear();
                                 self.catalog = ModelCatalog::default();
+                                self.attachments_draft.clear();
                             }
+                        }
+                        if !self.sessions.iter().any(|session| session.id == id) {
+                            self.open_tabs.retain(|tab| tab != &id);
+                            self.conversations.remove(&id);
+                            self.transcript.remove(&id);
+                            self.composers.remove(&id);
+                            self.attachment_drafts.remove(&id);
+                            self.pending_prompts.remove(&id);
+                            self.clear_accepted_drafts
+                                .retain(|(session, _, _)| session != &id);
+                            self.unread.remove(&id);
                         }
                     }
                     if let Some(id) = kind.session_id()
@@ -1812,7 +1886,10 @@ impl Client {
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
+            composer_session: String::new(),
+            composers: HashMap::new(),
             attachments_draft: Vec::new(),
+            attachment_drafts: HashMap::new(),
             overlay: if modal.is_none() { overlay } else { None },
             scroll,
             unread: server.unread,
@@ -1825,9 +1902,9 @@ impl Client {
             next_prompt_request_id: 0,
             next_session_request_id: 0,
             next_model_request_id: 0,
-            pending_prompt: None,
+            pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
-            clear_accepted_draft: None,
+            clear_accepted_drafts: Vec::new(),
             modal,
             picker_highlight: None,
             search: cx.new(|cx| {
@@ -3557,17 +3634,23 @@ impl Client {
 
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some((id, text, attachments)) = self.clear_accepted_draft.take()
-            && self.active == id
-            && self.composer.read(cx).value().as_ref() == text
-        {
-            self.composer.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            if self.attachments_draft == attachments {
-                self.attachments_draft.clear();
+        self.sync_composer(window, cx);
+        let mut deferred = Vec::new();
+        for (id, text, attachments) in std::mem::take(&mut self.clear_accepted_drafts) {
+            if self.active == id {
+                if self.composer.read(cx).value().as_ref() == text {
+                    self.composer.update(cx, |input, cx| {
+                        input.set_value("", window, cx);
+                    });
+                }
+                if self.attachments_draft == attachments {
+                    self.attachments_draft.clear();
+                }
+            } else {
+                deferred.push((id, text, attachments));
             }
         }
+        self.clear_accepted_drafts = deferred;
         let composer_slot = self
             .permission_card(cx)
             .unwrap_or_else(|| self.composer(cx));

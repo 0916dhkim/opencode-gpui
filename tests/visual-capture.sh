@@ -136,6 +136,26 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == close-last-reopen ]]; then
   sleep 0.4
   xdotool mousemove --window "$win" 440 252 click 1
 fi
+if [[ "$CLIENT" == gpui && ( "${INTERACTION:-}" == draft-switch || "${INTERACTION:-}" == draft-return ) ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool type --clearmodifiers --delay 30 'SESSION_A_MARKER'
+  xdotool mousemove --window "$win" 92 187 click 1
+  sleep 0.5
+  if [[ "${INTERACTION:-}" == draft-return ]]; then
+    xdotool mousemove --window "$win" 92 110 click 1
+  fi
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == draft-return-after-send ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool type --clearmodifiers --delay 30 'SESSION_A_MARKER'
+  xdotool mousemove --window "$win" 92 187 click 1
+  sleep 0.5
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool type --clearmodifiers --delay 30 'SESSION_B_MARKER'
+  xdotool key ctrl+Return
+  sleep 1
+  xdotool mousemove --window "$win" 92 110 click 1
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == copy-code ]]; then
   xdotool mousemove --window "$win" 720 392 click 1
   sleep 0.2
