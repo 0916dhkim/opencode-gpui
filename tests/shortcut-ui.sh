@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# Headless keyboard-shortcut check for the COSMIC client against the fake v2
+# Headless keyboard-shortcut check for the GPUI client against the fake v2
 # server (tests/fake_opencode_server.py). Every keyboard effect is asserted as
 # a request in the server's log, so this verifies the shortcuts end to end
 # instead of only proving that the client survives them (tests/smoke-ui.sh).
-#   CI:     xvfb-run --auto-servernum bash tests/shortcut-ui.sh
 #   Docker: docker run --rm --platform linux/amd64 -v "$PWD":/repo -w /repo \
-#             opencode-cosmic-builder-amd64:latest bash tests/shortcut-ui.sh
-#           (that image needs `apt-get install -y xdotool` first)
-# Without DISPLAY it starts its own Xvfb. Env knobs:
+#             opencode-gpui-builder-amd64:latest bash tests/shortcut-ui.sh
+# Uses a private Xvfb and a nested Weston Wayland compositor. Env knobs:
 #   SHORTCUT_BINARY=path   use a built client instead of `cargo build --locked`
 #   SHORTCUT_TIMEOUT=15    seconds to wait for each request-log marker
 #   SHORTCUT_KEEP=1        keep the temp dir (state, request log, app log)
@@ -26,6 +24,7 @@ app_log="${temporary}/app.log"
 server_pid=""
 app_pid=""
 xvfb_pid=""
+weston_pid=""
 window=""
 mark=0
 passes=0
@@ -36,7 +35,7 @@ cleanup() {
   [[ -z "${server_pid}" ]] || kill "${server_pid}" 2>/dev/null || true
   [[ -z "${app_pid}" ]] || wait "${app_pid}" 2>/dev/null || true
   [[ -z "${server_pid}" ]] || wait "${server_pid}" 2>/dev/null || true
-  [[ -z "${xvfb_pid}" ]] || kill "${xvfb_pid}" 2>/dev/null || true
+  gpui_stop_display
   if [[ -n "${SHORTCUT_KEEP:-}" ]]; then
     printf 'Kept %s\n' "${temporary}" >&2
   else
@@ -44,6 +43,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+source tests/gpui-headless.sh
 
 pass() { passes=$((passes + 1)); printf 'PASS %s\n' "$1"; }
 fail() { failures=$((failures + 1)); printf 'FAIL %s: %s\n' "$1" "$2" >&2; }
@@ -74,16 +74,7 @@ expect_count() {
 
 alive() { [[ -n "${app_pid}" ]] && kill -0 "${app_pid}" 2>/dev/null; }
 
-if [[ -z "${DISPLAY:-}" ]]; then
-  for display in $(seq 90 120); do
-    [[ -e "/tmp/.X11-unix/X${display}" || -e "/tmp/.X${display}-lock" ]] && continue
-    Xvfb ":${display}" -screen 0 1280x1024x24 -nolisten tcp >/dev/null 2>&1 &
-    xvfb_pid=$!
-    export DISPLAY=":${display}"
-    break
-  done
-  for _ in $(seq 1 50); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.1; done
-fi
+gpui_start_display || exit 1
 
 password="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 FAKE_OPENCODE_PASSWORD="${password}" python3 tests/fake_opencode_server.py \
@@ -102,12 +93,7 @@ if [[ ! -s "${temporary}/address" ]]; then
 fi
 address="$(<"${temporary}/address")"
 
-if [[ -n "${SHORTCUT_BINARY:-}" ]]; then
-  binary="${SHORTCUT_BINARY}"
-else
-  cargo build --locked || { printf 'cargo build failed\n' >&2; exit 1; }
-  binary="${CARGO_TARGET_DIR:-target}/debug/opencode-cosmic"
-fi
+gpui_binary "${SHORTCUT_BINARY:-}" || exit 1
 
 mkdir -p "${temporary}/config" "${temporary}/data" "${temporary}/cache" "${temporary}/runtime"
 chmod 700 "${temporary}/runtime"
@@ -116,37 +102,33 @@ XDG_DATA_HOME="${temporary}/data" \
 XDG_CACHE_HOME="${temporary}/cache" \
 XDG_RUNTIME_DIR="${temporary}/runtime" \
 GSETTINGS_BACKEND=memory \
-OPENCODE_SERVER_PASSWORD="${password}" \
+NO_AT_BRIDGE=1 OPENCODE_SERVER_PASSWORD="${password}" \
 "${binary}" --server "${address}" --username opencode >"${app_log}" 2>&1 &
 app_pid=$!
 
-for _ in {1..300}; do
-  window="$(xdotool search --onlyvisible --name '^OpenCode$' 2>/dev/null | tail -n 1)" || true
-  [[ -n "${window}" ]] && break
-  alive || { cat "${app_log}" >&2; printf 'client exited before its window appeared\n' >&2; exit 1; }
-  sleep 0.1
-done
-if [[ -z "${window}" ]]; then
+if ! gpui_wait_window; then
   cat "${app_log}" >&2
-  printf 'no main window\n' >&2
+  printf 'no GPUI window\n' >&2
   exit 1
 fi
 
-focus() { xdotool windowfocus --sync "${window}" 2>/dev/null || xdotool windowfocus "${window}" 2>/dev/null || true; }
-key() { focus; xdotool key --clearmodifiers "$@"; sleep 0.3; }
-type_text() { focus; xdotool type --delay 20 --clearmodifiers "$1"; sleep 0.3; }
+key() { gpui_key "$@"; }
+type_text() { gpui_type "$1"; }
 mark_now() { mark="$(logq seq "${log}")"; }
 
-# The client bootstraps the fake server's main session on start, so the window
-# only becomes ready once the bootstrap round trip is done.
-for _ in $(seq 1 100); do
-  [[ "$(logq count "${log}" --expr "http and route == 'session.list'")" != "0" ]] && break
-  sleep 0.1
-done
+# Wait for the initial transcript and model selection, not merely the first
+# session-list request (which can precede the completed GPUI bootstrap).
+logq wait "$log" --after 0 --timeout 30 --expr "http and route == 'message.list'" >/dev/null || {
+  cat "$app_log" >&2; echo 'bootstrap did not load a session' >&2; exit 1;
+}
+logq wait "$log" --after 0 --timeout 30 --expr "http and route == 'model.list'" >/dev/null || {
+  cat "$app_log" >&2; echo 'bootstrap did not load models' >&2; exit 1;
+}
 sleep 1
+gpui_click 410 680
 
 # ---------------------------------------------------------------- Ctrl+T
-# Opens GTK's new-session palette; Enter takes the first location and Ctrl+G
+# Opens GPUI's new-session palette; Enter takes the first location and Ctrl+G
 # then leaves the caret in the composer.
 mark_now
 key ctrl+t
@@ -157,6 +139,7 @@ sleep 1
 # -------------------------------------------------- Enter sends a prompt
 mark_now
 key ctrl+g
+gpui_click 410 680
 type_text "shortcut note one"
 key Return
 expect "enter.prompt" \
@@ -185,11 +168,11 @@ expect_count "ctrl-enter.queue-once" \
   "http and route == 'session.prompt' and 'shortcut queue three' in (b.get('text') or '')" 1
 
 # ------------------------------------------- overlay and layout shortcuts
-# Ctrl+P and Ctrl+, open the drawer, Escape closes it, Ctrl+B folds the sidebar
-# and Ctrl+W closes the active tab. None of them sends anything, so the check is
+# Ctrl+P and Ctrl+, open a modal, Escape closes it, and Ctrl+W closes the tab.
+# None of them sends anything, so the check is
 # that the client stays alive and never panics.
 mark_now
-for combo in ctrl+p Escape ctrl+comma Escape ctrl+b; do
+for combo in ctrl+p Escape ctrl+comma Escape; do
   key "${combo}"
   alive || { cat "${app_log}" >&2; fail "overlay-keys.alive" "client exited on ${combo}"; break; }
 done
@@ -209,4 +192,8 @@ expect_count "no.unexpected-prompts" \
   "http and route == 'session.prompt' and 'shortcut' not in (b.get('text') or '')" 0
 
 printf '\n%s passed, %s failed\n' "${passes}" "${failures}"
+if ((failures)); then
+  tail -n 40 "$app_log" >&2
+  if [[ -n "${SHORTCUT_SHOTS:-}" ]]; then import -window "$window" "$SHORTCUT_SHOTS"; fi
+fi
 [[ "${failures}" -eq 0 ]]

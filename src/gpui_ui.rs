@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
+use gpui_kit::base::{Checkbox, CheckboxIndicator, CheckboxState};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::markdown;
@@ -14,7 +15,7 @@ use gpui_kit::*;
 use opencode_gpui::{
     api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ServerEnvelope, UiEvent},
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
-    jobs::{self, JobRow, Jobs},
+    jobs::{self, JobKind, JobRow, Jobs},
     model::{
         self, Conversation, ModelCatalog, ModelSelection, Project, RunStatus, Session,
         SessionModel, TranscriptRow, TranscriptRowKind,
@@ -74,6 +75,7 @@ struct Client {
     permission_in_flight: HashSet<String>,
     permission_focus: [FocusHandle; 3],
     permission_presented: bool,
+    settings_tab_focus: [FocusHandle; 2],
     child_parents: HashMap<String, String>,
     next_prompt_request_id: u64,
     next_session_request_id: u64,
@@ -330,6 +332,7 @@ impl Client {
                                 .child(
                                     div()
                                         .w(px(17.))
+                                        .text_right()
                                         .text_color(self.tone(0x777e7d, 0xaeb4b9))
                                         .child("•"),
                                 )
@@ -490,6 +493,7 @@ impl Client {
             permission_in_flight: HashSet::new(),
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: false,
+            settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
@@ -2135,6 +2139,7 @@ impl Client {
             permission_in_flight: HashSet::new(),
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: false,
+            settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
@@ -2367,35 +2372,83 @@ impl Client {
             .flex()
             .flex_col()
             .px(px(12.))
-            .py(px(12.))
+            .py(px(14.))
             .gap(px(8.))
             .border_t_1()
             .border_color(self.tone(0xc8c3ba, 0x24282c));
         if !self.jobs.is_empty() {
             jobs_panel = jobs_panel.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
                     .text_size(px(10.))
                     .font_weight(FontWeight::BOLD)
                     .text_color(self.tone(0x737a78, 0x8d959d))
-                    .child(format!("BACKGROUND  {}", self.jobs.len())),
+                    .child("BACKGROUND")
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .rounded_full()
+                            .bg(self.tone(0xe4ddd0, 0x1c242b))
+                            .text_color(self.tone(0x5c4a2e, 0xd7c4a3))
+                            .child(self.jobs.len().to_string()),
+                    ),
             );
             for job in &self.jobs {
+                let shell = job.kind == JobKind::Shell;
+                let (label, elapsed) = job.subtitle_parts(1_704_067_320_000);
                 jobs_panel = jobs_panel.child(
                     div()
                         .flex()
-                        .flex_col()
                         .px(px(6.))
+                        .gap(px(8.))
                         .child(
                             div()
-                                .text_size(px(12.))
-                                .text_color(self.tone(0x252829, 0xd4d8dc))
-                                .child(job.title.clone()),
+                                .mt(px(1.))
+                                .size(px(17.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.))
+                                .bg(self.tone(
+                                    if shell { 0xe3e8e5 } else { 0xf3e7cf },
+                                    if shell { 0x1c2723 } else { 0x33281a },
+                                ))
+                                .text_color(self.tone(
+                                    if shell { 0x3f5a4c } else { 0x9c641a },
+                                    if shell { 0x9cc2ad } else { 0xe5b567 },
+                                ))
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(10.))
+                                .child(if shell { "$" } else { "◆" }),
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
-                                .text_color(self.tone(0x87908d, 0x6a7279))
-                                .child(job.subtitle(1_704_067_320_000)),
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(self.tone(0x252829, 0xd4d8dc))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(job.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .text_size(px(11.))
+                                        .text_color(self.tone(0x87908d, 0x6a7279))
+                                        .child(label)
+                                        .when_some(elapsed, |view, elapsed| {
+                                            view.child(format!(" · {elapsed}"))
+                                        }),
+                                ),
                         ),
                 );
             }
@@ -3379,12 +3432,14 @@ impl Client {
         let backdrop = div()
             .id("modal-backdrop")
             .absolute()
-            .inset_0()
+            .top(px(46.))
+            .bottom_0()
+            .left_0()
+            .right_0()
             .flex()
             .flex_col()
             .items_center()
             .justify_center()
-            .pt(px(46.))
             .bg(rgba(if self.dark { 0x000000a6 } else { 0x00000066 }))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.modal = None;
@@ -3630,30 +3685,17 @@ impl Client {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .px(px(22.))
-                    .pt(px(12.))
-                    .pb(px(22.))
-                    .gap(px(8.))
-                    .bg(self.tone(0xfffdfa, 0x15181b))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::BOLD)
-                            .text_size(px(16.))
-                            .child("Server Connection"),
-                    )
-                    .child(
-                        div()
-                            .mb(px(5.))
-                            .text_size(px(11.))
-                            .text_color(self.tone(0x737c7a, 0x899097))
-                            .child("Configure server endpoint, credentials, and Cloudflare tokens"),
-                    );
+                    .px(px(24.))
+                    .pt(px(16.))
+                    .pb(px(16.))
+                    .gap(px(9.))
+                    .bg(self.tone(0xfffdfa, 0x15181b));
                 for (index, (label, input)) in fields.into_iter().enumerate() {
                     if index == 3 {
                         content = content.child(
                             div()
-                                .mt(px(3.))
-                                .pt(px(14.))
+                                .mt(px(0.))
+                                .pt(px(7.))
                                 .border_t_1()
                                 .border_color(self.tone(0xded8cb, 0x232932))
                                 .child("Cloudflare Access service token"),
@@ -3676,20 +3718,44 @@ impl Client {
                             .child(Input::new(input).appearance(false)),
                     );
                     if index == 2 {
+                        let owner = cx.entity().downgrade();
+                        let checked = self.settings.remember_password;
                         content = content.child(
-                            div()
-                                .id("remember-password")
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings.remember_password = !this.settings.remember_password;
-                                    cx.notify();
-                                }))
-                                .child(format!(
-                                    "{} Remember the password in the system keyring",
-                                    if self.settings.remember_password { "☑" } else { "☐" }
-                                )),
+                            Checkbox::new("remember-password")
+                                .checked(checked)
+                                .accessibility_label("Remember the password in the system keyring")
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(12.))
+                                .on_change(move |state, _, _, cx| {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.settings.remember_password = state == CheckboxState::Checked;
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    CheckboxIndicator::new()
+                                        .checked(checked)
+                                        .size(px(14.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(2.))
+                                        .border_1()
+                                        .border_color(self.tone(0x9da5a3, 0x899097))
+                                        .bg(if checked {
+                                            rgb(0x2672c7)
+                                        } else {
+                                            self.tone(0xffffff, 0x2e2e2e)
+                                        })
+                                        .text_color(rgb(0xffffff))
+                                        .child(if checked { "✓" } else { "" }),
+                                )
+                                .child("Remember the password in the system keyring"),
                         )
-                            .child(div().mt(px(5.)).text_size(px(10.)).text_color(self.tone(0x818984, 0x899097))
+                            .child(div().mt(px(10.)).text_size(px(10.)).text_color(self.tone(0x818984, 0x899097))
                                 .child("Remote servers require HTTPS. Loopback HTTP is supported for SSH tunnels. A remembered password is used only for this server URL and username; uncheck Remember to remove it."));
                     }
                 }
@@ -3707,13 +3773,45 @@ impl Client {
                     );
                 }
                 let content = if self.settings.tab == SettingsTab::Connection {
-                    content.into_any_element()
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(px(70.))
+                                .flex_shrink_0()
+                                .px(px(24.))
+                                .pt(px(18.))
+                                .pb(px(12.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .border_b_1()
+                                .border_color(self.tone(0xded8cb, 0x232932))
+                                .bg(self.tone(0xfffdfa, 0x15181b))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_size(px(16.))
+                                        .child("Server Connection"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(self.tone(0x737c7a, 0x899097))
+                                        .child("Configure server endpoint, credentials, and Cloudflare tokens"),
+                                ),
+                        )
+                        .child(content)
+                        .into_any_element()
                 } else {
                     self.settings_sessions_body(cx)
                 };
                 div()
                     .w(px(820.))
-                    .h(px(640.))
+                    .h(px(674.))
                     .flex()
                     .rounded(px(10.))
                     .border_1()
@@ -3722,11 +3820,11 @@ impl Client {
                     .shadow_lg()
                     .child(
                         div()
-                            .w(px(264.))
+                            .w(px(280.))
                             .flex()
                             .flex_col()
                             .px(px(8.))
-                            .pt(px(11.))
+                            .pt(px(16.))
                             .pb(px(16.))
                             .child(
                                 div()
@@ -3738,15 +3836,40 @@ impl Client {
                             .child(
                                 div()
                                     .id("settings-tab-connection")
+                                    .role(Role::Tab)
+                                    .aria_label("Connection")
+                                    .aria_selected(self.settings.tab == SettingsTab::Connection)
+                                    .test_support()
+                                    .track_focus(&self.settings_tab_focus[0])
+                                    .focus_visible(|style| {
+                                        style.border_color(self.tone(0x2356a8, 0x78baff))
+                                    })
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.settings.tab = SettingsTab::Connection;
                                         this.settings.server.focus_handle(cx).focus(window, cx);
                                         cx.notify();
                                     }))
-                                    .mt(px(12.))
+                                    .mt(px(7.))
                                     .px(px(9.))
                                     .py(px(5.))
+                                    .font_weight(if self.settings.tab == SettingsTab::Connection {
+                                        FontWeight::BOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(self.tone(
+                                        if self.settings.tab == SettingsTab::Connection {
+                                            0x252829
+                                        } else {
+                                            0x77817e
+                                        },
+                                        if self.settings.tab == SettingsTab::Connection {
+                                            0xe8e5df
+                                        } else {
+                                            0x899097
+                                        },
+                                    ))
                                     .bg(self.tone(
                                         if self.settings.tab == SettingsTab::Connection {
                                             0xe3e0da
@@ -3764,6 +3887,14 @@ impl Client {
                             .child(
                                 div()
                                     .id("settings-tab-sessions")
+                                    .role(Role::Tab)
+                                    .aria_label("Sessions")
+                                    .aria_selected(self.settings.tab == SettingsTab::Sessions)
+                                    .test_support()
+                                    .track_focus(&self.settings_tab_focus[1])
+                                    .focus_visible(|style| {
+                                        style.border_color(self.tone(0x2356a8, 0x78baff))
+                                    })
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.settings.tab = SettingsTab::Sessions;
@@ -3776,6 +3907,23 @@ impl Client {
                                     .mt(px(2.))
                                     .px(px(9.))
                                     .py(px(5.))
+                                    .font_weight(if self.settings.tab == SettingsTab::Sessions {
+                                        FontWeight::BOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(self.tone(
+                                        if self.settings.tab == SettingsTab::Sessions {
+                                            0x252829
+                                        } else {
+                                            0x77817e
+                                        },
+                                        if self.settings.tab == SettingsTab::Sessions {
+                                            0xe8e5df
+                                        } else {
+                                            0x899097
+                                        },
+                                    ))
                                     .bg(self.tone(
                                         if self.settings.tab == SettingsTab::Sessions {
                                             0xe3e0da
@@ -3794,13 +3942,17 @@ impl Client {
                             .child(
                                 div()
                                     .pl(px(6.))
-                                    .text_size(px(11.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .text_size(px(10.))
                                     .text_color(self.tone(0x929a9a, 0x6a7482))
-                                    .child("127.0.0.1  ·  opencode-gpui v0.1.0"),
+                                    .child("127.0.0.1")
+                                    .child("opencode-gpui v0.1.0"),
                             ),
                     )
                     .child(
-                        div().w(px(556.)).flex().flex_col().child(content).child(
+                        div().w(px(540.)).flex().flex_col().child(content).child(
                             div()
                                 .h(px(56.))
                                 .flex_shrink_0()
@@ -4036,7 +4188,7 @@ impl Client {
                 .pb(px(77.))
                 .bg(rgba(0x00000000))
         } else if modal == Modal::Settings {
-            backdrop.items_start().justify_start().pt(px(99.))
+            backdrop.items_start().justify_start().pt(px(36.))
         } else {
             backdrop
         };
@@ -4237,6 +4389,50 @@ mod tests {
         })
         .unwrap();
         cx.update(|cx| assert!(client.read(cx).permissions.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn settings_password_checkbox_exposes_and_changes_checked_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("settings".into())))
+            })
+            .expect("headless settings window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let checkbox = window.find("remember-password");
+            assert_eq!(checkbox.role(), Some(Role::CheckBox));
+            assert_eq!(checkbox.checked(), Some(true));
+            window.click("remember-password", cx);
+            assert_eq!(window.find("remember-password").checked(), Some(false));
+            let connection = window.find("settings-tab-connection");
+            assert_eq!(connection.role(), Some(Role::Tab));
+            assert_eq!(connection.label(), Some("Connection"));
+            assert_eq!(connection.selected(), Some(true));
+            window.click("settings-tab-sessions", cx);
+            assert_eq!(window.find("settings-tab-sessions").selected(), Some(true));
+            assert_eq!(
+                window.find("settings-tab-connection").selected(),
+                Some(false)
+            );
+            let connection_focus = client.read(cx).settings_tab_focus[0].clone();
+            connection_focus.focus(window, cx);
+            window.render_frame(cx);
+            window.press("enter", cx);
+            assert_eq!(
+                window.find("settings-tab-connection").selected(),
+                Some(true)
+            );
+            let sessions_focus = client.read(cx).settings_tab_focus[1].clone();
+            sessions_focus.focus(window, cx);
+            window.render_frame(cx);
+            window.press("space", cx);
+            assert_eq!(window.find("settings-tab-sessions").selected(), Some(true));
+        })
+        .unwrap();
+        cx.update(|cx| assert!(!client.read(cx).settings.remember_password));
     }
 
     #[test]

@@ -3,6 +3,7 @@ FROM rust:bookworm
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         cmake \
+        fonts-noto-core \
         libdbus-1-dev \
         libexpat1-dev \
         libfontconfig1-dev \

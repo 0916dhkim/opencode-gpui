@@ -2,12 +2,12 @@
 # Headless check that the OpenCode password saved in Settings lives in a real Secret Service
 # (gnome-keyring) and survives app and keyring-daemon restarts, and that the client still starts
 # and connects when no Secret Service is running. Run it only headless (never on a live desktop);
-# it needs gnome-keyring-daemon and secret-tool, which the UI test image lacks:
+# it needs gnome-keyring-daemon and secret-tool, which the builder image lacks:
 #   docker run --rm --platform linux/amd64 -v "$PWD":/app -w /app \
-#     opencode-cosmic-ui-test-amd64-v4:latest bash -c 'apt-get update -qq &&
+#     opencode-gpui-builder-amd64:latest bash -c 'apt-get update -qq &&
 #       apt-get install -y -qq --no-install-recommends gnome-keyring libsecret-tools &&
 #       bash tests/keyring-ui.sh'
-# Without DISPLAY it starts its own Xvfb; without a session bus it re-runs itself under
+# The script starts isolated Weston/Xvfb; without a session bus it re-runs under
 # dbus-run-session. KEYRING_BINARY=path skips the build; KEYRING_TIMEOUT=15 bounds each wait.
 set -uo pipefail
 
@@ -25,10 +25,11 @@ timeout_s="${KEYRING_TIMEOUT:-15}"
 temporary="$(mktemp -d)"
 log="${temporary}/requests.jsonl"
 app_log="${temporary}/app.log"
-state="${temporary}/config/opencode-cosmic/state.json"
+state="${temporary}/config/opencode-gpui/state.json"
 server_pid=""
 app_pid=""
 xvfb_pid=""
+weston_pid=""
 window=""
 mark=0
 failures=()
@@ -40,10 +41,11 @@ cleanup() {
   [[ -z "${app_pid}" ]] || wait "${app_pid}" 2>/dev/null || true
   [[ -z "${server_pid}" ]] || wait "${server_pid}" 2>/dev/null || true
   stop_keyring
-  [[ -z "${xvfb_pid}" ]] || kill "${xvfb_pid}" 2>/dev/null || true
+  gpui_stop_display
   rm -rf "${temporary}"
 }
 trap cleanup EXIT
+source tests/gpui-headless.sh
 
 logq() { python3 tests/fake_v2/logwait.py "$@"; }
 mark_now() { mark="$(logq seq "${log}")"; }
@@ -71,9 +73,8 @@ expect_none_since_mark() {
   fi
 }
 
-focus() { xdotool windowfocus --sync "${window}" 2>/dev/null || xdotool windowfocus "${window}" 2>/dev/null || true; }
-key() { focus; xdotool key --clearmodifiers "$@"; sleep 0.4; }
-type_text() { focus; xdotool type --delay 20 --clearmodifiers "$1"; sleep 0.3; }
+key() { gpui_key "$@"; }
+type_text() { gpui_type "$1"; }
 
 keyring_home="${temporary}/keyring-home"
 start_keyring() {
@@ -87,7 +88,10 @@ start_keyring() {
   done
 }
 stop_keyring() {
-  pkill -u "$(id -u)" -x gnome-keyring-d 2>/dev/null || pkill -u "$(id -u)" -f gnome-keyring-daemon 2>/dev/null || true
+  if [[ -n "${GNOME_KEYRING_PID:-}" ]]; then
+    kill "$GNOME_KEYRING_PID" 2>/dev/null || true
+    unset GNOME_KEYRING_PID
+  fi
   for _ in $(seq 1 50); do
     pgrep -u "$(id -u)" -f gnome-keyring-daemon >/dev/null || return 0
     sleep 0.1
@@ -121,60 +125,34 @@ launch() {
     XDG_DATA_HOME="${temporary}/data" \
     XDG_CACHE_HOME="${temporary}/cache" \
     GSETTINGS_BACKEND=memory \
-    GDK_BACKEND=x11 \
-    GTK_A11Y=none \
     NO_AT_BRIDGE=1 \
     "$@" \
     "${binary}" >>"${app_log}" 2>&1 &
   app_pid=$!
-  window=""
-  for _ in $(seq 1 300); do
-    app_alive || break
-    window="$(xdotool search --onlyvisible --name '^OpenCode$' 2>/dev/null | tail -n 1)" || true
-    [[ -n "${window}" ]] && break
-    sleep 0.1
-  done
-  [[ -n "${window}" ]] || { fail "window" "no main window"; cat "${app_log}" >&2; exit 1; }
-  sleep 1
+  gpui_wait_window || { fail "window" "no GPUI window"; cat "${app_log}" >&2; exit 1; }
 }
 
-# quit -- Ctrl+Q, so the close handler saves state; killed if it hangs.
+# State is written on Apply; each launch is a new process in the same private home.
 quit() {
-  key ctrl+q
-  for _ in $(seq 1 50); do
-    app_alive || break
-    sleep 0.1
-  done
-  app_alive && kill "${app_pid}" 2>/dev/null
+  kill "${app_pid}" 2>/dev/null || true
   wait "${app_pid}" 2>/dev/null || true
   app_pid=""
 }
 
 open_password_field() {
+  gpui_click 410 680
   key ctrl+comma
-  sleep 0.5
-  # Settings focuses the server URL; the password follows the username.
-  key Tab
-  key Tab
+  sleep 0.4
+  gpui_click 440 367
 }
 
 stored_entry() {
-  secret-tool lookup service ai.opencode.Cosmic.basic-auth username "${account}" 2>/dev/null
+  secret-tool lookup service ai.opencode.Gpui.basic-auth username "${account}" 2>/dev/null
 }
 
 # ------------------------------------------------------------ environment
 
-if [[ -z "${DISPLAY:-}" ]]; then
-  command -v Xvfb >/dev/null || { printf 'No DISPLAY and no Xvfb\n' >&2; exit 1; }
-  for display in $(seq 90 120); do
-    [[ -e "/tmp/.X11-unix/X${display}" || -e "/tmp/.X${display}-lock" ]] && continue
-    Xvfb ":${display}" -screen 0 1280x1024x24 -nolisten tcp >/dev/null 2>&1 &
-    xvfb_pid=$!
-    export DISPLAY=":${display}"
-    break
-  done
-  for _ in $(seq 1 50); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.1; done
-fi
+gpui_start_display || exit 1
 
 password="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 FAKE_OPENCODE_PASSWORD="${password}" python3 tests/fake_opencode_server.py \
@@ -189,12 +167,7 @@ address="$(<"${temporary}/address")"
 account="http://opencode@${address#http://}"
 account="${account%/}"
 
-if [[ -n "${KEYRING_BINARY:-}" ]]; then
-  binary="${KEYRING_BINARY}"
-else
-  cargo build --locked || { printf 'cargo build failed\n' >&2; exit 1; }
-  binary="${CARGO_TARGET_DIR:-target}/debug/opencode-cosmic"
-fi
+gpui_binary "${KEYRING_BINARY:-}" || exit 1
 
 auth_route="http and route == 'server.info'"
 
@@ -220,7 +193,7 @@ expect "save.unauthenticated-before" "${auth_route} and r['auth'] == 'missing'"
 open_password_field
 mark_now
 type_text "${password}"
-key Return
+gpui_click 760 727
 expect "save.connects" "http and r['auth'] == 'ok'"
 check "save.state-flag" '[[ "$(state_flag)" == true ]]'
 check "save.keyring-entry" '[[ "$(stored_entry)" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
@@ -238,10 +211,9 @@ expect_none_since_mark "restart.no-unauthenticated-requests" "http and r['auth']
 # ------------------------------------------------------------ 4. uncheck Remember to forget it
 
 open_password_field
-key Tab
-key space
+gpui_click 310 404
 mark_now
-key ctrl+Return
+gpui_click 760 727
 sleep 1
 check "forget.keyring-entry-removed" '[[ -z "$(stored_entry)" ]]'
 check "forget.state-flag" '[[ "$(state_flag)" == false ]]'
@@ -256,7 +228,7 @@ quit
 launch OPENCODE_SERVER_URL="${address}" OPENCODE_SERVER_PASSWORD="${password}"
 expect "env.connects" "${auth_route} and r['auth'] == 'ok'"
 open_password_field
-key Return
+gpui_click 760 727
 sleep 1
 quit
 check "env.not-saved" '[[ -z "$(stored_entry)" ]]'
