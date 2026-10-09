@@ -4530,14 +4530,13 @@ impl Client {
             .border_r_1()
             .border_color(self.tone(0xc8c3ba, 0x24282c))
             .child(
-                div()
-                    .id("new-session")
+                BaseButton::new("new-session")
+                    .accessibility_label("New session")
                     .h(px(39.))
                     .px(px(16.))
-                    .flex()
-                    .items_center()
+                    .line_height(px(16.))
+                    .justify_start()
                     .text_color(self.tone(0x667078, 0x92999f))
-                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.show_modal(Modal::NewSession, window, cx);
                     }))
@@ -4555,18 +4554,22 @@ impl Client {
                     .flex_col()
                     .gap(px(12.))
                     .child(
-                        div()
-                            .id("footer-tabs")
-                            .cursor_pointer()
+                        BaseButton::new("footer-tabs")
+                            .accessibility_label("Open tabs")
+                            .h(px(21.))
+                            .line_height(px(16.))
+                            .justify_start()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Sessions, window, cx);
                             }))
                             .child("≡  Tabs"),
                     )
                     .child(
-                        div()
-                            .id("footer-settings")
-                            .cursor_pointer()
+                        BaseButton::new("footer-settings")
+                            .accessibility_label("Open settings")
+                            .h(px(21.))
+                            .line_height(px(16.))
+                            .justify_start()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Settings, window, cx);
                             }))
@@ -9192,6 +9195,38 @@ mod tests {
             window.render_frame(cx);
             window.press("escape", cx);
             assert!(!client.read(cx).unread.contains(&client.read(cx).active));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_navigation_controls_are_named_buttons(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for (id, name) in [
+                ("new-session", "New session"),
+                ("footer-tabs", "Open tabs"),
+                ("footer-settings", "Open settings"),
+            ] {
+                let control = window.find(id);
+                assert_eq!(control.role(), Some(Role::Button));
+                assert_eq!(control.label(), Some(name));
+            }
+            window.click("footer-tabs", cx);
+            assert!(client.read(cx).modal == Some(Modal::Sessions));
+            window.press("escape", cx);
+            window.click("footer-settings", cx);
+            assert!(client.read(cx).modal == Some(Modal::Settings));
+            window.press("escape", cx);
+            window.click("new-session", cx);
+            assert!(client.read(cx).modal == Some(Modal::NewSession));
         })
         .unwrap();
     }
