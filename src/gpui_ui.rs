@@ -1100,6 +1100,18 @@ fn permission_detail(text: String, dark: bool) -> AnyElement {
         .into_any_element()
 }
 
+fn permission_metadata(text: String, dark: bool) -> AnyElement {
+    div()
+        .p(px(8.))
+        .rounded(px(5.))
+        .bg(rgb(if dark { 0x15191c } else { 0xefede8 }))
+        .text_color(rgb(if dark { 0x9da4aa } else { 0x626764 }))
+        .font_family("DejaVu Sans Mono")
+        .text_size(px(11.))
+        .child(text)
+        .into_any_element()
+}
+
 fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
     let mut lines = source.lines().peekable();
     let mut blocks = Vec::new();
@@ -4057,11 +4069,38 @@ impl Client {
             TranscriptRowKind::Error => {
                 body = body.child(
                     div()
-                        .p(px(12.))
-                        .border_l_4()
-                        .border_color(self.tone(0xcf222e, 0xf85149))
-                        .bg(self.tone(0xf8eae7, 0x271a1b))
-                        .child(row.body.clone()),
+                        .mt(px(4.))
+                        .flex()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(self.tone(0xe8b8b8, 0x664547))
+                        .bg(self.tone(0xf3e7e4, 0x271a1b))
+                        .child(
+                            div()
+                                .w(px(3.))
+                                .flex_shrink_0()
+                                .bg(self.tone(0xcf222e, 0xf85149)),
+                        )
+                        .child(
+                            div()
+                                .px(px(14.))
+                                .py(px(11.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_size(px(11.))
+                                        .text_color(self.tone(0xcf222e, 0xf85149))
+                                        .child("⚠")
+                                        .child("Error"),
+                                )
+                                .child(row.body.clone()),
+                        ),
                 )
             }
             TranscriptRowKind::Normal if !user => {
@@ -4402,12 +4441,7 @@ impl Client {
             has_details = true;
         }
         if let Some(metadata) = pending::metadata_text(request.metadata.as_ref()) {
-            details = details.child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(self.tone(0x626764, 0x9da4aa))
-                    .child(metadata),
-            );
+            details = details.child(permission_metadata(metadata, self.dark));
             has_details = true;
         }
         let always = pending::always_patterns(request);
@@ -4477,7 +4511,7 @@ impl Client {
             .id("permission-card")
             .mx(px(16.))
             .mb(px(17.))
-            .p(px(16.))
+            .p(px(14.))
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -4494,6 +4528,7 @@ impl Client {
             .child(
                 div()
                     .text_size(px(11.))
+                    .line_height(px(14.))
                     .text_color(self.tone(0x737875, 0x899097))
                     .child(context),
             );
