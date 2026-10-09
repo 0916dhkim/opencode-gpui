@@ -3604,8 +3604,18 @@ impl Client {
                 Ok(session) => {
                     let id = session.id.clone();
                     // The SSE creation can arrive before the POST response;
-                    // never duplicate (or overwrite newer) session data.
-                    model::SessionChange::Created(session).apply(&mut self.sessions);
+                    // fill an SSE placeholder from the response without
+                    // replacing a title already changed by a later event.
+                    if let Some(existing) = self.sessions.iter_mut().find(|item| item.id == id) {
+                        if existing.title == "Untitled session"
+                            && session.title != "Untitled session"
+                            && existing.time.updated <= session.time.updated
+                        {
+                            existing.title = session.title;
+                        }
+                    } else {
+                        model::SessionChange::Created(session).apply(&mut self.sessions);
+                    }
                     self.select_session(id);
                 }
                 Err(error) => self.connection_status = format!("Create failed: {error}"),
@@ -9577,10 +9587,16 @@ mod tests {
         });
         cx.update_window(handle, |_, _, cx| {
             client.update(cx, |client, cx| {
-                for (id, sse_first) in [("ses_sse_first", true), ("ses_reply_first", false)] {
+                for (id, sse_first, newer_rename) in [
+                    ("ses_sse_first", true, false),
+                    ("ses_reply_first", false, false),
+                    ("ses_renamed_first", true, true),
+                ] {
                     let mut reply = client.sessions[0].clone();
                     reply.id = id.into();
                     reply.title = "POST title".into();
+                    reply.time.created = 500;
+                    reply.time.updated = 500;
                     let event = || {
                         super::UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
                             directory: Some("/repo".into()),
@@ -9603,6 +9619,21 @@ mod tests {
                     };
                     if sse_first {
                         client.handle_live_event(event(), cx);
+                        if newer_rename {
+                            client.handle_live_event(
+                                super::UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                                    directory: Some("/repo".into()),
+                                    payload: json!({
+                                        "id": format!("evt_renamed_{id}"),
+                                        "created": 600,
+                                        "type": "session.renamed",
+                                        "location": { "directory": "/repo" },
+                                        "data": { "sessionID": id, "title": "Newer title" }
+                                    }),
+                                }),
+                                cx,
+                            );
+                        }
                         client.handle_live_event(response(), cx);
                     } else {
                         client.handle_live_event(response(), cx);
@@ -9614,8 +9645,8 @@ mod tests {
                     assert_eq!(client.active, id);
                     assert_eq!(
                         matches[0].title,
-                        if sse_first {
-                            "Untitled session"
+                        if newer_rename {
+                            "Newer title"
                         } else {
                             "POST title"
                         }
