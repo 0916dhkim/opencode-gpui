@@ -412,6 +412,7 @@ struct Client {
     forms: Forms,
     permissions: Vec<PendingPermission>,
     permission_in_flight: HashSet<String>,
+    permission_container_focus: FocusHandle,
     permission_focus: [FocusHandle; 3],
     permission_presented: bool,
     settings_tab_focus: [FocusHandle; 2],
@@ -1399,6 +1400,7 @@ impl Client {
             forms: Forms::default(),
             permissions: Vec::new(),
             permission_in_flight: HashSet::new(),
+            permission_container_focus: cx.focus_handle().tab_stop(true),
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: false,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
@@ -1731,7 +1733,7 @@ impl Client {
     fn focus_selected_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_composer(window, cx);
         let focus = if self.modal.is_none() && self.visible_permission().is_some() {
-            self.permission_focus[0].clone()
+            self.permission_container_focus.clone()
         } else {
             self.composer.focus_handle(cx)
         };
@@ -3472,6 +3474,7 @@ impl Client {
             forms,
             permissions,
             permission_in_flight: HashSet::new(),
+            permission_container_focus: cx.focus_handle().tab_stop(true),
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: false,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
@@ -4489,6 +4492,8 @@ impl Client {
         for (index, (label, decision)) in choices.into_iter().enumerate() {
             let id = request.id.clone();
             let session_id = request.session_id.clone();
+            let key_id = id.clone();
+            let key_session_id = session_id.clone();
             actions = actions.child(
                 div()
                     .id(format!("permission-{label}-{}", request.id))
@@ -4497,6 +4502,17 @@ impl Client {
                     .test_support()
                     .track_focus(&self.permission_focus[index])
                     .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if !in_flight && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.reply_permission(
+                                key_id.clone(),
+                                key_session_id.clone(),
+                                decision,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }
+                    }))
                     .px(px(12.))
                     .py(px(7.))
                     .rounded(px(6.))
@@ -4531,6 +4547,17 @@ impl Client {
         };
         let mut card = div()
             .id("permission-card")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(format!("Permission request: {action}"))
+            .track_focus(&self.permission_container_focus)
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    // Arrival of a prompt must not turn the next composer
+                    // keystroke into a permission answer.
+                    cx.stop_propagation();
+                }
+            }))
             .mx(px(16.))
             .mb(px(17.))
             .p(px(14.))
@@ -6453,8 +6480,8 @@ impl Render for Client {
         let permission_visible = self.modal.is_none() && self.visible_permission().is_some();
         if permission_visible && !self.permission_presented {
             self.permission_presented = true;
-            let focus = self.permission_focus[0].clone();
-            window.on_next_frame(move |window, cx| focus.focus(window, cx));
+            let focus = self.permission_container_focus.clone();
+            focus.focus(window, cx);
         } else if !permission_visible && self.permission_presented {
             self.permission_presented = false;
             if self.modal.is_none() {
@@ -7980,7 +8007,26 @@ mod tests {
             let deny = window.find("permission-Deny-per_preview");
             assert_eq!(deny.role(), Some(Role::Button));
             assert_eq!(deny.label(), Some("Deny"));
-            window.click("permission-Deny-per_preview", cx);
+            let card = window.find("permission-card");
+            assert_eq!(card.role(), Some(Role::Group));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(
+                client
+                    .read(cx)
+                    .permission_container_focus
+                    .is_focused(window)
+            );
+            window.press("enter", cx);
+            window.press("space", cx);
+            assert!(window.try_find("permission-Deny-per_preview").is_some());
+            let focus = client.read(cx).permission_focus[0].clone();
+            focus.focus(window, cx);
+            window.press("space", cx);
             assert!(window.try_find("permission-Deny-per_preview").is_none());
         })
         .unwrap();
@@ -8055,7 +8101,12 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            assert!(client.read(cx).permission_focus[0].is_focused(window));
+            assert!(
+                client
+                    .read(cx)
+                    .permission_container_focus
+                    .is_focused(window)
+            );
             client.update(cx, |client, cx| {
                 client.unread.insert(client.active.clone());
                 cx.notify();
