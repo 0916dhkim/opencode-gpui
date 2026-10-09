@@ -429,6 +429,7 @@ struct Client {
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
     forms: Forms,
+    form_cancel_focus: FocusHandle,
     permissions: Vec<PendingPermission>,
     permission_in_flight: HashSet<String>,
     permission_container_focus: FocusHandle,
@@ -1417,6 +1418,7 @@ impl Client {
             statuses: HashMap::new(),
             jobs: Vec::new(),
             forms: Forms::default(),
+            form_cancel_focus: cx.focus_handle().tab_stop(true),
             permissions: Vec::new(),
             permission_in_flight: HashSet::new(),
             permission_container_focus: cx.focus_handle().tab_stop(true),
@@ -3503,6 +3505,7 @@ impl Client {
             statuses: bootstrap.statuses,
             jobs,
             forms,
+            form_cancel_focus: cx.focus_handle().tab_stop(true),
             permissions,
             permission_in_flight: HashSet::new(),
             permission_container_focus: cx.focus_handle().tab_stop(true),
@@ -4394,6 +4397,16 @@ impl Client {
         }
     }
 
+    fn cancel_waiting_form(&self, target: &pending::CancelTarget) {
+        if let Some(api) = &self.api {
+            api.send(Command::CancelForm {
+                form_id: target.form_id.clone(),
+                session_id: target.session_id.clone(),
+                directory: target.directory.clone(),
+            });
+        }
+    }
+
     fn form_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let notice = self.forms.notice(Some(&self.active), &HashMap::new())?;
         let mut bar = div()
@@ -4421,23 +4434,32 @@ impl Client {
                     .child("Open web UI"),
             );
         if let Some(target) = notice.cancel {
+            let key_target = target.clone();
             bar = bar.child(
                 div()
                     .id("cancel-form")
+                    .role(Role::Button)
+                    .aria_label("Cancel waiting form")
+                    .test_support()
+                    .track_focus(&self.form_cancel_focus)
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.cancel_waiting_form(&key_target);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(api) = &this.api {
-                            api.send(Command::CancelForm {
-                                form_id: target.form_id.clone(),
-                                session_id: target.session_id.clone(),
-                                directory: target.directory.clone(),
-                            });
-                        }
+                        this.cancel_waiting_form(&target);
                         cx.notify();
                     }))
                     .rounded(px(6.))
                     .border_1()
                     .border_color(self.tone(0xc8c3ba, 0x353b40))
+                    .bg(self.tone(0xf1efec, 0x393939))
+                    .text_color(self.tone(0x252829, 0xf8f7f7))
                     .px(px(10.))
                     .py(px(4.))
                     .child("Cancel"),
@@ -8062,6 +8084,31 @@ mod tests {
         })
         .unwrap();
         cx.update(|cx| assert!(client.read(cx).permissions.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn waiting_form_cancel_is_a_focusable_named_action(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let cancel = window.find("cancel-form");
+            assert_eq!(cancel.role(), Some(Role::Button));
+            assert_eq!(cancel.label(), Some("Cancel waiting form"));
+            let focus = client.read(cx).form_cancel_focus.clone();
+            focus.focus(window, cx);
+            assert!(focus.is_focused(window));
+            // The static fixture has no API worker, but keyboard activation
+            // must be handled without leaking Space into the composer.
+            window.press("space", cx);
+            assert!(window.try_find("cancel-form").is_some());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
