@@ -3058,7 +3058,9 @@ impl Client {
             UiEvent::SessionCreated { result, .. } => match result {
                 Ok(session) => {
                     let id = session.id.clone();
-                    self.sessions.push(session);
+                    // The SSE creation can arrive before the POST response;
+                    // never duplicate (or overwrite newer) session data.
+                    model::SessionChange::Created(session).apply(&mut self.sessions);
                     self.select_session(id);
                 }
                 Err(error) => self.connection_status = format!("Create failed: {error}"),
@@ -8415,6 +8417,66 @@ mod tests {
             );
             window.press("enter", cx);
             assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn created_session_response_and_sse_each_add_only_one_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, _, cx| {
+            client.update(cx, |client, cx| {
+                for (id, sse_first) in [("ses_sse_first", true), ("ses_reply_first", false)] {
+                    let mut reply = client.sessions[0].clone();
+                    reply.id = id.into();
+                    reply.title = "POST title".into();
+                    let event = || {
+                        super::UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                            directory: Some("/repo".into()),
+                            payload: json!({
+                                "id": format!("evt_{id}"),
+                                "created": 500,
+                                "type": "session.created",
+                                "location": { "directory": "/repo" },
+                                "data": {
+                                    "sessionID": id,
+                                    "slug": "new-session",
+                                    "location": { "directory": "/repo" }
+                                }
+                            }),
+                        })
+                    };
+                    let response = || super::UiEvent::SessionCreated {
+                        request_id: 1,
+                        result: Ok(reply.clone()),
+                    };
+                    if sse_first {
+                        client.handle_live_event(event(), cx);
+                        client.handle_live_event(response(), cx);
+                    } else {
+                        client.handle_live_event(response(), cx);
+                        client.handle_live_event(event(), cx);
+                    }
+                    let matches: Vec<_> = client.sessions.iter().filter(|s| s.id == id).collect();
+                    assert_eq!(matches.len(), 1, "{id} was duplicated");
+                    assert_eq!(client.open_tabs.iter().filter(|tab| *tab == id).count(), 1);
+                    assert_eq!(client.active, id);
+                    assert_eq!(
+                        matches[0].title,
+                        if sse_first {
+                            "Untitled session"
+                        } else {
+                            "POST title"
+                        }
+                    );
+                }
+            });
         })
         .unwrap();
     }
