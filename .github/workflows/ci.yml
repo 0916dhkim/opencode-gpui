@@ -22,11 +22,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake fonts-noto-core libdbus-1-dev libexpat1-dev \
+            at-spi2-core cmake fonts-noto-core gnome-keyring \
+            libdbus-1-dev libexpat1-dev \
             libfontconfig1-dev libfreetype6-dev libgl1-mesa-dev libssl-dev \
+            libsecret-tools \
             libwebkit2gtk-4.1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libx11-xcb-dev libzstd-dev libvulkan1 \
-            mesa-vulkan-drivers pkg-config python3 weston xvfb xdotool \
+            mesa-vulkan-drivers pkg-config python3 python3-pyatspi \
+            python3-dbus python3-gi weston xvfb xdotool \
             x11-utils imagemagick
       - name: Format
         run: cargo fmt --all -- --check
@@ -44,5 +47,11 @@ jobs:
         run: SHORTCUT_BINARY="$PWD/target/debug/opencode-gpui" bash tests/shortcut-ui.sh
       - name: Headless fake-server UI flow
         run: FLOW_BINARY="$PWD/target/debug/opencode-gpui" bash tests/remote-flow-ui.sh
+      - name: Isolated Secret Service and legacy-state migration
+        run: KEYRING_BINARY="$PWD/target/debug/opencode-gpui" bash tests/keyring-ui.sh
+      - name: Platform accessibility tree
+        run: ACCESSIBILITY_BINARY="$PWD/target/debug/opencode-gpui" bash tests/accessibility-ui.sh
+      - name: Isolated file-picker and attachment flow
+        run: ATTACHMENT_BINARY="$PWD/target/debug/opencode-gpui" bash tests/attachment-ui.sh
       # The real OpenCode 2.0.8 end-to-end run (tests/v2/e2e.sh) needs Docker and
       # downloads the pinned CLI when its image is built, so it runs locally only.
