@@ -900,11 +900,18 @@ impl RowHeightCache {
     fn retain_replaced(&mut self, rows: &[TranscriptRow], change: &ProjectionChange) {
         // The key is semantic, not the row index: prepends may shift the slot.
         // Keep the first still-measured revision through rapid token updates.
-        let current: HashMap<_, _> = rows.iter().map(|row| (&row.key, row)).collect();
+        // Only the spliced message range can replace or remove a stale row.
+        // Building a map of all history on every streamed token costs O(history).
+        let changed_keys: HashSet<_> = change.old_rows.iter().map(|row| &row.key).collect();
+        let current: HashMap<_, _> = rows[change.range.clone()]
+            .iter()
+            .map(|row| (&row.key, row))
+            .collect();
         self.stale.retain(|key, old| {
-            current
-                .get(key)
-                .is_some_and(|row| row.render_revision() != old.row.render_revision())
+            !changed_keys.contains(key)
+                || current
+                    .get(key)
+                    .is_some_and(|row| row.render_revision() != old.row.render_revision())
         });
         for row in &change.old_rows {
             let Some(new) = current.get(&row.key) else {
@@ -7836,7 +7843,27 @@ mod tests {
             images.get("ses_a", &new, 0).unwrap(),
             &old_image
         ));
-        cache.retain_replaced(&[], &change);
+        // Prepending another message must not discard this offscreen stale row.
+        let prepended = cache_row("earlier", "earlier");
+        cache.retain_replaced(
+            &[prepended, new.clone()],
+            &super::ProjectionChange {
+                range: 0..1,
+                removed_images: Vec::new(),
+                old_rows: Vec::new(),
+                old_images: Default::default(),
+            },
+        );
+        assert_eq!(cache.stale.len(), 1);
+        cache.retain_replaced(
+            &[],
+            &super::ProjectionChange {
+                range: 0..0,
+                removed_images: Vec::new(),
+                old_rows: vec![new.clone()],
+                old_images: Default::default(),
+            },
+        );
         assert!(cache.stale.is_empty());
         cache.retain_replaced(std::slice::from_ref(&new), &change);
         assert_eq!(cache.stale.len(), 1);
