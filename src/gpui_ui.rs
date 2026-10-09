@@ -6913,7 +6913,11 @@ impl Client {
                 };
                 let list = div()
                     .w(px(if model { 368. } else { 268. }))
-                    .h(px(70. + picker_list_height(model, count)))
+                    // The GTK popup's external frame is 2px shorter for
+                    // models and 4px taller for levels than the natural list.
+                    .h(px(70.
+                        + picker_list_height(model, count)
+                        + if model { -2. } else { 4. }))
                     .relative()
                     .rounded(px(8.))
                     .border_1()
@@ -7136,8 +7140,8 @@ impl Client {
             backdrop
                 .items_start()
                 .justify_end()
-                .pl(px(if modal == Modal::Model { 225. } else { 379. }))
-                .pb(px(77.))
+                .pl(px(if modal == Modal::Model { 220. } else { 374. }))
+                .pb(px(79.))
                 .bg(rgba(0x00000000))
         } else if modal == Modal::Settings {
             backdrop.items_start().justify_start().pt(px(36.))
