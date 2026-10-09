@@ -1260,7 +1260,12 @@ impl Client {
                                                 copy.clone(),
                                             ));
                                         }))
-                                        .child("▣"),
+                                        .child(
+                                            Icon::default()
+                                                .data(include_bytes!("icons/copy.svg"))
+                                                .with_size(px(12.))
+                                                .text_color(self.tone(0x777e7d, 0x899198)),
+                                        ),
                                 ),
                         )
                         .child(
