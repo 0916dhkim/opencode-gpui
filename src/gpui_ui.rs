@@ -433,6 +433,7 @@ struct Client {
     jobs: Vec<JobRow>,
     forms: Forms,
     form_cancel_focus: FocusHandle,
+    form_cancel_presented: Option<String>,
     permissions: Vec<PendingPermission>,
     permission_in_flight: HashSet<String>,
     permission_container_focus: FocusHandle,
@@ -1509,6 +1510,7 @@ impl Client {
             jobs: Vec::new(),
             forms: Forms::default(),
             form_cancel_focus: cx.focus_handle().tab_stop(true),
+            form_cancel_presented: None,
             permissions: Vec::new(),
             permission_in_flight: HashSet::new(),
             permission_container_focus: cx.focus_handle().tab_stop(true),
@@ -3706,6 +3708,7 @@ impl Client {
             jobs,
             forms,
             form_cancel_focus: cx.focus_handle().tab_stop(true),
+            form_cancel_presented: None,
             permissions,
             permission_in_flight: HashSet::new(),
             permission_container_focus: cx.focus_handle().tab_stop(true),
@@ -6812,6 +6815,21 @@ impl Render for Client {
             });
         }
         self.tab_focus.retain(|id, _| self.open_tabs.contains(id));
+        let form_cancel_id = self
+            .forms
+            .notice(Some(&self.active), &self.child_parents)
+            .and_then(|notice| notice.cancel.map(|target| target.form_id));
+        if self.form_cancel_presented != form_cancel_id {
+            if self.form_cancel_presented.is_some()
+                && self.form_cancel_focus.is_focused(window)
+                && self.modal.is_none()
+                && self.visible_permission().is_none()
+            {
+                let focus = self.composer.focus_handle(cx);
+                window.on_next_frame(move |window, cx| focus.focus(window, cx));
+            }
+            self.form_cancel_presented = form_cancel_id;
+        }
         for id in &self.open_tabs {
             self.tab_focus
                 .entry(id.clone())
@@ -8541,6 +8559,29 @@ mod tests {
             // must be handled without leaking Space into the composer.
             window.press("space", cx);
             assert!(window.try_find("cancel-form").is_some());
+            let form_id = {
+                let state = client.read(cx);
+                state
+                    .forms
+                    .notice(Some(&state.active), &state.child_parents)
+                    .unwrap()
+                    .cancel
+                    .unwrap()
+                    .form_id
+            };
+            client.update(cx, |client, cx| {
+                client.handle_live_event(
+                    super::UiEvent::FormCancelled {
+                        form_id,
+                        result: Ok(opencode_gpui::api::Settled::Done),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            assert!(window.try_find("cancel-form").is_none());
+            assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
         })
         .unwrap();
     }
