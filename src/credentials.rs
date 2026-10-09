@@ -469,7 +469,9 @@ pub fn apply_password_change(
         KeyringChange::Remove => match remove_password(store, server, username) {
             Ok(()) => (false, plan.warning.clone()),
             Err(error) => (
-                false,
+                // Do not persist "not stored" when deletion failed: the entry
+                // may still exist, and the next Settings Apply must retry it.
+                true,
                 Some(format!(
                     "The stored OpenCode password could not be removed ({error})"
                 )),
@@ -1064,8 +1066,68 @@ mod tests {
             false,
         );
         let (stored, warning) = apply_password_change(&store, SERVER, "opencode", &plan);
-        assert!(!stored);
+        assert!(stored);
         assert!(warning.unwrap().contains("could not be removed"));
+    }
+
+    #[test]
+    fn failed_password_removal_remains_retryable_after_restart() {
+        struct RemoveFails<'a>(&'a MemoryStore);
+        impl SecretStore for RemoveFails<'_> {
+            fn get(&self, service: &str, account: &str) -> keyring::Result<String> {
+                self.0.get(service, account)
+            }
+
+            fn set(&self, service: &str, account: &str, secret: &str) -> keyring::Result<()> {
+                self.0.set(service, account, secret)
+            }
+
+            fn delete(&self, _: &str, _: &str) -> keyring::Result<()> {
+                Err(KeyringError::NoStorageAccess("keyring locked".into()))
+            }
+        }
+
+        let store = MemoryStore::default();
+        save_password(&store, SERVER, "opencode", "saved").unwrap();
+        let plan = plan_password(
+            &store,
+            target(SERVER, "opencode"),
+            Some("saved"),
+            true,
+            target(SERVER, "opencode"),
+            "",
+            false,
+        );
+        let (persisted_stored, warning) =
+            apply_password_change(&RemoveFails(&store), SERVER, "opencode", &plan);
+        assert!(persisted_stored);
+        assert!(warning.unwrap().contains("could not be removed"));
+        assert_eq!(
+            load_password(&store, SERVER, "opencode")
+                .unwrap()
+                .as_deref(),
+            Some("saved")
+        );
+
+        // Restart uses the persisted flag, and a subsequent uncheck still
+        // plans a removal instead of silently leaving the secret behind.
+        let reloaded = initial_password(&store, SERVER, "opencode", None, persisted_stored, true);
+        assert!(reloaded.stored);
+        let retry = plan_password(
+            &store,
+            target(SERVER, "opencode"),
+            reloaded.password.as_deref(),
+            persisted_stored,
+            target(SERVER, "opencode"),
+            "",
+            false,
+        );
+        assert_eq!(retry.change, KeyringChange::Remove);
+        assert_eq!(
+            apply_password_change(&store, SERVER, "opencode", &retry),
+            (false, None)
+        );
+        assert_eq!(load_password(&store, SERVER, "opencode").unwrap(), None);
     }
 
     #[test]
