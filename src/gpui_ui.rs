@@ -3824,7 +3824,7 @@ impl Client {
                     .text_color(if selected {
                         self.tone(0x555b5c, 0xc8c4bd)
                     } else {
-                        self.tone(0xa3a9a8, 0x899097)
+                        self.tone(0xcfd0cc, 0x45494c)
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -3832,7 +3832,16 @@ impl Client {
                         this.rename_target = Some(rename_id.clone());
                         this.show_modal(Modal::Rename, window, cx);
                     }))
-                    .child("✎"),
+                    .child(
+                        Icon::default()
+                            .data(include_bytes!("icons/edit.svg"))
+                            .with_size(px(16.))
+                            .text_color(if selected {
+                                self.tone(0x555b5c, 0xc8c4bd)
+                            } else {
+                                self.tone(0xcfd0cc, 0x45494c)
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -3852,7 +3861,7 @@ impl Client {
                     .text_color(if selected {
                         self.tone(0x555b5c, 0xc8c4bd)
                     } else {
-                        self.tone(0xa3a9a8, 0x899097)
+                        self.tone(0xcfd0cc, 0x45494c)
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -3860,7 +3869,16 @@ impl Client {
                         this.close_tab(&close_id, cx);
                         this.focus_selected_composer(window, cx);
                     }))
-                    .child("×"),
+                    .child(
+                        Icon::default()
+                            .data(include_bytes!("icons/close.svg"))
+                            .with_size(px(16.))
+                            .text_color(if selected {
+                                self.tone(0x555b5c, 0xc8c4bd)
+                            } else {
+                                self.tone(0xcfd0cc, 0x45494c)
+                            }),
+                    ),
             )
             .when_some(drop_cue, |tab, after| {
                 tab.child(
