@@ -5396,7 +5396,7 @@ impl Client {
             .child(
                 div()
                     .mx(px(18.))
-                    .mt(px(14.))
+                    .mt(px(12.))
                     .mb(px(12.))
                     .h(px(50.))
                     .px(px(9.))
@@ -6075,7 +6075,7 @@ impl Client {
                     .child(
                         div().w(px(540.)).flex().flex_col().child(content).child(
                             div()
-                                .h(px(56.))
+                                .h(px(58.))
                                 .flex_shrink_0()
                                 .px(px(22.))
                                 .flex()
