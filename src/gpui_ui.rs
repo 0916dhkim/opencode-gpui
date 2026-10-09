@@ -715,6 +715,27 @@ fn splice_transcript(
             }
         })
         .collect::<Vec<_>>();
+    // The model revision belongs to the whole assistant message. A streaming
+    // tail edit must not invalidate every already measured tool/reasoning row
+    // in that message. Reuse a row revision only when its complete visible
+    // presentation and its snapshot epoch are unchanged.
+    if spans[prefix..spans.len() - suffix]
+        .iter()
+        .all(|span| span.epoch == epoch)
+    {
+        let previous: HashMap<_, _> = rows[start..end].iter().map(|row| (&row.key, row)).collect();
+        for row in &mut replacements {
+            if let Some(old) = previous.get(&row.key).filter(|old| {
+                old.role == row.role
+                    && old.kind == row.kind
+                    && old.body == row.body
+                    && old.images == row.images
+                    && old.time == row.time
+            }) {
+                row.render_revision = old.render_revision();
+            }
+        }
+    }
     let new_end = start + replacements.len();
     let removed_images = rows[start..end]
         .iter()
@@ -7548,6 +7569,85 @@ mod tests {
         splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
         assert_eq!(rows, full_rows(&conversation));
         assert_eq!(rows[0].body, "replacement");
+    }
+
+    #[test]
+    fn streaming_tail_of_tool_heavy_message_keeps_unchanged_row_heights() {
+        let mut conversation = model::Conversation::default();
+        let mut content = vec![json!({ "type": "text", "text": "Starting work" })];
+        for index in 0..12 {
+            content.push(json!({
+                "type": "tool", "id": format!("call_{index}"), "name": "glob",
+                "time": { "created": 7 },
+                "state": { "status": "completed", "input": { "pattern": "*.rs" }, "content": [] }
+            }));
+        }
+        content.push(json!({ "type": "text", "text": "Answer" }));
+        snapshot(
+            &mut conversation,
+            vec![json!({
+                "id": "assistant", "type": "assistant", "time": { "created": 1 },
+                "agent": "build", "content": content
+            })],
+        );
+        let mut rows = Vec::new();
+        let mut spans = Vec::new();
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert!(
+            rows.len() > 12,
+            "tool and text segments must form distinct rows"
+        );
+        let original = rows.clone();
+        let stamp = RowLayoutStamp {
+            width: px(500.),
+            dark: false,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: conversation.cache_epoch(),
+        };
+        let mut heights = RowHeightCache::default();
+        assert_eq!(heights.missing(stamp, &rows).len(), rows.len());
+        for row in &rows {
+            heights.record(stamp, row.key.clone(), row.render_revision(), px(60.));
+        }
+
+        assert!(conversation.apply_event(&json!({
+            "id": "evt_00000000000000000000000001", "created": 2000,
+            "type": "session.text.delta", "data": {
+                "sessionID": "ses_a", "assistantMessageID": "assistant",
+                "ordinal": 1, "delta": " streamed"
+            }
+        })));
+        let change = splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert_eq!(rows.len(), original.len());
+        let changed: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| (row.body != original[index].body).then_some(index))
+            .collect();
+        assert_eq!(changed, vec![rows.len() - 1]);
+        for (old, row) in original.iter().zip(&rows).take(rows.len() - 1) {
+            assert_eq!(row.key, old.key);
+            assert_eq!(row.render_revision(), old.render_revision());
+        }
+        heights.retain_replaced(&rows, &change);
+        assert_eq!(heights.missing(stamp, &rows), changed);
+        assert_eq!(heights.stale.len(), 1);
+
+        // An unrelated replacement snapshot with the same IDs must not reuse
+        // the previous epoch's cached heights or retained row revisions.
+        snapshot(
+            &mut conversation,
+            vec![json!({
+                "id": "assistant", "type": "assistant", "time": { "created": 1 },
+                "agent": "build", "content": [ { "type": "text", "text": "Answer" } ]
+            })],
+        );
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        let next_stamp = RowLayoutStamp {
+            epoch: conversation.cache_epoch(),
+            ..stamp
+        };
+        assert_eq!(heights.missing(next_stamp, &rows), vec![0]);
     }
 
     #[test]
