@@ -422,6 +422,7 @@ struct Client {
     attachment_drafts: HashMap<String, Vec<PathBuf>>,
     overlay: Option<String>,
     scroll: VirtualListScrollHandle,
+    history_focus: FocusHandle,
     sessions_picker_scroll: ScrollHandle,
     picker_list_scroll: ScrollHandle,
     projects_picker_scroll: ScrollHandle,
@@ -1411,6 +1412,7 @@ impl Client {
             attachment_drafts: HashMap::new(),
             overlay: None,
             scroll,
+            history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
             projects_picker_scroll: ScrollHandle::new(),
@@ -3527,6 +3529,7 @@ impl Client {
             attachment_drafts: HashMap::new(),
             overlay: if modal.is_none() { overlay } else { None },
             scroll,
+            history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
             projects_picker_scroll: ScrollHandle::new(),
@@ -4380,6 +4383,8 @@ impl Client {
 
     fn load_earlier_row(&self, cursor: String, loading: bool, cx: &Context<Self>) -> Stateful<Div> {
         let id = self.active.clone();
+        let key_id = id.clone();
+        let key_cursor = cursor.clone();
         div()
             .id("load-earlier")
             .font_family("Noto Sans")
@@ -4396,6 +4401,16 @@ impl Client {
             .text_color(self.tone(0x555b5c, 0xe8e5df))
             .when(!loading, |button| {
                 button
+                    .role(Role::Button)
+                    .aria_label("Load earlier messages")
+                    .track_focus(&self.history_focus)
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.load_earlier(&key_id, &key_cursor, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.load_earlier(&id, &cursor, cx);
@@ -7306,6 +7321,14 @@ mod tests {
                 cache.load_height.unwrap().1,
                 window.find("load-earlier").bounds().size.height
             );
+            let control = window.find("load-earlier");
+            assert_eq!(control.role(), Some(Role::Button));
+            assert_eq!(control.label(), Some("Load earlier messages"));
+            let focus = client.history_focus.clone();
+            drop(cache);
+            focus.focus(window, cx);
+            assert!(focus.is_focused(window));
+            window.press("enter", cx);
         })
         .expect("headless window stays open");
         render(cx); // first virtual frame
