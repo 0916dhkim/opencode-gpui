@@ -253,6 +253,26 @@ quit
 check "env.not-saved" '[[ -z "$(stored_entry)" ]]'
 check "env.state-flag" '[[ "$(state_flag)" == false ]]'
 
+# ------------------------------------------------------------ 6. copy legacy state and password
+
+legacy_state="${temporary}/config/opencode-cosmic/state.json"
+gpui_state="${state}"
+state="${legacy_state}"
+write_state true
+state="${gpui_state}"
+legacy_hash="$(sha256sum "${legacy_state}" | cut -d' ' -f1)"
+rm -f "${gpui_state}"
+printf '%s' "{\"version\":1,\"password\":\"${password}\"}" |
+  secret-tool store --label='Legacy OpenCode Basic password' \
+    service ai.opencode.Cosmic.basic-auth username "${account}"
+launch OPENCODE_SERVER_URL="${address}"
+expect "migration.connects-with-legacy-password" "${auth_route} and r['auth'] == 'ok'"
+check "migration.state-copied" 'wait_state_flag true'
+check "migration.new-keyring-entry" '[[ "$(stored_entry)" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
+check "migration.old-keyring-entry-retained" '[[ "$(secret-tool lookup service ai.opencode.Cosmic.basic-auth username "${account}")" == "$(stored_entry)" ]]'
+check "migration.old-state-untouched" '[[ "$(sha256sum "${legacy_state}" | cut -d" " -f1)" == "${legacy_hash}" ]]'
+quit
+
 # ------------------------------------------------------------ secrets stay out of files and logs
 
 check "secret.not-in-state" '! grep -qF "${password}" "${state}"'
