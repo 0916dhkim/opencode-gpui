@@ -5236,16 +5236,13 @@ impl Client {
                             .w(px(32.))
                             .h(px(32.))
                             .rounded_full()
-                            .bg(self.tone(
-                                if can_send { 0xc59535 } else { 0xe2c99a },
-                                if can_send { 0xd29b52 } else { 0x6d5130 },
-                            ))
+                            .bg(self.tone(0xc59535, 0xd29b52))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_color(self.tone(
-                                if can_send { 0x17130e } else { 0x8b7b62 },
-                                if can_send { 0x17130e } else { 0x8a7661 },
+                                if can_send { 0x17130e } else { 0x7a5d29 },
+                                if can_send { 0x17130e } else { 0x815f35 },
                             ))
                             .child(
                                 Icon::default()
