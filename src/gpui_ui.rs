@@ -446,7 +446,7 @@ struct Client {
     child_parents: HashMap<String, String>,
     next_prompt_request_id: u64,
     next_session_request_id: u64,
-    focus_after_create: bool,
+    focus_composer_pending: bool,
     next_model_request_id: u64,
     pending_prompts: HashMap<String, (u64, String, Vec<PathBuf>)>,
     tray_in_flight: HashSet<String>,
@@ -1866,7 +1866,7 @@ impl Client {
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
-            focus_after_create: false,
+            focus_composer_pending: false,
             next_model_request_id: 0,
             pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
@@ -2242,7 +2242,7 @@ impl Client {
             });
         }
         self.modal = None;
-        self.focus_after_create = true;
+        self.focus_composer_pending = true;
         cx.notify();
     }
 
@@ -3532,6 +3532,7 @@ impl Client {
                     }
                     self.catalogs.clear();
                 }
+                let first_bootstrap = !self.bootstrapped;
                 if let Some(id) = desired {
                     self.select_session(id);
                 } else {
@@ -3539,6 +3540,12 @@ impl Client {
                     self.catalog = ModelCatalog::default();
                 }
                 self.bootstrapped = true;
+                if first_bootstrap && !self.active.is_empty() {
+                    // Restored tabs have no focused input yet. Once bootstrap
+                    // selects the saved tab, focus its actual composer rather
+                    // than leaving keyboard shortcuts on an unmounted root.
+                    self.focus_composer_pending = true;
+                }
                 if refresh_tabs {
                     for id in self.open_tabs.clone() {
                         if id != self.active {
@@ -3652,13 +3659,13 @@ impl Client {
                         // The new session gets a different TextareaState; any
                         // focus restored when the picker closed belonged to
                         // the previous tab's composer.
-                        self.focus_after_create = true;
+                        self.focus_composer_pending = true;
                     }
                 }
                 Err(error) => {
                     self.connection_status = format!("Create failed: {error}");
                     if request_id == self.next_session_request_id {
-                        self.focus_after_create = true;
+                        self.focus_composer_pending = true;
                     }
                 }
             },
@@ -4102,7 +4109,7 @@ impl Client {
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
-            focus_after_create: false,
+            focus_composer_pending: false,
             next_model_request_id: 0,
             pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
@@ -7209,8 +7216,11 @@ impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
         self.sync_composer(window, cx);
-        if self.focus_after_create && self.modal.is_none() && self.visible_permission().is_none() {
-            self.focus_after_create = false;
+        if self.focus_composer_pending
+            && self.modal.is_none()
+            && self.visible_permission().is_none()
+        {
+            self.focus_composer_pending = false;
             let focus = self.composer.focus_handle(cx);
             window.on_next_frame(move |window, cx| focus.focus(window, cx));
         }
@@ -9849,6 +9859,35 @@ mod tests {
             let current = client.read(cx).composer.clone();
             assert_ne!(current.entity_id(), old_composer.entity_id());
             assert!(current.focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn first_live_bootstrap_focuses_the_restored_session_composer(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let event = super::preview::State::new().handle(super::Command::Bootstrap {
+                sessions: Vec::new(),
+                directories: Vec::new(),
+            });
+            client.update(cx, |client, cx| {
+                client.bootstrapped = false;
+                client.saved_active = Some(client.active.clone());
+                client.handle_live_event(event, cx);
+                assert!(client.focus_composer_pending);
+            });
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
         })
         .unwrap();
     }

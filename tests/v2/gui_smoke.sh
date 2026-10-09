@@ -116,17 +116,17 @@ gpui_type "Hello from the GUI smoke test [[scenario:text]]"
 gpui_key Return
 
 check_messages() {
-  api GET "/api/session/${session}/message?limit=20" | python3 -c '
+  api GET "/api/session/$1/message?limit=20" | python3 -c '
 import json, sys
 entries = json.load(sys.stdin)["data"]
-user = [e for e in entries if e["type"] == "user" and "GUI smoke test" in e.get("text", "")]
+user = [e for e in entries if e["type"] == "user" and sys.argv[1] in e.get("text", "")]
 assistant = [e for e in entries if e["type"] == "assistant"
-             and any(c.get("type") == "text" and c.get("text") for c in e.get("content", []))]
-sys.exit(0 if user and assistant else 1)'
+              and any(c.get("type") == "text" and c.get("text") for c in e.get("content", []))]
+sys.exit(0 if user and assistant else 1)' "$2"
 }
 ok=""
 for _ in $(seq 1 60); do
-  if check_messages; then ok=1; break; fi
+  if check_messages "${session}" "GUI smoke test"; then ok=1; break; fi
   sleep 0.5
 done
 if [[ -n "${ok}" ]]; then
@@ -186,6 +186,50 @@ if [[ -n "${restored}" ]]; then
   pass "tab-switch.first-session-persisted"
 else
   fail "tab-switch.first-session-persisted" "Ctrl+1 did not restore the first tab"
+fi
+
+# A new process must restore both tabs from this private state, then send in
+# the second session without borrowing the first session's composer draft.
+kill "${app}"
+wait "${app}" 2>/dev/null || true
+pids=("${forwarder}")
+OPENCODE_SERVER_PASSWORD="$(cat "${password_file}")" \
+XDG_CONFIG_HOME="${temporary}/config" XDG_DATA_HOME="${temporary}/data" \
+XDG_CACHE_HOME="${temporary}/cache" GSETTINGS_BACKEND=memory NO_AT_BRIDGE=1 \
+"${binary}" --server "${base}" --username opencode >>"${temporary}/app.log" 2>&1 &
+app=$!
+app_pid=$app
+pids+=("${app}")
+if gpui_wait_window; then pass "restart.ui.window"; else fail "restart.ui.window" "no restored GPUI window"; fi
+sleep 3
+gpui_key ctrl+2
+restored=''
+for _ in $(seq 1 50); do
+  if [[ "$(active_tab)" == "${new_session}" ]]; then restored=1; break; fi
+  sleep 0.2
+done
+if [[ -n "${restored}" ]]; then
+  pass "restart.second-session-restored"
+else
+  fail "restart.second-session-restored" "Ctrl+2 did not select the persisted second tab"
+fi
+gpui_click 410 680
+gpui_type "Second session after restart [[scenario:text]]"
+gpui_key Return
+ok=''
+for _ in $(seq 1 60); do
+  if check_messages "${new_session}" "after restart"; then ok=1; break; fi
+  sleep 0.5
+done
+if [[ -n "${ok}" ]]; then
+  pass "restart.second-session-prompt-round-trip"
+else
+  fail "restart.second-session-prompt-round-trip" "no reply in the restored second session"
+fi
+if [[ -n "${shots}" ]]; then
+  import -window "${window}" "${shots}/e2e-gui-restored-session.png" 2>/dev/null \
+    && pass "screenshot ${shots}/e2e-gui-restored-session.png" \
+    || fail "screenshot" "restored-session capture failed"
 fi
 
 kill -0 "${app}" 2>/dev/null && pass "ui.still-running" || fail "ui.still-running" "client exited"
