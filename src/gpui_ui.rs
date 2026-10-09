@@ -6169,6 +6169,7 @@ impl Client {
                                 if sessions { 0xded8cb } else { 0x4f99ee },
                                 if sessions { 0x27272a } else { 0x62bceb },
                             ))
+                            .when(!sessions, |header| header.border_1().rounded(px(6.)))
                             .flex()
                             .items_center()
                             .when(sessions, |view| {
