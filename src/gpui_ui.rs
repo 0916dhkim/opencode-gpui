@@ -434,7 +434,7 @@ struct Client {
     permission_in_flight: HashSet<String>,
     permission_container_focus: FocusHandle,
     permission_focus: [FocusHandle; 3],
-    permission_presented: bool,
+    permission_presented: Option<String>,
     settings_tab_focus: [FocusHandle; 2],
     settings_session_focus: HashMap<String, FocusHandle>,
     settings_sessions_scroll: ScrollHandle,
@@ -1423,7 +1423,7 @@ impl Client {
             permission_in_flight: HashSet::new(),
             permission_container_focus: cx.focus_handle().tab_stop(true),
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
-            permission_presented: false,
+            permission_presented: None,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             settings_session_focus: HashMap::new(),
             settings_sessions_scroll: ScrollHandle::new(),
@@ -2041,7 +2041,7 @@ impl Client {
         self.forms.clear();
         self.permissions.clear();
         self.permission_in_flight.clear();
-        self.permission_presented = false;
+        self.permission_presented = None;
         self.child_parents.clear();
         self.tray_in_flight.clear();
         self.jobs.clear();
@@ -3539,7 +3539,7 @@ impl Client {
             permission_in_flight: HashSet::new(),
             permission_container_focus: cx.focus_handle().tab_stop(true),
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
-            permission_presented: false,
+            permission_presented: None,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             settings_session_focus: HashMap::new(),
             settings_sessions_scroll: ScrollHandle::new(),
@@ -6599,17 +6599,21 @@ impl Render for Client {
         if row_probe.is_none() {
             self.correct_scroll(window);
         }
-        let permission_visible = self.modal.is_none() && self.visible_permission().is_some();
-        if permission_visible && !self.permission_presented {
-            self.permission_presented = true;
-            let focus = self.permission_container_focus.clone();
-            focus.focus(window, cx);
-        } else if !permission_visible && self.permission_presented {
-            self.permission_presented = false;
-            if self.modal.is_none() {
-                let focus = self.composer.focus_handle(cx);
-                window.on_next_frame(move |window, cx| focus.focus(window, cx));
+        let visible_permission_id = if self.modal.is_none() {
+            self.visible_permission().map(|item| item.request.id)
+        } else {
+            None
+        };
+        if let Some(id) = visible_permission_id {
+            if self.permission_presented.as_deref() != Some(&id) {
+                // A second queued request must get a fresh, inert focus target
+                // when the first request's focused action disappears.
+                self.permission_presented = Some(id);
+                self.permission_container_focus.focus(window, cx);
             }
+        } else if self.permission_presented.take().is_some() && self.modal.is_none() {
+            let focus = self.composer.focus_handle(cx);
+            window.on_next_frame(move |window, cx| focus.focus(window, cx));
         }
         let composer_slot = self
             .permission_card(cx)
@@ -8153,6 +8157,56 @@ mod tests {
         })
         .unwrap();
         cx.update(|cx| assert!(client.read(cx).permissions.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn queued_permission_gets_inert_focus_after_first_reply(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let mut second = client.permissions[0].clone();
+                second.request.id = "per_second".into();
+                client.permissions.push(second);
+                client.select_session("ses_other".into());
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let deny_focus = client.read(cx).permission_focus[0].clone();
+            deny_focus.focus(window, cx);
+            client.update(cx, |client, cx| {
+                client.handle_live_event(
+                    super::UiEvent::PermissionReplied {
+                        request_id: "per_preview".into(),
+                        result: Ok(opencode_gpui::api::Settled::Done),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("permission-Deny-per_second").is_some());
+            assert!(
+                client
+                    .read(cx)
+                    .permission_container_focus
+                    .is_focused(window)
+            );
+            window.press("enter", cx);
+            window.press("space", cx);
+            assert_eq!(client.read(cx).permissions.len(), 1);
+            assert!(window.try_find("permission-Deny-per_second").is_some());
+            deny_focus.focus(window, cx);
+            window.press("space", cx);
+            assert!(client.read(cx).permissions.is_empty());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
