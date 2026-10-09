@@ -23,6 +23,10 @@ shots="${GUI_SHOTS:-}"
 # Never 4096/4097: those are the ports of real servers on a developer host.
 local_port=14096
 base="http://127.0.0.1:${local_port}"
+case "${GUI_CONFIG_SUFFIX:-}" in
+  ''|/api) configured="${base}${GUI_CONFIG_SUFFIX:-}" ;;
+  *) echo 'GUI_CONFIG_SUFFIX must be empty or /api' >&2; exit 2 ;;
+esac
 temporary="$(mktemp -d)"
 pids=()
 failures=0
@@ -83,7 +87,7 @@ session="$(api POST /api/session "{\"location\":{\"directory\":\"${workspace}\"}
 [[ -n "${session}" ]] && pass "session.created ${session}" || { fail "session.created" "no session"; exit 1; }
 
 mkdir -p "${temporary}/config/opencode-gpui"
-python3 - "${base}" "${session}" "${workspace}" "${temporary}/config/opencode-gpui/state.json" <<'PY'
+python3 - "${configured}" "${session}" "${workspace}" "${temporary}/config/opencode-gpui/state.json" <<'PY'
 import json, sys
 server, session, workspace, path = sys.argv[1:]
 json.dump({
@@ -100,7 +104,7 @@ XDG_DATA_HOME="${temporary}/data" \
 XDG_CACHE_HOME="${temporary}/cache" \
 GSETTINGS_BACKEND=memory \
 NO_AT_BRIDGE=1 \
-"${binary}" --server "${base}" --username opencode >"${temporary}/app.log" 2>&1 &
+"${binary}" --server "${configured}" --username opencode >"${temporary}/app.log" 2>&1 &
 app=$!
 app_pid=$app
 pids+=("${app}")
@@ -196,7 +200,7 @@ pids=("${forwarder}")
 OPENCODE_SERVER_PASSWORD="$(cat "${password_file}")" \
 XDG_CONFIG_HOME="${temporary}/config" XDG_DATA_HOME="${temporary}/data" \
 XDG_CACHE_HOME="${temporary}/cache" GSETTINGS_BACKEND=memory NO_AT_BRIDGE=1 \
-"${binary}" --server "${base}" --username opencode >>"${temporary}/app.log" 2>&1 &
+"${binary}" --server "${configured}" --username opencode >>"${temporary}/app.log" 2>&1 &
 app=$!
 app_pid=$app
 pids+=("${app}")

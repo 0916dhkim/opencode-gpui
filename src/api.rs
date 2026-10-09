@@ -414,6 +414,16 @@ pub(crate) fn mount_root(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// The same canonical mount-root identity used by `ApiHandle::start` for
+/// per-server tabs and unread state. A configured terminal `/api` is not a
+/// separate server from its mount root.
+pub fn server_key(base_url: &str) -> Result<String> {
+    Ok(mount_root(base_url)?
+        .as_str()
+        .trim_end_matches('/')
+        .to_owned())
+}
+
 /// The server's own web UI, served at its mount root.
 pub fn web_ui_url(base_url: &str) -> Result<String> {
     Ok(mount_root(base_url)?.to_string())

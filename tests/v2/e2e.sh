@@ -12,7 +12,8 @@
 #
 # DIR must be outside the repository; it only holds the per-run password.
 # Env knobs: E2E_BUILDER_IMAGE, E2E_UI_IMAGE, E2E_CARGO_VOLUME, E2E_TARGET_VOLUME,
-# E2E_GUI_BINARY (an already built absolute path inside the UI image), and
+# E2E_GUI_BINARY (an already built absolute path inside the UI image),
+# E2E_GUI_CONFIG_SUFFIX (/api to test canonical tab-state migration), and
 # OCGTK_V2H_PREFIX (harness container/network names; see harness.sh).
 set -uo pipefail
 
@@ -107,6 +108,7 @@ if [ -z "$skip_gui" ]; then
     -v "$shots":/shots \
     -e GUI_PASSWORD_FILE=/run/ocgtk/password \
     -e GUI_BINARY="$gui_binary" \
+    -e GUI_CONFIG_SUFFIX="${E2E_GUI_CONFIG_SUFFIX:-}" \
     -e GUI_SHOTS=/shots \
     -e GUI_UPSTREAM_HOST="$UPSTREAM" \
     "$UI_IMAGE" bash tests/v2/gui_smoke.sh; then

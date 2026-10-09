@@ -47,6 +47,17 @@ fn tab_number_key(key: &str) -> Option<usize> {
     }
 }
 
+/// Old prototype builds wrote tabs under the configured spelling, while the
+/// transport restores them under its normalized mount-root key. Copy rather
+/// than remove that entry so the older client/state remains recoverable.
+fn ensure_canonical_server_state(state: &mut PersistedState, configured: &str, key: &str) {
+    if !state.servers.contains_key(key)
+        && let Some(saved) = state.servers.get(configured.trim_end_matches('/')).cloned()
+    {
+        state.servers.insert(key.to_owned(), saved);
+    }
+}
+
 fn unread_on_server_switch(
     state: &mut PersistedState,
     previous: Option<(&str, &HashSet<String>)>,
@@ -1738,7 +1749,7 @@ impl Client {
     }
 
     fn from_live(window: &mut Window, cx: &mut Context<Self>, args: &Args) -> Self {
-        let (state, state_warning) = match persist::load_with_legacy(&persist::default_path()) {
+        let (mut state, state_warning) = match persist::load_with_legacy(&persist::default_path()) {
             Ok(loaded) => loaded,
             Err(error) => (PersistedState::default(), Some(error.to_string())),
         };
@@ -1746,6 +1757,9 @@ impl Client {
             .server
             .clone()
             .unwrap_or(state.connection.server.clone());
+        if let Ok(key) = opencode_gpui::api::server_key(&server) {
+            ensure_canonical_server_state(&mut state, &server, &key);
+        }
         let username = args
             .username
             .clone()
@@ -2057,12 +2071,18 @@ impl Client {
     }
 
     fn persist_tabs(&mut self) {
-        let key = self
-            .settings
-            .current
-            .base_url
-            .trim_end_matches('/')
-            .to_owned();
+        let key = match opencode_gpui::api::server_key(&self.settings.current.base_url) {
+            Ok(key) => key,
+            Err(error) => {
+                self.connection_status = format!("State save failed: {error}");
+                return;
+            }
+        };
+        ensure_canonical_server_state(
+            &mut self.settings.persisted,
+            &self.settings.current.base_url,
+            &key,
+        );
         let server = self.settings.persisted.servers.entry(key).or_default();
         server.tabs = self
             .open_tabs
@@ -2405,12 +2425,16 @@ impl Client {
             log::warn!("{warning}");
         }
         let mut persisted = self.settings.persisted.clone();
+        let previous_key = opencode_gpui::api::server_key(&old.base_url)
+            .unwrap_or_else(|_| old.base_url.trim_end_matches('/').to_owned());
+        ensure_canonical_server_state(&mut persisted, &old.base_url, &previous_key);
         let next_unread = next_connection.as_ref().map(|(_, _, key)| {
+            ensure_canonical_server_state(&mut persisted, &server, key);
             unread_on_server_switch(
                 &mut persisted,
                 self.api
                     .as_ref()
-                    .map(|_| (old.base_url.as_str(), &self.unread)),
+                    .map(|_| (previous_key.as_str(), &self.unread)),
                 key,
             )
         });
@@ -9890,6 +9914,64 @@ mod tests {
             assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
         })
         .unwrap();
+    }
+
+    #[test]
+    fn canonical_server_key_recovers_raw_api_suffix_tabs_without_deleting_them() {
+        let configured = "https://EXAMPLE.com/prefix/api/";
+        let key = opencode_gpui::api::server_key(configured).unwrap();
+        assert_eq!(key, "https://example.com/prefix");
+        let mut state = PersistedState::default();
+        let legacy = configured.trim_end_matches('/');
+        state.servers.insert(
+            legacy.into(),
+            opencode_gpui::persist::ServerState {
+                tabs: vec![opencode_gpui::persist::PersistedTab {
+                    id: "ses_restored".into(),
+                    title: "Restored".into(),
+                    directory: "/repo".into(),
+                }],
+                active: Some("ses_restored".into()),
+                ..Default::default()
+            },
+        );
+        super::ensure_canonical_server_state(&mut state, configured, &key);
+        assert_eq!(state.servers[&key].active.as_deref(), Some("ses_restored"));
+        assert!(
+            state.servers.contains_key(legacy),
+            "legacy state is copied, not moved"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn persisted_tabs_use_the_transport_mount_root_key(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, _| {
+                client.settings.current.base_url = "http://127.0.0.1:4096/api".into();
+                client.persist_tabs();
+                let key =
+                    opencode_gpui::api::server_key(&client.settings.current.base_url).unwrap();
+                assert_eq!(key, "http://127.0.0.1:4096");
+                assert_eq!(
+                    client.settings.persisted.servers[&key].active.as_deref(),
+                    Some(client.active.as_str())
+                );
+                assert!(
+                    !client
+                        .settings
+                        .persisted
+                        .servers
+                        .contains_key("http://127.0.0.1:4096/api")
+                );
+            });
+        });
     }
 
     #[test]
