@@ -2586,6 +2586,9 @@ impl Client {
     }
 
     fn send_prompt(&mut self, queue: bool, cx: &mut Context<Self>) {
+        if !self.can_send(cx) {
+            return;
+        }
         let text = self.composer.read(cx).value().to_string();
         if (text.trim().is_empty() && self.attachments_draft.is_empty())
             || self.active.is_empty()
@@ -2622,6 +2625,24 @@ impl Client {
             (request_id, text, self.attachments_draft.clone()),
         );
         cx.notify();
+    }
+
+    fn can_send(&self, cx: &Context<Self>) -> bool {
+        let has_input =
+            !self.composer.read(cx).value().trim().is_empty() || !self.attachments_draft.is_empty();
+        let model = self
+            .selected_model()
+            .as_ref()
+            .and_then(|selection| self.catalog.find(selection));
+        !self.active.is_empty()
+            && self.composer_session == self.active
+            && self.api.is_some()
+            && has_input
+            && !self.pending_prompts.contains_key(&self.active)
+            && self.visible_permission().is_none()
+            && model.is_some_and(|option| {
+                self.attachments_draft.is_empty() || option.supports_attachments
+            })
     }
 
     fn update_transcript(&mut self, session_id: &str) {
@@ -4610,6 +4631,23 @@ impl Client {
         sticky_user_index(users, top, bottom).and_then(|index| transcript.get(index))
     }
 
+    fn resume_warning(&self, cx: &Context<Self>) -> Option<String> {
+        let paused = !self
+            .statuses
+            .get(&self.active)
+            .is_some_and(RunStatus::is_busy);
+        let count = if paused {
+            self.conversations
+                .get(&self.active)
+                .map_or(0, |conversation| conversation.tray_items().len())
+        } else {
+            0
+        };
+        let has_input =
+            !self.composer.read(cx).value().trim().is_empty() || !self.attachments_draft.is_empty();
+        tray::resume_warning(count, has_input)
+    }
+
     fn tray_view(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let items = self.conversations.get(&self.active)?.tray_items();
         let rows = tray::tray_rows(&items, None, None, &self.tray_in_flight);
@@ -4770,7 +4808,8 @@ impl Client {
         Some(card.into_any_element())
     }
 
-    fn composer(&self, cx: &Context<Self>) -> AnyElement {
+    fn composer(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let can_send = self.can_send(cx);
         let selected_model = self.selected_model();
         let model = selected_model
             .as_ref()
@@ -4908,6 +4947,18 @@ impl Client {
                             .text_color(self.tone(0x858e8c, 0x899097))
                             .child(context),
                     )
+                    .when(
+                        running && window.viewport_size().width >= px(900.),
+                        |footer| {
+                            footer.child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_size(px(10.))
+                                    .text_color(self.tone(0x858e8c, 0x899097))
+                                    .child("Ctrl+Enter to queue"),
+                            )
+                        },
+                    )
                     .when(running, |footer| {
                         footer.child(
                             div()
@@ -4935,18 +4986,29 @@ impl Client {
                     .child(
                         div()
                             .id("send-prompt")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.send_prompt(false, cx);
-                            }))
+                            .role(Role::Button)
+                            .aria_label("Send prompt")
+                            .when(can_send, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.send_prompt(false, cx);
+                                    }))
+                            })
                             .w(px(32.))
                             .h(px(32.))
                             .rounded_full()
-                            .bg(self.tone(0xc59535, 0xd29b52))
+                            .bg(self.tone(
+                                if can_send { 0xc59535 } else { 0xe2c99a },
+                                if can_send { 0xd29b52 } else { 0x6d5130 },
+                            ))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(rgb(0x17130e))
+                            .text_color(self.tone(
+                                if can_send { 0x17130e } else { 0x8b7b62 },
+                                if can_send { 0x17130e } else { 0x8a7661 },
+                            ))
                             .child(
                                 Icon::default()
                                     .data(include_bytes!("icons/send.svg"))
@@ -6120,7 +6182,7 @@ impl Render for Client {
         }
         let composer_slot = self
             .permission_card(cx)
-            .unwrap_or_else(|| self.composer(cx));
+            .unwrap_or_else(|| self.composer(window, cx));
         let root = div()
             .id("app-root")
             .size_full()
@@ -6192,6 +6254,16 @@ impl Render for Client {
                             .when_some(self.working_pill(), |view, pill| view.child(pill))
                             .when_some(self.form_notice(cx), |view, notice| view.child(notice))
                             .when_some(self.tray_view(cx), |view, tray| view.child(tray))
+                            .when_some(self.resume_warning(cx), |view, warning| {
+                                view.child(
+                                    div()
+                                        .mx(px(16.))
+                                        .mb(px(6.))
+                                        .text_size(px(11.))
+                                        .text_color(self.tone(0x995b18, 0xe9ad68))
+                                        .child(warning),
+                                )
+                            })
                             .child(composer_slot),
                     ),
             )
@@ -8201,6 +8273,79 @@ mod tests {
             );
             assert_eq!(server.active.as_deref(), Some(second.as_str()));
         });
+    }
+
+    #[gpui_kit::test]
+    fn composer_send_requires_model_input_and_supported_attachments(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!client.update(cx, |client, cx| client.can_send(cx)));
+            let (api, _, _) = super::ApiHandle::preview();
+            client.update(cx, |client, cx| {
+                client.api = Some(api);
+                client.permissions.clear();
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("Prompt text", window, cx));
+            });
+            assert!(client.update(cx, |client, cx| client.can_send(cx)));
+            client.update(cx, |client, _| {
+                for option in &mut client.catalog.models {
+                    option.supports_attachments = false;
+                }
+                client.attachments_draft.push(PathBuf::from("/fake.png"));
+            });
+            assert!(!client.update(cx, |client, cx| client.can_send(cx)));
+            client.update(cx, |client, _| {
+                client.attachments_draft.clear();
+                client
+                    .pending_prompts
+                    .insert(client.active.clone(), (1, String::new(), vec![]));
+            });
+            assert!(!client.update(cx, |client, cx| client.can_send(cx)));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn parked_tray_warns_when_a_new_prompt_would_resume_it(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                client.select_session("ses_parked".into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                client.update(cx, |client, cx| client.resume_warning(cx)),
+                None
+            );
+            client.update(cx, |client, cx| {
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("Next turn", window, cx));
+            });
+            assert!(
+                client
+                    .update(cx, |client, cx| client.resume_warning(cx))
+                    .is_some()
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

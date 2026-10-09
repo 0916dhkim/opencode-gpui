@@ -233,6 +233,12 @@ if [[ "${INTERACTION:-}" == running || "${INTERACTION:-}" == parked ]]; then
     xdotool mousemove 92 "$row_y" click 1
   fi
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == parked-type ]]; then
+  xdotool mousemove --window "$win" 92 224 click 1
+  sleep 0.5
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool type --clearmodifiers --delay 30 'Next turn'
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == queue ]]; then
   xdotool mousemove --window "$win" 92 187 click 1
   sleep 0.8
