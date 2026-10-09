@@ -77,6 +77,27 @@ fn unread_on_server_switch(
         .unwrap_or_default()
 }
 
+fn model_button_presentation(
+    catalog: &ModelCatalog,
+    selected: Option<&ModelSelection>,
+) -> (String, Option<u64>) {
+    if catalog.models.is_empty() {
+        return ("No models available".into(), None);
+    }
+    match selected {
+        Some(selection) => catalog.find(selection).map_or_else(
+            || {
+                (
+                    format!("{}/{}", selection.provider_id, selection.model_id),
+                    None,
+                )
+            },
+            |option| (option.label.clone(), option.context_limit),
+        ),
+        None => ("Choose model".into(), None),
+    }
+}
+
 fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
@@ -460,6 +481,7 @@ struct Client {
     next_session_request_id: u64,
     focus_composer_pending: bool,
     next_model_request_id: u64,
+    model_switches: HashMap<String, PendingModelPick>,
     pending_prompts: HashMap<String, (u64, String, Vec<PathBuf>)>,
     tray_in_flight: HashSet<String>,
     clear_accepted_drafts: Vec<(String, String, Vec<PathBuf>)>,
@@ -869,6 +891,11 @@ struct StaleMeasuredRow {
     row: TranscriptRow,
     height: Pixels,
     images: Vec<Option<Arc<Image>>>,
+}
+
+struct PendingModelPick {
+    request_id: u64,
+    selection: ModelSelection,
 }
 
 impl RowHeightCache {
@@ -1884,6 +1911,7 @@ impl Client {
             next_session_request_id: 0,
             focus_composer_pending: false,
             next_model_request_id: 0,
+            model_switches: HashMap::new(),
             pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
             clear_accepted_drafts: Vec::new(),
@@ -2221,36 +2249,52 @@ impl Client {
     }
 
     fn selected_model(&self) -> Option<ModelSelection> {
-        self.sessions
+        let session = self
+            .sessions
             .iter()
-            .find(|session| session.id == self.active)
-            .and_then(Session::model_selection)
-            .or_else(|| self.catalog.preferred.clone())
+            .find(|session| session.id == self.active);
+        model::displayed_model(
+            self.model_switches
+                .get(&self.active)
+                .map(|pending| &pending.selection),
+            session,
+            &self.catalog,
+        )
     }
 
     fn choose_model(&mut self, model: protocol::ModelRef, cx: &mut Context<Self>) {
         if self.active.is_empty() {
             return;
         }
-        if let Some(api) = &self.api {
-            self.next_model_request_id += 1;
-            api.send(Command::SelectModel {
-                request_id: self.next_model_request_id,
-                session_id: self.active.clone(),
-                model,
-            });
-        } else if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == self.active)
+        let displayed = self.selected_model();
+        if let Some(selection) =
+            model::model_switch_for_pick(displayed.as_ref(), ModelSelection::from_ref(&model))
         {
-            session.model = Some(SessionModel {
-                id: model.id,
-                provider_id: model.provider_id,
-                variant: model.variant,
-            });
+            if let Some(api) = &self.api {
+                self.next_model_request_id += 1;
+                let request_id = self.next_model_request_id;
+                self.model_switches.insert(
+                    self.active.clone(),
+                    PendingModelPick {
+                        request_id,
+                        selection,
+                    },
+                );
+                api.send(Command::SelectModel {
+                    request_id,
+                    session_id: self.active.clone(),
+                    model,
+                });
+            } else if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == self.active)
+            {
+                session.model = Some(SessionModel::from_selection(&selection));
+            }
         }
         self.modal = None;
+        self.focus_composer_pending = true;
         cx.notify();
     }
 
@@ -2487,6 +2531,7 @@ impl Client {
         self.attachments_draft.clear();
         self.attachment_drafts.clear();
         self.pending_prompts.clear();
+        self.model_switches.clear();
         self.clear_accepted_drafts.clear();
         self.transcript.clear();
         self.transcript_spans.clear();
@@ -3006,6 +3051,8 @@ impl Client {
             "t" => Some(Modal::NewSession),
             "p" => Some(Modal::Sessions),
             "," | "comma" => Some(Modal::Settings),
+            "m" if self.modal.is_none() => Some(Modal::Model),
+            "/" | "slash" | "kp_divide" if self.modal.is_none() => Some(Modal::Level),
             _ => None,
         };
         if let Some(modal) = action {
@@ -3014,6 +3061,11 @@ impl Client {
             return;
         }
         if self.modal.is_some() {
+            return;
+        }
+        if key == "u" && !modifiers.shift {
+            self.choose_attachments(cx);
+            cx.stop_propagation();
             return;
         }
         let selection =
@@ -3753,22 +3805,33 @@ impl Client {
                 }
             },
             UiEvent::ModelSelected {
+                request_id,
                 session_id,
                 model,
                 result,
-                ..
-            } => match result {
-                Ok(()) => {
-                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                        session.model = Some(SessionModel {
-                            id: model.id,
-                            provider_id: model.provider_id,
-                            variant: model.variant,
-                        });
+            } => {
+                if self
+                    .model_switches
+                    .get(&session_id)
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    self.model_switches.remove(&session_id);
+                    match result {
+                        Ok(()) => {
+                            if let Some(session) =
+                                self.sessions.iter_mut().find(|s| s.id == session_id)
+                            {
+                                session.model = Some(SessionModel::from_selection(
+                                    &ModelSelection::from_ref(&model),
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            self.connection_status = format!("Model change failed: {error}")
+                        }
                     }
                 }
-                Err(error) => self.connection_status = format!("Model change failed: {error}"),
-            },
+            }
             UiEvent::PromptAccepted {
                 request_id,
                 session_id,
@@ -3865,6 +3928,9 @@ impl Client {
                     }
                     if let Some(change) = model::SessionChange::from_kind(&event, &kind) {
                         let id = change.session_id().to_owned();
+                        if matches!(change, model::SessionChange::ModelSelected { .. }) {
+                            self.model_switches.remove(&id);
+                        }
                         change.apply(&mut self.sessions);
                         if self.active.is_empty()
                             && self.sessions.iter().any(|session| session.id == id)
@@ -3884,6 +3950,7 @@ impl Client {
                             }
                         }
                         if !self.sessions.iter().any(|session| session.id == id) {
+                            self.model_switches.remove(&id);
                             self.open_tabs.retain(|tab| tab != &id);
                             self.conversations.remove(&id);
                             self.transcript.remove(&id);
@@ -4167,6 +4234,7 @@ impl Client {
             next_session_request_id: 0,
             focus_composer_pending: false,
             next_model_request_id: 0,
+            model_switches: HashMap::new(),
             pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
             clear_accepted_drafts: Vec::new(),
@@ -5771,17 +5839,9 @@ impl Client {
     fn composer(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let can_send = self.can_send(cx);
         let selected_model = self.selected_model();
-        let model = selected_model
-            .as_ref()
-            .and_then(|preferred| {
-                self.catalog.models.iter().find(|model| {
-                    model.provider_id == preferred.provider_id
-                        && model.model_id == preferred.model_id
-                })
-            })
-            .or_else(|| self.catalog.models.first());
-        let context = model
-            .and_then(|option| option.context_limit)
+        let (model, context_limit) =
+            model_button_presentation(&self.catalog, selected_model.as_ref());
+        let context = context_limit
             .map(|limit| {
                 let used = self
                     .conversations
@@ -5795,7 +5855,6 @@ impl Client {
                 model::format_context_usage(used, limit)
             })
             .unwrap_or_default();
-        let model = model.map_or("Choose model".to_owned(), |model| model.label.clone());
         let running = self
             .statuses
             .get(&self.active)
@@ -6244,6 +6303,7 @@ impl Client {
                         this.settings.reset_draft(window, cx);
                     }
                     this.modal = None;
+                    this.focus_composer_pending = true;
                     this.rename_target = None;
                     this.rename_error = None;
                     cx.notify();
@@ -9421,6 +9481,30 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn composer_picker_shortcuts_open_the_corresponding_modal(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-m", cx);
+            assert!(client.read(cx).modal == Some(Modal::Model));
+            window.press("escape", cx);
+            assert!(client.read(cx).modal.is_none());
+            window.press("ctrl-/", cx);
+            assert!(client.read(cx).modal == Some(Modal::Level));
+            window.press("escape", cx);
+            assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn sidebar_shortcuts_navigate_rename_and_acknowledge_unread(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
@@ -10047,6 +10131,105 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[gpui_kit::test]
+    fn model_picker_does_not_pin_a_displayed_default_and_ignores_stale_replies(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let displayed = client.selected_model().expect("preview default");
+                let different = client
+                    .catalog
+                    .models
+                    .iter()
+                    .find(|option| {
+                        option.provider_id != displayed.provider_id
+                            || option.model_id != displayed.model_id
+                    })
+                    .expect("second preview model");
+                let picked = protocol::ModelRef {
+                    id: different.model_id.clone(),
+                    provider_id: different.provider_id.clone(),
+                    variant: None,
+                };
+                let (api, _receiver, _) = opencode_gpui::api::ApiHandle::preview();
+                client.api = Some(api);
+                client.choose_model(displayed.to_ref(), cx);
+                assert_eq!(client.next_model_request_id, 0);
+                assert!(client.model_switches.is_empty());
+                assert!(client.focus_composer_pending);
+
+                client.choose_model(picked.clone(), cx);
+                assert_eq!(
+                    client.selected_model(),
+                    Some(model::ModelSelection::from_ref(&picked))
+                );
+                let first = client.model_switches[&client.active].request_id;
+                client.choose_model(displayed.to_ref(), cx);
+                let second = client.model_switches[&client.active].request_id;
+                assert!(second > first);
+                let active = client.active.clone();
+                client.handle_live_event(
+                    super::UiEvent::ModelSelected {
+                        request_id: first,
+                        session_id: active.clone(),
+                        model: picked,
+                        result: Ok(()),
+                    },
+                    cx,
+                );
+                assert_eq!(client.model_switches[&active].request_id, second);
+                assert_eq!(client.selected_model(), Some(displayed.clone()));
+                client.handle_live_event(
+                    super::UiEvent::ModelSelected {
+                        request_id: second,
+                        session_id: active.clone(),
+                        model: displayed.to_ref(),
+                        result: Ok(()),
+                    },
+                    cx,
+                );
+                assert!(!client.model_switches.contains_key(&active));
+                assert_eq!(client.selected_model(), Some(displayed));
+            });
+        });
+    }
+
+    #[test]
+    fn unavailable_saved_model_is_not_relabelled_as_the_first_catalog_option() {
+        let catalog = model::ModelCatalog {
+            models: vec![model::ModelOption {
+                provider_id: "available".into(),
+                model_id: "first".into(),
+                label: "First model".into(),
+                variants: vec![],
+                supports_attachments: true,
+                context_limit: Some(128_000),
+            }],
+            preferred: None,
+        };
+        let missing = model::ModelSelection {
+            provider_id: "missing".into(),
+            model_id: "saved".into(),
+            variant: None,
+        };
+        assert_eq!(
+            super::model_button_presentation(&catalog, Some(&missing)),
+            ("missing/saved".into(), None)
+        );
+        assert_eq!(
+            super::model_button_presentation(&catalog, None),
+            ("Choose model".into(), None)
+        );
     }
 
     #[gpui_kit::test]
