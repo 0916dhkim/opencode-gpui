@@ -5789,7 +5789,7 @@ impl Client {
                     .px(px(24.))
                     .pt(px(16.))
                     .pb(px(16.))
-                    .gap(px(9.))
+                    .gap(px(10.))
                     .bg(self.tone(0xfffdfa, 0x15181b));
                 for (index, (label, input)) in fields.into_iter().enumerate() {
                     let focused = input.focus_handle(cx).is_focused(window);
@@ -5805,7 +5805,7 @@ impl Client {
                     }
                     content = content.child(div().child(label)).child(
                         div()
-                            .h(px(34.))
+                            .h(px(32.))
                             .px(px(9.))
                             .flex()
                             .items_center()
@@ -5922,6 +5922,7 @@ impl Client {
                 div()
                     .w(px(820.))
                     .h(px(674.))
+                    .flex_shrink_0()
                     .flex()
                     .rounded(px(10.))
                     .border_1()
