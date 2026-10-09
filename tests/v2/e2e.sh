@@ -11,7 +11,8 @@
 # 4. Always takes the harness down again.
 #
 # DIR must be outside the repository; it only holds the per-run password.
-# Env knobs: E2E_BUILDER_IMAGE, E2E_UI_IMAGE, E2E_CARGO_VOLUME, E2E_TARGET_VOLUME, and
+# Env knobs: E2E_BUILDER_IMAGE, E2E_UI_IMAGE, E2E_CARGO_VOLUME, E2E_TARGET_VOLUME,
+# E2E_GUI_BINARY (an already built absolute path inside the UI image), and
 # OCGTK_V2H_PREFIX (harness container/network names; see harness.sh).
 set -uo pipefail
 
@@ -91,9 +92,12 @@ fi
 # ---------------------------------------------------------------- GUI smoke
 
 if [ -z "$skip_gui" ]; then
-  # The UI image builds into the repository's own target/, like remote-flow-ui.sh.
-  docker run --rm --platform linux/amd64 -v "$REPO":/app -w /app "$UI_IMAGE" \
-    cargo build --locked >/dev/null 2>&1 || { echo "e2e: GUI build failed" >&2; exit 1; }
+  gui_binary="${E2E_GUI_BINARY:-/app/target/debug/opencode-gpui}"
+  if [ -z "${E2E_GUI_BINARY:-}" ]; then
+    # The UI image builds into the repository's own target/, like remote-flow-ui.sh.
+    docker run --rm --platform linux/amd64 -v "$REPO":/app -w /app "$UI_IMAGE" \
+      cargo build --locked >/dev/null 2>&1 || { echo "e2e: GUI build failed" >&2; exit 1; }
+  fi
   # A fresh server, so nothing the API test left pending covers the composer.
   teardown
   "$HERE/harness.sh" up --state "$state" >/dev/null || { echo "e2e: harness did not come up again" >&2; exit 1; }
@@ -102,7 +106,7 @@ if [ -z "$skip_gui" ]; then
     -v "$state/password":/run/ocgtk/password:ro \
     -v "$shots":/shots \
     -e GUI_PASSWORD_FILE=/run/ocgtk/password \
-    -e GUI_BINARY=/app/target/debug/opencode-gpui \
+    -e GUI_BINARY="$gui_binary" \
     -e GUI_SHOTS=/shots \
     -e GUI_UPSTREAM_HOST="$UPSTREAM" \
     "$UI_IMAGE" bash tests/v2/gui_smoke.sh; then
