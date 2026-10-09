@@ -107,8 +107,14 @@ mark_now
 gpui_click 696 738
 expect permission.once "http and route == 'session.permission.reply' and p.get('sessionID') == '$main' and b.get('decision') == 'once'"
 
-# The earlier-history button is at the top of the main transcript.
+# Bootstrap opens a long transcript pinned to its newest turn. Scroll to the
+# beginning before activating Load earlier; clicking its window coordinate
+# while still at the bottom only hits a user-message row.
 mark_now
+gpui_focus
+xdotool mousemove --window "$window" 490 310 click --repeat 300 --delay 10 4
+sleep 0.5
+if [[ -n "${FLOW_SHOTS:-}" ]]; then import -window "$window" "${FLOW_SHOTS%.png}-history-top.png"; fi
 gpui_click 400 76
 expect history.cursor "http and route == 'message.list' and p.get('sessionID') == '$main' and 'cursor' in q and 'order' not in q"
 
