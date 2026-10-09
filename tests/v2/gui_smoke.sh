@@ -145,6 +145,49 @@ if [[ -n "${shots}" ]]; then
   fi
 fi
 
+# Exercise a second real-server GUI path, not just an API-created tab: create
+# through the project picker and verify the server and persisted active tab.
+state_file="${temporary}/config/opencode-gpui/state.json"
+active_tab() {
+  python3 - "${state_file}" "${base}" <<'PY'
+import json, sys
+try:
+    state = json.load(open(sys.argv[1]))
+    print(state["servers"][sys.argv[2]]["active"] or "")
+except (FileNotFoundError, KeyError, ValueError):
+    print("")
+PY
+}
+gpui_key ctrl+t
+gpui_key Return
+new_session=''
+for _ in $(seq 1 50); do
+  candidate="$(active_tab)"
+  if [[ -n "${candidate}" && "${candidate}" != "${session}" ]]; then
+    new_session="${candidate}"
+    break
+  fi
+  sleep 0.2
+done
+if [[ -n "${new_session}" ]] && api GET "/api/session/${new_session}" |
+    python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("data", {}).get("id") else 1)'; then
+  pass "new-session.gui-created-and-persisted"
+else
+  fail "new-session.gui-created-and-persisted" "no new server session became the active tab"
+fi
+sleep 1
+gpui_key ctrl+1
+restored=''
+for _ in $(seq 1 50); do
+  if [[ "$(active_tab)" == "${session}" ]]; then restored=1; break; fi
+  sleep 0.2
+done
+if [[ -n "${restored}" ]]; then
+  pass "tab-switch.first-session-persisted"
+else
+  fail "tab-switch.first-session-persisted" "Ctrl+1 did not restore the first tab"
+fi
+
 kill -0 "${app}" 2>/dev/null && pass "ui.still-running" || fail "ui.still-running" "client exited"
 if grep -qi "panicked" "${temporary}/app.log"; then fail "ui.no-panic" "$(grep -i -m1 panicked "${temporary}/app.log")"; fi
 

@@ -446,6 +446,7 @@ struct Client {
     child_parents: HashMap<String, String>,
     next_prompt_request_id: u64,
     next_session_request_id: u64,
+    focus_after_create: bool,
     next_model_request_id: u64,
     pending_prompts: HashMap<String, (u64, String, Vec<PathBuf>)>,
     tray_in_flight: HashSet<String>,
@@ -1865,6 +1866,7 @@ impl Client {
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
+            focus_after_create: false,
             next_model_request_id: 0,
             pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
@@ -2240,6 +2242,7 @@ impl Client {
             });
         }
         self.modal = None;
+        self.focus_after_create = true;
         cx.notify();
     }
 
@@ -3628,7 +3631,7 @@ impl Client {
             UiEvent::ModelsLoaded {
                 result: Err(error), ..
             } => self.connection_status = format!("Models failed: {error}"),
-            UiEvent::SessionCreated { result, .. } => match result {
+            UiEvent::SessionCreated { request_id, result } => match result {
                 Ok(session) => {
                     let id = session.id.clone();
                     // The SSE creation can arrive before the POST response;
@@ -3645,8 +3648,19 @@ impl Client {
                         model::SessionChange::Created(session).apply(&mut self.sessions);
                     }
                     self.select_session(id);
+                    if request_id == self.next_session_request_id {
+                        // The new session gets a different TextareaState; any
+                        // focus restored when the picker closed belonged to
+                        // the previous tab's composer.
+                        self.focus_after_create = true;
+                    }
                 }
-                Err(error) => self.connection_status = format!("Create failed: {error}"),
+                Err(error) => {
+                    self.connection_status = format!("Create failed: {error}");
+                    if request_id == self.next_session_request_id {
+                        self.focus_after_create = true;
+                    }
+                }
             },
             UiEvent::SessionRenamed {
                 request_id,
@@ -4088,6 +4102,7 @@ impl Client {
             child_parents: HashMap::new(),
             next_prompt_request_id: 0,
             next_session_request_id: 0,
+            focus_after_create: false,
             next_model_request_id: 0,
             pending_prompts: HashMap::new(),
             tray_in_flight: HashSet::new(),
@@ -7194,6 +7209,11 @@ impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
         self.sync_composer(window, cx);
+        if self.focus_after_create && self.modal.is_none() && self.visible_permission().is_none() {
+            self.focus_after_create = false;
+            let focus = self.composer.focus_handle(cx);
+            window.on_next_frame(move |window, cx| focus.focus(window, cx));
+        }
         let composer_focused = self.composer.focus_handle(cx).is_focused(window);
         if composer_focused != self.composer_placeholder_focused {
             self.composer_placeholder_focused = composer_focused;
@@ -9785,6 +9805,50 @@ mod tests {
                     );
                 }
             });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn new_session_picker_and_create_response_focus_the_current_composer(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::NewSession, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
+            let old_composer = client.read(cx).composer.clone();
+            client.update(cx, |client, cx| client.create_session("/repo".into(), cx));
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            assert!(old_composer.focus_handle(cx).is_focused(window));
+
+            client.update(cx, |client, cx| {
+                let mut session = client.sessions[0].clone();
+                session.id = "ses_created".into();
+                client.handle_live_event(
+                    super::UiEvent::SessionCreated {
+                        request_id: client.next_session_request_id,
+                        result: Ok(session),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            let current = client.read(cx).composer.clone();
+            assert_ne!(current.entity_id(), old_composer.entity_id());
+            assert!(current.focus_handle(cx).is_focused(window));
         })
         .unwrap();
     }
