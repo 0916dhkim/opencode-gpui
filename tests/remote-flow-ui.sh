@@ -162,6 +162,10 @@ if [[ -n "$new_session" ]]; then
   mark_now
   gpui_click 680 607
   expect tray.steer "http and route == 'session.inbox.update' and b.get('delivery') == 'steer' and r['status'] == 204"
+  expect tray.steer-event "ev == 'session.inbox.delivery.changed' and r.get('sessionID') == '$new_session'"
+  # A 204 is recorded before the UI necessarily paints the SSE-updated switch.
+  # Press Space only after that state has had a frame to settle.
+  sleep 0.5
   mark_now
   # The same named switch control remains focused after the delivery flips;
   # Space must dispatch the reverse action through its semantic button.
