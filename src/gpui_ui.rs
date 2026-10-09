@@ -395,6 +395,7 @@ struct Client {
     attachments: ImageCache,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
+    composer_action_focus: [FocusHandle; 5],
     composer_placeholder_focused: bool,
     composer_session: String,
     composers: HashMap<String, Entity<TextareaState>>,
@@ -1306,6 +1307,7 @@ impl Client {
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
+            composer_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             composer_placeholder_focused: false,
             composer_session: String::new(),
             composers: HashMap::new(),
@@ -3365,6 +3367,7 @@ impl Client {
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
+            composer_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             composer_placeholder_focused: false,
             composer_session: String::new(),
             composers: HashMap::new(),
@@ -4894,6 +4897,19 @@ impl Client {
                     .child(
                         div()
                             .id("attach-file")
+                            .role(Role::Button)
+                            .aria_label("Attach file")
+                            .test_support()
+                            .track_focus(&self.composer_action_focus[0])
+                            .focus_visible(|style| {
+                                style.border_color(self.tone(0x2356a8, 0x78baff))
+                            })
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.choose_attachments(cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.choose_attachments(cx);
@@ -4908,6 +4924,19 @@ impl Client {
                     .child(
                         div()
                             .id("composer-model")
+                            .role(Role::Button)
+                            .aria_label("Choose model")
+                            .test_support()
+                            .track_focus(&self.composer_action_focus[1])
+                            .focus_visible(|style| {
+                                style.border_color(self.tone(0x2356a8, 0x78baff))
+                            })
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.show_modal(Modal::Model, window, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Model, window, cx);
@@ -4928,6 +4957,19 @@ impl Client {
                     .child(
                         div()
                             .id("composer-level")
+                            .role(Role::Button)
+                            .aria_label("Choose reasoning level")
+                            .test_support()
+                            .track_focus(&self.composer_action_focus[2])
+                            .focus_visible(|style| {
+                                style.border_color(self.tone(0x2356a8, 0x78baff))
+                            })
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.show_modal(Modal::Level, window, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Level, window, cx);
@@ -4963,6 +5005,24 @@ impl Client {
                         footer.child(
                             div()
                                 .id("stop-run")
+                                .role(Role::Button)
+                                .aria_label("Stop current run")
+                                .test_support()
+                                .track_focus(&self.composer_action_focus[3])
+                                .focus_visible(|style| {
+                                    style.border_color(self.tone(0x2356a8, 0x78baff))
+                                })
+                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                        if let Some(api) = &this.api {
+                                            api.send(Command::Abort {
+                                                session_id: this.active.clone(),
+                                            });
+                                        }
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }
+                                }))
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(api) = &this.api {
@@ -4988,8 +5048,24 @@ impl Client {
                             .id("send-prompt")
                             .role(Role::Button)
                             .aria_label("Send prompt")
+                            .test_support()
                             .when(can_send, |button| {
                                 button
+                                    .track_focus(&self.composer_action_focus[4])
+                                    .focus_visible(|style| {
+                                        style.border_color(self.tone(0x2356a8, 0x78baff))
+                                    })
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, _, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.send_prompt(false, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.send_prompt(false, cx);
@@ -8310,6 +8386,60 @@ mod tests {
                     .insert(client.active.clone(), (1, String::new(), vec![]));
             });
             assert!(!client.update(cx, |client, cx| client.can_send(cx)));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn composer_controls_have_names_focus_and_keyboard_actions(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for (id, name) in [
+                ("attach-file", "Attach file"),
+                ("composer-model", "Choose model"),
+                ("composer-level", "Choose reasoning level"),
+            ] {
+                let control = window.find(id);
+                assert_eq!(control.role(), Some(Role::Button));
+                assert_eq!(control.label(), Some(name));
+            }
+            let model_focus = client.read(cx).composer_action_focus[1].clone();
+            model_focus.focus(window, cx);
+            window.press("enter", cx);
+            assert!(client.read(cx).modal == Some(Modal::Model));
+            window.press("escape", cx);
+            let level_focus = client.read(cx).composer_action_focus[2].clone();
+            level_focus.focus(window, cx);
+            window.press("space", cx);
+            assert!(client.read(cx).modal == Some(Modal::Level));
+            window.press("escape", cx);
+            let (api, _, _) = super::ApiHandle::preview();
+            client.update(cx, |client, cx| {
+                client.api = Some(api);
+                client.permissions.clear();
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("Keyboard send", window, cx));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("send-prompt").role(), Some(Role::Button));
+            let send_focus = client.read(cx).composer_action_focus[4].clone();
+            send_focus.focus(window, cx);
+            window.press("enter", cx);
+            assert!(
+                client
+                    .read(cx)
+                    .pending_prompts
+                    .contains_key(&client.read(cx).active)
+            );
         })
         .unwrap();
     }

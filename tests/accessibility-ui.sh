@@ -111,13 +111,26 @@ for button in session_buttons:
         assert any(child.getRoleName() == 'push button'
                     and child.name.startswith(prefix) and 'Action' in child.get_interfaces()
                     and pyatspi.STATE_FOCUSABLE in child.getState().getStates()
-                    for child in children), f'{button.name} lacks actionable {prefix}'
+                     for child in children), f'{button.name} lacks actionable {prefix}'
+for name in ('Attach file', 'Choose model', 'Choose reasoning level'):
+    matches_by_name = [child for child in frames[0]
+                       if child.getRoleName() == 'push button' and child.name == name]
+    assert len(matches_by_name) == 1, f'{name} is not exposed exactly once'
+    control = matches_by_name[0]
+    assert 'Action' in control.get_interfaces(), f'{name} lacks Action'
+    assert pyatspi.STATE_FOCUSABLE in control.getState().getStates(), (
+        f'{name} is not keyboard-focusable')
+send_buttons = [child for child in frames[0]
+                if child.getRoleName() == 'push button' and child.name == 'Send prompt']
+assert len(send_buttons) == 1, 'The Send button lacks a platform-accessible name'
+assert 'Action' not in send_buttons[0].get_interfaces(), (
+    'The empty Send button unexpectedly exposes an action')
 for interface in ('Text', 'EditableText'):
     try:
         getattr(entries[0], 'query' + interface)()
         print(f'Composer supports {interface} interface')
     except NotImplementedError:
         print(f'Composer does not support {interface} interface')
-print(f'PASS GPUI application, window, named composer, and {len(session_buttons)} '
-      'session buttons with rename/close actions are exposed through AT-SPI')
+print(f'PASS GPUI application, window, named composer, {len(session_buttons)} '
+      'session buttons and three actionable composer controls are exposed through AT-SPI')
 PY
