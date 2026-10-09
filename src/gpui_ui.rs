@@ -5154,6 +5154,7 @@ impl Client {
         let mut files = div().px(px(13.)).flex().gap(px(7.));
         for (index, path) in self.attachments_draft.iter().enumerate() {
             let target = path.clone();
+            let session_id = self.active.clone();
             let label = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -5166,14 +5167,24 @@ impl Client {
                     .bg(self.tone(0xf4f1eb, 0x262b30))
                     .flex()
                     .gap(px(6.))
-                    .child(label)
+                    .child(label.clone())
                     .child(
-                        div()
-                            .id(format!("remove-attachment-{index}"))
-                            .cursor_pointer()
+                        BaseButton::new(format!("remove-attachment-{index}"))
+                            .accessibility_label(format!("Remove attachment: {label}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.attachments_draft.retain(|path| path != &target);
-                                cx.notify();
+                                if this.active != session_id {
+                                    return;
+                                }
+                                let matching = this.attachments_draft.get(index) == Some(&target);
+                                let index = matching.then_some(index).or_else(|| {
+                                    this.attachments_draft
+                                        .iter()
+                                        .position(|path| path == &target)
+                                });
+                                if let Some(index) = index {
+                                    this.attachments_draft.remove(index);
+                                    cx.notify();
+                                }
                             }))
                             .child("×"),
                     ),
@@ -8253,6 +8264,37 @@ mod tests {
             // must be handled without leaking Space into the composer.
             window.press("space", cx);
             assert!(window.try_find("cancel-form").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn duplicate_attachment_chips_remove_one_named_file_at_a_time(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.attachments_draft = vec![PathBuf::from("/work/photo.png"); 2];
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let remove = window.find("remove-attachment-0");
+            assert_eq!(remove.role(), Some(Role::Button));
+            assert_eq!(remove.label(), Some("Remove attachment: photo.png"));
+            window.click("remove-attachment-0", cx);
+            assert_eq!(client.read(cx).attachments_draft.len(), 1);
+            window.render_frame(cx);
+            let remove = window.find("remove-attachment-0");
+            assert_eq!(remove.role(), Some(Role::Button));
+            window.press("space", cx);
+            assert!(client.read(cx).attachments_draft.is_empty());
         })
         .unwrap();
     }
