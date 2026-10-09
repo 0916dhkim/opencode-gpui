@@ -592,6 +592,12 @@ enum MarkdownBlock {
     Paragraph(String),
     List(Vec<String>),
     Code(String, String),
+    NestedCode {
+        language: String,
+        content: String,
+        list_depth: usize,
+        quote_depth: usize,
+    },
     Structured {
         content: String,
         marker: Option<String>,
@@ -1167,6 +1173,7 @@ fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
                 false
             }
             Event::Start(Tag::BlockQuote(_) | Tag::Table(_))
+            | Event::Start(Tag::Image { .. })
             | Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))
             | Event::TaskListMarker(_)
             | Event::Rule => true,
@@ -1209,21 +1216,28 @@ fn flush_inline(blocks: &mut Vec<MarkdownBlock>, current: &mut Option<InlineMark
 fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock> {
     let mut blocks = Vec::new();
     let mut current: Option<InlineMarkdownBlock> = None;
-    let mut code: Option<(String, String)> = None;
+    let mut code: Option<(String, String, usize, usize)> = None;
     let mut table: Option<MarkdownTableBuilder> = None;
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut marker: Option<String> = None;
     let mut quote_depth = 0;
     let mut links: Vec<String> = Vec::new();
     for event in Parser::new_ext(source, options) {
-        if let Some((_, content)) = code.as_mut() {
+        if let Some((_, content, _, _)) = code.as_mut() {
             match event {
                 Event::End(TagEnd::CodeBlock) => {
-                    let (language, content) = code.take().unwrap();
-                    blocks.push(MarkdownBlock::Code(
-                        language,
-                        content.trim_end_matches('\n').into(),
-                    ));
+                    let (language, content, list_depth, quote_depth) = code.take().unwrap();
+                    let content = content.trim_end_matches('\n').to_owned();
+                    blocks.push(if list_depth > 0 || quote_depth > 0 {
+                        MarkdownBlock::NestedCode {
+                            language,
+                            content,
+                            list_depth,
+                            quote_depth,
+                        }
+                    } else {
+                        MarkdownBlock::Code(language, content)
+                    });
                 }
                 Event::Text(text) | Event::Code(text) => content.push_str(&text),
                 Event::SoftBreak | Event::HardBreak => content.push('\n'),
@@ -1273,7 +1287,7 @@ fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock>
                         .into(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                code = Some((language, String::new()));
+                code = Some((language, String::new(), lists.len(), quote_depth));
             }
             Event::Start(Tag::Table(_)) => {
                 flush_inline(&mut blocks, &mut current);
@@ -1356,6 +1370,15 @@ fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock>
                     lists.len(),
                     quote_depth,
                     &format!("]({destination})"),
+                );
+            }
+            Event::Start(Tag::Image { .. }) => {
+                append_inline(
+                    &mut current,
+                    &mut marker,
+                    lists.len(),
+                    quote_depth,
+                    "Image: ",
                 );
             }
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
@@ -1492,6 +1515,61 @@ impl Client {
         rgb(if self.dark { dark } else { light })
     }
 
+    fn markdown_code_block(
+        &self,
+        language: String,
+        code: String,
+        row_index: usize,
+        block_index: usize,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let copy = code.clone();
+        div()
+            .w_full()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(self.tone(0xd2cdc5, 0x30353a))
+            .bg(self.tone(0xf7f5f1, 0x171a1d))
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(32.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .bg(self.tone(0xece9e2, 0x14171a))
+                    .border_b_1()
+                    .border_color(self.tone(0xd2cdc5, 0x282c30))
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(self.tone(0x777e7d, 0x899198))
+                    .child(language)
+                    .child(div().flex_1())
+                    .child(
+                        BaseButton::new(format!("copy-code-{row_index}-{block_index}"))
+                            .accessibility_label("Copy code")
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                            }))
+                            .child(
+                                Icon::default()
+                                    .data(include_bytes!("icons/copy.svg"))
+                                    .with_size(px(12.))
+                                    .text_color(self.tone(0x777e7d, 0x899198)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .min_h(px(65.))
+                    .p(px(12.))
+                    .font_family("monospace")
+                    .text_size(px(12.))
+                    .child(code),
+            )
+            .into_any_element()
+    }
+
     fn markdown_body(&self, source: &str, row_index: usize, cx: &Context<Self>) -> AnyElement {
         let mut content = div().w_full().flex().flex_col().gap(px(10.));
         for (block_index, block) in markdown_blocks(source).into_iter().enumerate() {
@@ -1597,52 +1675,31 @@ impl Client {
                     list.into_any_element()
                 }
                 MarkdownBlock::Code(language, code) => {
-                    let copy = code.clone();
-                    div()
+                    self.markdown_code_block(language, code, row_index, block_index, cx)
+                }
+                MarkdownBlock::NestedCode {
+                    language,
+                    content,
+                    list_depth,
+                    quote_depth,
+                } => {
+                    let mut wrapper = div()
                         .w_full()
-                        .rounded(px(7.))
-                        .border_1()
-                        .border_color(self.tone(0xd2cdc5, 0x30353a))
-                        .bg(self.tone(0xf7f5f1, 0x171a1d))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .h(px(32.))
-                                .px(px(12.))
-                                .flex()
-                                .items_center()
-                                .bg(self.tone(0xece9e2, 0x14171a))
-                                .border_b_1()
-                                .border_color(self.tone(0xd2cdc5, 0x282c30))
-                                .text_size(px(10.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(self.tone(0x777e7d, 0x899198))
-                                .child(language)
-                                .child(div().flex_1())
-                                .child(
-                                    BaseButton::new(format!("copy-code-{row_index}-{block_index}"))
-                                        .accessibility_label("Copy code")
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                copy.clone(),
-                                            ));
-                                        }))
-                                        .child(
-                                            Icon::default()
-                                                .data(include_bytes!("icons/copy.svg"))
-                                                .with_size(px(12.))
-                                                .text_color(self.tone(0x777e7d, 0x899198)),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .min_h(px(65.))
-                                .p(px(12.))
-                                .font_family("monospace")
-                                .text_size(px(12.))
-                                .child(code),
-                        )
+                        .pl(px(16. * list_depth.saturating_sub(1) as f32));
+                    if quote_depth > 0 {
+                        wrapper = wrapper
+                            .border_l_1()
+                            .border_color(self.tone(0xb7b3ac, 0x50565b))
+                            .pl(px(10. + 12. * (quote_depth - 1) as f32));
+                    }
+                    wrapper
+                        .child(self.markdown_code_block(
+                            language,
+                            content,
+                            row_index,
+                            block_index,
+                            cx,
+                        ))
                         .into_any_element()
                 }
             };
@@ -10470,8 +10527,13 @@ mod tests {
                 .contains(&MarkdownBlock::Code("sh".into(), "echo ok".into()))
         );
         assert!(markdown_blocks("- parent\n\n      code line").iter().any(
-            |block| matches!(block, MarkdownBlock::Code(_, code) if code.contains("code line"))
+            |block| matches!(block, MarkdownBlock::NestedCode { content, list_depth: 1, .. } if content.contains("code line"))
         ));
+        let nested = markdown_blocks(
+            "> ```rust\n> let x = 22;\n> ```\n\n![clip](https://example.com/clip.png)",
+        );
+        assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::NestedCode { language, content, quote_depth: 1, .. } if language == "rust" && content == "let x = 22;")));
+        assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "Image: clip")));
     }
 
     #[gpui_kit::test]
