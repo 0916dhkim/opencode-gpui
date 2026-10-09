@@ -4736,11 +4736,14 @@ impl Client {
         }
         let sticky = self.sticky_user_row(window).map(|row| {
             div()
+                .id("sticky-user")
+                .test_support()
                 .absolute()
                 .top_0()
                 .left_0()
                 .right(px(TRANSCRIPT_SCROLLBAR_GUTTER))
-                .h(px(106.))
+                .min_h(px(106.))
+                .max_h(px(226.))
                 .px(px(28.))
                 .pt(px(18.))
                 .flex()
@@ -4765,7 +4768,14 @@ impl Client {
                                 .child(timestamp(row.time)),
                         ),
                 )
-                .child(row.body.clone())
+                .child(
+                    div()
+                        .id("sticky-body")
+                        .test_support()
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .child(row.body.clone()),
+                )
                 .into_any_element()
         });
         let has_load = self
@@ -9593,6 +9603,49 @@ mod tests {
         assert_eq!(sticky_user_index(users, px(0.), px(400.)), Some(3));
         let users = [(0, px(-480.), px(-385.)), (3, px(0.), px(70.))];
         assert_eq!(sticky_user_index(users, px(0.), px(400.)), None);
+    }
+
+    #[gpui_kit::test]
+    fn long_sticky_prompt_is_capped_and_scrollable(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            assert!(window.try_find("sticky-user").is_some());
+        })
+        .unwrap();
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let rows = client.transcript.get_mut(&client.active).unwrap();
+                let user = rows
+                    .iter_mut()
+                    .find(|row| row.role == model::Role::User)
+                    .unwrap();
+                user.body = "A long prompt with wrapped words and lines. ".repeat(100);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let sticky = window.find("sticky-user").bounds();
+            let body = window.find("sticky-body").bounds();
+            assert!(sticky.size.height > px(106.), "long prompt did not grow");
+            assert!(
+                sticky.size.height <= px(226.),
+                "sticky prompt escaped its cap"
+            );
+            assert!(
+                body.size.height <= px(180.),
+                "sticky body escaped its scroll cap"
+            );
+        })
+        .unwrap();
     }
 
     #[test]
