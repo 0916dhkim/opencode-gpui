@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
@@ -456,6 +456,9 @@ struct Client {
     attachment_drafts: HashMap<String, Vec<PathBuf>>,
     overlay: Option<String>,
     scroll: VirtualListScrollHandle,
+    safe_scroll: HashMap<String, (RowLayoutStamp, Point<Pixels>)>,
+    safe_anchors: HashMap<String, (RowLayoutStamp, TranscriptAnchor)>,
+    pending_jump: Option<PendingTranscriptJump>,
     history_focus: FocusHandle,
     sessions_picker_scroll: ScrollHandle,
     picker_list_scroll: ScrollHandle,
@@ -650,6 +653,8 @@ enum MarkdownBlock {
 // Increment this when the row's typography or layout rules change. The other
 // parts of the stamp follow the live width, theme and conversation snapshot.
 const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 2;
+const TRANSCRIPT_MEASURE_BATCH: usize = 64;
+const TRANSCRIPT_PROGRESSIVE_MIN_ROWS: usize = 256;
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
 const SIDEBAR_WIDTH: f32 = 270.;
 const TRANSCRIPT_SCROLLBAR_GUTTER: f32 = 14.;
@@ -674,6 +679,12 @@ struct TranscriptAnchor {
     key: TranscriptRowKey,
     within: Pixels,
     offset: Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct PendingTranscriptJump {
+    stamp: RowLayoutStamp,
+    anchor: TranscriptAnchor,
 }
 
 /// One entry for every message, including undelivered prompts with zero rows.
@@ -788,14 +799,14 @@ fn splice_transcript(
 
 struct CachedImage {
     url: String,
-    image: Option<Arc<Image>>,
+    image: OnceLock<Option<Arc<Image>>>,
 }
 
 #[derive(Default)]
 struct ImageCache {
     entries: HashMap<(String, TranscriptRowKey, usize), CachedImage>,
     #[cfg(test)]
-    decodes: usize,
+    decodes: std::cell::Cell<usize>,
 }
 
 impl ImageCache {
@@ -803,7 +814,25 @@ impl ImageCache {
         self.entries
             .get(&(session.to_owned(), row.key.clone(), index))
             .filter(|entry| row.images.get(index) == Some(&entry.url))
-            .and_then(|entry| entry.image.as_ref())
+            .and_then(|entry| {
+                entry
+                    .image
+                    .get_or_init(|| {
+                        #[cfg(test)]
+                        self.decodes.set(self.decodes.get() + 1);
+                        inline_image(&entry.url)
+                    })
+                    .as_ref()
+            })
+    }
+
+    /// A replaced offscreen row must not decode an old image merely to keep
+    /// a stale snapshot; only already painted images need that retention.
+    fn peek(&self, session: &str, row: &TranscriptRow, index: usize) -> Option<&Arc<Image>> {
+        self.entries
+            .get(&(session.to_owned(), row.key.clone(), index))
+            .filter(|entry| row.images.get(index) == Some(&entry.url))
+            .and_then(|entry| entry.image.get().and_then(Option::as_ref))
     }
 
     fn update(&mut self, session: &str, rows: &[TranscriptRow], change: &ProjectionChange) {
@@ -827,15 +856,11 @@ impl ImageCache {
                 {
                     continue;
                 }
-                #[cfg(test)]
-                {
-                    self.decodes += 1;
-                }
                 self.entries.insert(
                     key,
                     CachedImage {
                         url: url.clone(),
-                        image: inline_image(url),
+                        image: OnceLock::new(),
                     },
                 );
             }
@@ -863,7 +888,7 @@ fn update_session_projection(
     splice_transcript(conversation, rows, spans).map(|mut change| {
         for row in &change.old_rows {
             for index in 0..row.images.len() {
-                if let Some(image) = images.get(session, row, index) {
+                if let Some(image) = images.peek(session, row, index) {
                     change
                         .old_images
                         .insert((row.key.clone(), index), image.clone());
@@ -899,17 +924,160 @@ struct PendingModelPick {
 }
 
 impl RowHeightCache {
-    fn missing(&mut self, stamp: RowLayoutStamp, rows: &[TranscriptRow]) -> Vec<usize> {
+    fn prepare_stamp(&mut self, stamp: RowLayoutStamp) {
         if self.stamp != Some(stamp) {
             self.entries.clear();
             self.stale.clear();
             self.load_height = None;
             self.stamp = Some(stamp);
         }
+    }
+
+    fn missing(&mut self, stamp: RowLayoutStamp, rows: &[TranscriptRow]) -> Vec<usize> {
+        self.prepare_stamp(stamp);
         rows.iter()
             .enumerate()
             .filter_map(|(index, row)| self.height(row).is_none().then_some(index))
             .collect()
+    }
+
+    /// Choose a bounded exact-layout batch nearest the first-visit tail.
+    /// This planner does not change what is painted until the virtual list can
+    /// safely admit partially measured ranges without blank visible slots.
+    fn missing_tail(
+        &mut self,
+        stamp: RowLayoutStamp,
+        rows: &[TranscriptRow],
+        budget: usize,
+        target_height: Pixels,
+    ) -> Vec<usize> {
+        self.prepare_stamp(stamp);
+        let mut indices = Vec::with_capacity(budget);
+        let mut exact_height = px(0.);
+        for (index, row) in rows.iter().enumerate().rev() {
+            if let Some(height) = self.height(row) {
+                exact_height += height;
+                if exact_height >= target_height {
+                    break;
+                }
+            } else {
+                indices.push(index);
+                if indices.len() == budget {
+                    break;
+                }
+            }
+        }
+        indices.reverse();
+        indices
+    }
+
+    fn missing_range(
+        &mut self,
+        stamp: RowLayoutStamp,
+        rows: &[TranscriptRow],
+        range: std::ops::Range<usize>,
+        budget: usize,
+    ) -> Vec<usize> {
+        self.prepare_stamp(stamp);
+        rows.iter()
+            .enumerate()
+            .skip(range.start)
+            .take(range.end.saturating_sub(range.start))
+            .filter_map(|(index, row)| self.height(row).is_none().then_some(index))
+            .take(budget)
+            .collect()
+    }
+
+    fn exact_tail(&self, rows: &[TranscriptRow]) -> (usize, Pixels) {
+        let mut count = 0;
+        let mut height = px(0.);
+        for row in rows.iter().rev() {
+            let Some(exact) = self.height(row) else { break };
+            count += 1;
+            height += exact;
+        }
+        (count, height)
+    }
+
+    fn provisional_prefix(&self, rows: &[TranscriptRow], index: usize, has_load: bool) -> Pixels {
+        let mut top = if has_load {
+            self.load_height.map_or(px(48.), |(_, height)| height)
+        } else {
+            px(0.)
+        };
+        for row in rows.iter().take(index) {
+            top += self
+                .entries
+                .get(&row.key)
+                .map_or(px(64.), |entry| entry.height);
+        }
+        top
+    }
+
+    fn provisional_viewport(
+        &self,
+        rows: &[TranscriptRow],
+        has_load: bool,
+        offset: Point<Pixels>,
+        viewport_height: Pixels,
+    ) -> std::ops::Range<usize> {
+        let first_row = usize::from(has_load);
+        let visible_top = (-offset.y).max(px(0.));
+        let visible_bottom = visible_top + viewport_height;
+        let mut top = px(0.);
+        let mut start = None;
+        let mut end = first_row;
+        if has_load {
+            let height = self.load_height.map_or(px(48.), |(_, height)| height);
+            if height > visible_top {
+                start = Some(0);
+            }
+            top += height;
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let height = self
+                .entries
+                .get(&row.key)
+                .map_or(px(64.), |entry| entry.height);
+            let item = index + first_row;
+            if top + height > visible_top && start.is_none() {
+                start = Some(item);
+            }
+            if top < visible_bottom {
+                end = item + 1;
+            }
+            top += height;
+            if top >= visible_bottom && start.is_some() {
+                break;
+            }
+        }
+        let length = rows.len() + first_row;
+        let start = start.unwrap_or(length.saturating_sub(1));
+        start..end.max(start + 1).min(length)
+    }
+
+    fn viewport_ready(
+        &self,
+        rows: &[TranscriptRow],
+        has_load: bool,
+        loading: bool,
+        range: std::ops::Range<usize>,
+    ) -> bool {
+        range.into_iter().all(|index| {
+            if has_load && index == 0 {
+                self.load_height
+                    .is_some_and(|(was_loading, _)| was_loading == loading)
+            } else {
+                let row = &rows[index - usize::from(has_load)];
+                self.height(row).is_some()
+                    || self.stale.get(&row.key).is_some_and(|old| {
+                        self.entries.get(&row.key).is_some_and(|entry| {
+                            entry.revision == old.row.render_revision()
+                                && entry.height == old.height
+                        })
+                    })
+            }
+        })
     }
 
     fn record(
@@ -1886,6 +2054,9 @@ impl Client {
             attachment_drafts: HashMap::new(),
             overlay: None,
             scroll,
+            safe_scroll: HashMap::new(),
+            safe_anchors: HashMap::new(),
+            pending_jump: None,
             history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
@@ -2033,6 +2204,7 @@ impl Client {
                 .or_insert_with(VirtualListScrollHandle::new)
                 .clone();
             self.preserve_scroll = None;
+            self.pending_jump = None;
             self.follow_bottom = first_visit.then(|| (id.clone(), self.scroll.offset()));
             self.active = id.clone();
             // First visits pin after exact heights arrive. Returning to a
@@ -2539,6 +2711,9 @@ impl Client {
         self.row_heights.clear();
         self.virtual_scrolls.clear();
         self.scroll = VirtualListScrollHandle::new();
+        self.safe_scroll.clear();
+        self.safe_anchors.clear();
+        self.pending_jump = None;
         self.conversations.clear();
         self.loading_messages.clear();
         self.message_events_during_load.clear();
@@ -3451,14 +3626,14 @@ impl Client {
             .get(&self.active)
             .is_some_and(|conversation| conversation.next_cursor.is_some());
         let cache = self.row_heights.get(&self.active)?.borrow();
-        let mut top = if has_load {
-            cache.load_height?.1
-        } else {
-            px(0.)
-        };
+        let mut top = cache.provisional_prefix(rows, 0, has_load);
         let visible_top = -offset.y;
         for row in rows {
-            let bottom = top + cache.height(row)?;
+            let bottom = top
+                + cache
+                    .entries
+                    .get(&row.key)
+                    .map_or(px(64.), |entry| entry.height);
             if bottom > visible_top {
                 return Some(TranscriptAnchor {
                     session: self.active.clone(),
@@ -3472,6 +3647,179 @@ impl Client {
             top = bottom;
         }
         None
+    }
+
+    /// The Kit decides the visible range in prepaint. Before it reaches that
+    /// callback, hold the last exact viewport while measuring an unmeasured
+    /// jump; otherwise the callback would paint empty provisional slots.
+    fn guard_unmeasured_scroll(&mut self, window: &Window) {
+        let Some(rows) = self.transcript.get(&self.active) else {
+            return;
+        };
+        if rows.len() <= TRANSCRIPT_PROGRESSIVE_MIN_ROWS {
+            return;
+        }
+        if let Some(anchor) = &self.preserve_scroll
+            && anchor.session == self.active
+        {
+            if self.scroll.offset() == anchor.offset && rows.iter().any(|row| row.key == anchor.key)
+            {
+                return;
+            }
+            // A user movement or deletion of the anchored row supersedes it.
+            self.preserve_scroll = None;
+        }
+        let width = window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        let stamp = RowLayoutStamp {
+            width,
+            dark: self.dark,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: self
+                .conversations
+                .get(&self.active)
+                .map_or(0, Conversation::cache_epoch),
+        };
+        let has_load = self
+            .conversations
+            .get(&self.active)
+            .is_some_and(|conversation| conversation.next_cursor.is_some());
+        let loading = self.loading_messages.contains_key(&self.active);
+        let cache = self
+            .row_heights
+            .entry(self.active.clone())
+            .or_default()
+            .clone();
+        let cache = cache.borrow();
+        if cache.stamp != Some(stamp) {
+            self.safe_scroll.remove(&self.active);
+            self.safe_anchors.remove(&self.active);
+            if self
+                .follow_bottom
+                .as_ref()
+                .is_some_and(|(session, offset)| {
+                    session == &self.active && *offset == self.scroll.offset()
+                })
+            {
+                self.pending_jump = None;
+                return;
+            }
+            // Keep a scrolled-up row stable across a resize/theme/snapshot
+            // invalidation while only its neighborhood is remeasured.
+            let current = self.scroll.offset();
+            let visible_top = (-current.y).max(px(0.));
+            let sizes = cache.provisional_sizes(rows, has_load, width);
+            let mut top = px(0.);
+            let mut row_index = rows.len() - 1;
+            for (index, item) in sizes.iter().enumerate() {
+                if top + item.height > visible_top {
+                    row_index = index
+                        .saturating_sub(usize::from(has_load))
+                        .min(rows.len() - 1);
+                    break;
+                }
+                top += item.height;
+            }
+            let within = visible_top - cache.provisional_prefix(rows, row_index, has_load);
+            let estimated_top = px(row_index as f32 * 64. + if has_load { 48. } else { 0. });
+            let parked = point(current.x, -(estimated_top + within));
+            self.pending_jump = Some(PendingTranscriptJump {
+                stamp,
+                anchor: TranscriptAnchor {
+                    session: self.active.clone(),
+                    key: rows[row_index].key.clone(),
+                    within,
+                    offset: parked,
+                },
+            });
+            self.scroll.set_offset(parked);
+            return;
+        }
+        let current = self.scroll.offset();
+        if cache.sizes(rows, has_load, width).is_some() {
+            self.safe_scroll
+                .insert(self.active.clone(), (stamp, current));
+            self.pending_jump = None;
+            return;
+        }
+        let viewport_height = if self.scroll.bounds().size.height > px(0.) {
+            self.scroll.bounds().size.height
+        } else {
+            (window.viewport_size().height - px(220.)).max(px(160.))
+        };
+        let safe = self
+            .safe_scroll
+            .get(&self.active)
+            .filter(|(saved_stamp, _)| *saved_stamp == stamp)
+            .map(|(_, offset)| *offset);
+        if let Some(jump) = &self.pending_jump
+            && jump.stamp == stamp
+            && jump.anchor.session == self.active
+            && (safe == Some(current) || (safe.is_none() && current == jump.anchor.offset))
+        {
+            if let Some(index) = rows.iter().position(|row| row.key == jump.anchor.key) {
+                if cache.height(&rows[index]).is_none() {
+                    return; // Do not use a 64px estimate for a tall anchor.
+                }
+                let top = cache.provisional_prefix(rows, index, has_load);
+                let target = point(current.x, -(top + jump.anchor.within));
+                let range = cache.provisional_viewport(rows, has_load, target, viewport_height);
+                if cache.viewport_ready(rows, has_load, loading, range) {
+                    self.scroll.set_offset(target);
+                    self.safe_scroll
+                        .insert(self.active.clone(), (stamp, target));
+                    self.pending_jump = None;
+                }
+                return;
+            }
+            self.pending_jump = None; // The anchored row was deleted.
+        }
+        let range = cache.provisional_viewport(rows, has_load, current, viewport_height);
+        if cache.viewport_ready(rows, has_load, loading, range) {
+            if safe != Some(current) {
+                // A second user movement into a measured region supersedes the
+                // earlier deferred jump; never resume it on a later frame.
+                self.pending_jump = None;
+            }
+            self.safe_scroll
+                .insert(self.active.clone(), (stamp, current));
+            return;
+        }
+        if safe == Some(current)
+            || (safe.is_none()
+                && self
+                    .follow_bottom
+                    .as_ref()
+                    .is_some_and(|(session, offset)| session == &self.active && *offset == current))
+        {
+            return;
+        }
+        let visible_top = (-current.y).max(px(0.));
+        let sizes = cache.provisional_sizes(rows, has_load, width);
+        let mut top = px(0.);
+        let mut row_index = rows.len() - 1;
+        for (index, item) in sizes.iter().enumerate() {
+            if top + item.height > visible_top {
+                row_index = index
+                    .saturating_sub(usize::from(has_load))
+                    .min(rows.len() - 1);
+                break;
+            }
+            top += item.height;
+        }
+        let row_top = cache.provisional_prefix(rows, row_index, has_load);
+        self.pending_jump = Some(PendingTranscriptJump {
+            stamp,
+            anchor: TranscriptAnchor {
+                session: self.active.clone(),
+                key: rows[row_index].key.clone(),
+                within: visible_top - row_top,
+                offset: current,
+            },
+        });
+        self.follow_bottom = None;
+        if let Some(safe) = safe {
+            self.scroll.set_offset(safe);
+        }
     }
 
     fn correct_scroll(&mut self, window: &mut Window) {
@@ -3496,28 +3844,79 @@ impl Client {
             return;
         };
         let cache = cache.borrow();
-        if cache.stamp != Some(stamp) || cache.sizes(rows, has_load, width).is_none() {
+        if cache.stamp != Some(stamp) {
             return;
         }
-        if let Some(anchor) = self.preserve_scroll.take() {
+        let exact_sizes = cache.sizes(rows, has_load, width);
+        if let Some(mut anchor) = self.preserve_scroll.take() {
             if anchor.session == self.active
-                && let Some(index) = rows.iter().position(|row| row.key == anchor.key)
-                && let Some(top) = cache.prefix(rows, index, has_load)
                 && self.scroll.offset() == anchor.offset
+                && let Some(index) = rows.iter().position(|row| row.key == anchor.key)
             {
-                self.scroll
-                    .set_offset(point(anchor.offset.x, -(top + anchor.within)));
+                let top = if exact_sizes.is_some() {
+                    cache
+                        .prefix(rows, index, has_load)
+                        .unwrap_or_else(|| cache.provisional_prefix(rows, index, has_load))
+                } else {
+                    cache.provisional_prefix(rows, index, has_load)
+                };
+                let next = point(anchor.offset.x, -(top + anchor.within));
+                self.scroll.set_offset(next);
+                self.safe_scroll.insert(self.active.clone(), (stamp, next));
+                if exact_sizes.is_none() {
+                    anchor.offset = next;
+                    self.preserve_scroll = Some(anchor);
+                }
             }
-        } else if let Some((session, offset)) = self.follow_bottom.take()
+        } else if self.preserve_scroll.is_none()
+            && let Some((session, offset)) = self.follow_bottom.clone()
             && session == self.active
-            && self.scroll.offset() == offset
         {
-            let content_height = cache.prefix(rows, rows.len(), has_load).unwrap_or(px(0.));
-            let viewport_height = self.scroll.bounds().size.height;
-            self.scroll.set_offset(point(
-                offset.x,
-                -(content_height - viewport_height).max(px(0.)),
-            ));
+            if self.scroll.offset() != offset {
+                self.follow_bottom = None; // The user moved away from the tail.
+                return;
+            }
+            let viewport_height = if self.scroll.bounds().size.height > px(0.) {
+                self.scroll.bounds().size.height
+            } else {
+                (window.viewport_size().height - px(220.)).max(px(160.))
+            };
+            // The virtual list may use provisional *offscreen* prefix sizes,
+            // but never place its visible tail in an unmeasured slot.
+            if exact_sizes.is_none() && cache.exact_tail(rows).1 < viewport_height + px(32.) {
+                return;
+            }
+            let sizes = exact_sizes
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cache.provisional_sizes(rows, has_load, width));
+            let content_height = sizes.iter().fold(px(0.), |sum, item| sum + item.height);
+            let next = point(offset.x, -(content_height - viewport_height).max(px(0.)));
+            self.scroll.set_offset(next);
+            self.safe_scroll.insert(self.active.clone(), (stamp, next));
+            if exact_sizes.is_some() {
+                self.follow_bottom = None;
+            } else {
+                self.follow_bottom = Some((session, next));
+            }
+        } else if self.pending_jump.is_none()
+            && let Some((saved_stamp, mut anchor)) = self.safe_anchors.get(&self.active).cloned()
+            && saved_stamp == stamp
+            && anchor.offset == self.scroll.offset()
+            && let Some(index) = rows.iter().position(|row| row.key == anchor.key)
+        {
+            // An offscreen sticky/header row can replace its 64px estimate
+            // with a much taller exact height. Keep the painted semantic row
+            // at the same within-row position when that prefix changes.
+            let top = cache.provisional_prefix(rows, index, has_load);
+            let next = point(anchor.offset.x, -(top + anchor.within));
+            if next != anchor.offset {
+                self.scroll.set_offset(next);
+                self.safe_scroll.insert(self.active.clone(), (stamp, next));
+                anchor.offset = next;
+                self.safe_anchors
+                    .insert(self.active.clone(), (stamp, anchor));
+            }
         }
     }
 
@@ -3958,6 +4357,15 @@ impl Client {
                             self.attachments.remove_session(&id);
                             self.row_heights.remove(&id);
                             self.virtual_scrolls.remove(&id);
+                            self.safe_scroll.remove(&id);
+                            self.safe_anchors.remove(&id);
+                            if self
+                                .pending_jump
+                                .as_ref()
+                                .is_some_and(|jump| jump.anchor.session == id)
+                            {
+                                self.pending_jump = None;
+                            }
                             self.composers.remove(&id);
                             self.attachment_drafts.remove(&id);
                             self.pending_prompts.remove(&id);
@@ -4209,6 +4617,9 @@ impl Client {
                 None
             },
             scroll,
+            safe_scroll: HashMap::new(),
+            safe_anchors: HashMap::new(),
+            pending_jump: None,
             history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
@@ -5016,11 +5427,114 @@ impl Client {
             .entry(self.active.clone())
             .or_default()
             .clone();
-        let missing = cache.borrow_mut().missing(stamp, transcript);
         let load = self
             .conversations
             .get(&self.active)
             .and_then(|conversation| conversation.next_cursor.clone());
+        let target_anchor = self
+            .pending_jump
+            .as_ref()
+            .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
+            .map(|jump| &jump.anchor)
+            .or_else(|| {
+                self.preserve_scroll
+                    .as_ref()
+                    .filter(|anchor| anchor.session == self.active)
+            });
+        let pending_range = target_anchor.and_then(|anchor| {
+            transcript
+                .iter()
+                .position(|row| row.key == anchor.key)
+                .map(|index| {
+                    let cache = cache.borrow();
+                    if cache.stamp != Some(stamp) || cache.height(&transcript[index]).is_none() {
+                        return index..index + 1;
+                    }
+                    let top = cache.provisional_prefix(transcript, index, load.is_some());
+                    let viewport_height = if self.scroll.bounds().size.height > px(0.) {
+                        self.scroll.bounds().size.height
+                    } else {
+                        (window.viewport_size().height - px(220.)).max(px(160.))
+                    };
+                    let range = cache.provisional_viewport(
+                        transcript,
+                        load.is_some(),
+                        point(px(0.), -(top + anchor.within)),
+                        viewport_height,
+                    );
+                    range.start.saturating_sub(1 + usize::from(load.is_some()))
+                        ..(range.end + 1)
+                            .min(transcript.len() + usize::from(load.is_some()))
+                            .saturating_sub(usize::from(load.is_some()))
+                })
+        });
+        let mut missing = if transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS {
+            if let Some(range) = pending_range {
+                cache
+                    .borrow_mut()
+                    .missing_range(stamp, transcript, range, TRANSCRIPT_MEASURE_BATCH)
+            } else {
+                let viewport_height = if self.scroll.bounds().size.height > px(0.) {
+                    self.scroll.bounds().size.height
+                } else {
+                    (window.viewport_size().height - px(220.)).max(px(160.))
+                };
+                let follows_bottom =
+                    self.follow_bottom
+                        .as_ref()
+                        .is_some_and(|(session, offset)| {
+                            session == &self.active && *offset == self.scroll.offset()
+                        });
+                let need_tail = follows_bottom && {
+                    let cache = cache.borrow();
+                    cache.stamp != Some(stamp)
+                        || cache.exact_tail(transcript).1 < viewport_height + px(32.)
+                };
+                if need_tail {
+                    cache.borrow_mut().missing_tail(
+                        stamp,
+                        transcript,
+                        TRANSCRIPT_MEASURE_BATCH,
+                        viewport_height + px(32.),
+                    )
+                } else {
+                    let range = cache.borrow().provisional_viewport(
+                        transcript,
+                        load.is_some(),
+                        self.scroll.offset(),
+                        viewport_height,
+                    );
+                    cache.borrow_mut().missing_range(
+                        stamp,
+                        transcript,
+                        range.start.saturating_sub(1 + usize::from(load.is_some()))
+                            ..(range.end + 1)
+                                .min(transcript.len() + usize::from(load.is_some()))
+                                .saturating_sub(usize::from(load.is_some())),
+                        TRANSCRIPT_MEASURE_BATCH,
+                    )
+                }
+            }
+        } else {
+            cache.borrow_mut().missing(stamp, transcript)
+        };
+        if transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS && self.scroll.offset().y < px(-1.) {
+            let cache = cache.borrow();
+            let positions = cache.provisional_positions(transcript, load.is_some());
+            let visible_top = -self.scroll.offset().y;
+            let sticky = transcript
+                .iter()
+                .enumerate()
+                .filter(|(index, row)| row.role.label() == "YOU" && positions[*index] < visible_top)
+                .map(|(index, _)| index)
+                .next_back();
+            if let Some(index) = sticky
+                && cache.height(&transcript[index]).is_none()
+                && !missing.contains(&index)
+            {
+                missing.push(index);
+            }
+        }
         let loading = self.loading_messages.contains_key(&self.active);
         let measure_load = load.as_ref().is_some_and(|_| {
             cache
@@ -5425,14 +5939,6 @@ impl Client {
             .pr(px(TRANSCRIPT_SCROLLBAR_GUTTER))
             .flex()
             .flex_col();
-        if let Some(cursor) = self
-            .conversations
-            .get(&self.active)
-            .and_then(|conversation| conversation.next_cursor.clone())
-        {
-            let loading = self.loading_messages.contains_key(&self.active);
-            rows = rows.child(self.load_earlier_element(cursor, loading, cx));
-        }
         let sticky = self.sticky_user_row(window).map(|row| {
             div()
                 .id("sticky-user")
@@ -5524,14 +6030,57 @@ impl Client {
                                 .map(|old| (index, old.clone()))
                         })
                         .collect::<HashMap<_, _>>();
+                    let missing = ready.iter().filter(|ready| !**ready).count();
+                    let viewport_height = if self.scroll.bounds().size.height > px(0.) {
+                        self.scroll.bounds().size.height
+                    } else {
+                        (window.viewport_size().height - px(220.)).max(px(160.))
+                    };
+                    let viewport = cache.provisional_viewport(
+                        transcript,
+                        has_load,
+                        self.scroll.offset(),
+                        viewport_height,
+                    );
+                    let safe_partial = cache.viewport_ready(
+                        transcript,
+                        has_load,
+                        self.loading_messages.contains_key(&self.active),
+                        viewport,
+                    );
+                    let anchor_unmeasured = self
+                        .pending_jump
+                        .as_ref()
+                        .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
+                        .map(|jump| &jump.anchor)
+                        .or_else(|| {
+                            self.preserve_scroll
+                                .as_ref()
+                                .filter(|anchor| anchor.session == self.active)
+                        })
+                        .and_then(|anchor| transcript.iter().find(|row| row.key == anchor.key))
+                        .is_some_and(|row| cache.height(row).is_none());
+                    let parked_at_safe_viewport = self.preserve_scroll.is_none()
+                        && self.safe_scroll.get(&self.active).is_some_and(
+                            |(saved_stamp, offset)| {
+                                *saved_stamp == stamp && *offset == self.scroll.offset()
+                            },
+                        )
+                        && safe_partial;
+                    if transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
+                        && ((anchor_unmeasured && !parked_at_safe_viewport)
+                            || (missing > 4 && !safe_partial))
+                    {
+                        return None;
+                    }
                     let sizes = if ready.iter().all(|ready| *ready) {
                         cache.sizes(transcript, has_load, width)
                     } else {
                         None
                     }
                     .unwrap_or_else(|| cache.provisional_sizes(transcript, has_load, width));
-                    (sizes, ready, stale)
-                })
+                    Some((sizes, ready, stale))
+                })?
             })
         });
         let content: AnyElement = if let Some((sizes, ready, stale)) = layout {
@@ -5585,9 +6134,138 @@ impl Client {
         } else {
             // A first layout or width/style change has no usable measurements.
             // Natural rows avoid guessing their geometry while the probe runs.
+            // On a large first visit paint only a bounded tail rather than
+            // mounting the entire unmeasured history before virtualization.
             if let Some(transcript) = self.transcript.get(&self.active) {
-                for (index, row) in transcript.iter().enumerate() {
+                let tail_only = transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
+                    && self
+                        .follow_bottom
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == &self.active);
+                let pending_index = self
+                    .pending_jump
+                    .as_ref()
+                    .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
+                    .map(|jump| &jump.anchor)
+                    .or_else(|| {
+                        self.preserve_scroll
+                            .as_ref()
+                            .filter(|anchor| anchor.session == self.active)
+                    })
+                    .and_then(|anchor| transcript.iter().position(|row| row.key == anchor.key));
+                let has_load = self
+                    .conversations
+                    .get(&self.active)
+                    .is_some_and(|conversation| conversation.next_cursor.is_some());
+                let current_range = if pending_index.is_none()
+                    && transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
+                    && !tail_only
+                {
+                    self.row_heights.get(&self.active).map(|cache| {
+                        let viewport_height = if self.scroll.bounds().size.height > px(0.) {
+                            self.scroll.bounds().size.height
+                        } else {
+                            (window.viewport_size().height - px(220.)).max(px(160.))
+                        };
+                        cache.borrow().provisional_viewport(
+                            transcript,
+                            has_load,
+                            self.scroll.offset(),
+                            viewport_height,
+                        )
+                    })
+                } else {
+                    None
+                };
+                let target_index = pending_index.or_else(|| {
+                    current_range.as_ref().map(|range| {
+                        range
+                            .start
+                            .saturating_sub(usize::from(has_load))
+                            .min(transcript.len() - 1)
+                    })
+                });
+                let bounded_target = transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
+                    && !tail_only
+                    && target_index.is_some();
+                let start = if let Some(index) = target_index.filter(|_| bounded_target) {
+                    let within = self
+                        .pending_jump
+                        .as_ref()
+                        .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
+                        .map(|jump| jump.anchor.within)
+                        .or_else(|| {
+                            self.preserve_scroll
+                                .as_ref()
+                                .filter(|anchor| anchor.session == self.active)
+                                .map(|anchor| anchor.within)
+                        })
+                        .unwrap_or(px(0.));
+                    if within >= px(0.) {
+                        // A tall anchor can begin far above the viewport. Do
+                        // not put unmeasured natural rows ahead of it after an
+                        // estimated spacer: their real heights would shift it.
+                        index
+                    } else {
+                        index.saturating_sub(TRANSCRIPT_MEASURE_BATCH)
+                    }
+                } else if tail_only {
+                    let measured_tail = self.row_heights.get(&self.active).map_or(0, |cache| {
+                        let cache = cache.borrow();
+                        if cache.stamp == Some(stamp) {
+                            cache.exact_tail(transcript).0
+                        } else {
+                            0
+                        }
+                    });
+                    transcript
+                        .len()
+                        .saturating_sub(measured_tail + TRANSCRIPT_MEASURE_BATCH)
+                } else {
+                    0
+                };
+                let end =
+                    target_index
+                        .filter(|_| bounded_target)
+                        .map_or(transcript.len(), |index| {
+                            (index + TRANSCRIPT_MEASURE_BATCH + 1)
+                                .max(current_range.as_ref().map_or(0, |range| {
+                                    range.end.saturating_sub(usize::from(has_load))
+                                        + TRANSCRIPT_MEASURE_BATCH
+                                }))
+                                .min(transcript.len())
+                        });
+                if bounded_target
+                    && start > 0
+                    && let Some(cache) = self.row_heights.get(&self.active)
+                {
+                    let height = cache
+                        .borrow()
+                        .provisional_prefix(transcript, start, has_load);
+                    rows = rows.child(div().h(height).flex_shrink_0());
+                }
+                if !tail_only
+                    && start == 0
+                    && let Some(cursor) = self
+                        .conversations
+                        .get(&self.active)
+                        .and_then(|conversation| conversation.next_cursor.clone())
+                {
+                    let loading = self.loading_messages.contains_key(&self.active);
+                    rows = rows.child(self.load_earlier_element(cursor, loading, cx));
+                }
+                for (index, row) in transcript.iter().enumerate().take(end).skip(start) {
                     rows = rows.child(self.message(row, index, cx));
+                }
+                if bounded_target
+                    && end < transcript.len()
+                    && let Some(cache) = self.row_heights.get(&self.active)
+                {
+                    let cache = cache.borrow();
+                    let remaining =
+                        cache.provisional_prefix(transcript, transcript.len(), has_load)
+                            - cache.provisional_prefix(transcript, end, has_load);
+                    rows = rows.child(div().h(remaining).flex_shrink_0());
                 }
             }
             rows.into_any_element()
@@ -5641,14 +6319,21 @@ impl Client {
             }
             if let (Some(cache), Some(positions)) = (measured, &positions) {
                 let row_top = top + self.scroll.offset().y + positions[index];
-                Some((index, row_top, row_top + cache.height(row)?))
+                let height = cache
+                    .entries
+                    .get(&row.key)
+                    .map_or(px(64.), |entry| entry.height);
+                Some((index, row_top, row_top + height))
             } else {
                 let bounds = self.scroll.bounds_for_item(index + first_child)?;
                 let row_top = bounds.origin.y + self.scroll.offset().y;
                 Some((index, row_top, row_top + bounds.size.height))
             }
         });
-        sticky_user_index(users, top, bottom).and_then(|index| transcript.get(index))
+        sticky_user_index(users, top, bottom).and_then(|index| {
+            let row = transcript.get(index)?;
+            (measured.is_none_or(|cache| cache.height(row).is_some())).then_some(row)
+        })
     }
 
     fn resume_warning(&self, cx: &Context<Self>) -> Option<String> {
@@ -7457,10 +8142,31 @@ impl Render for Client {
             }
         }
         self.clear_accepted_drafts = deferred;
-        let row_probe = self.row_measurement_probe(window, cx);
-        if row_probe.is_none() {
-            self.correct_scroll(window);
+        self.guard_unmeasured_scroll(window);
+        if self.preserve_scroll.is_none()
+            && self.pending_jump.is_none()
+            && self.follow_bottom.is_none()
+            && let Some(cache) = self.row_heights.get(&self.active)
+            && let Some(stamp) = cache.borrow().stamp
+            && self
+                .safe_scroll
+                .get(&self.active)
+                .is_some_and(|(saved_stamp, offset)| {
+                    *saved_stamp == stamp && *offset == self.scroll.offset()
+                })
+            && self
+                .safe_anchors
+                .get(&self.active)
+                .is_none_or(|(saved_stamp, anchor)| {
+                    *saved_stamp != stamp || anchor.offset != self.scroll.offset()
+                })
+            && let Some(anchor) = self.transcript_anchor()
+        {
+            self.safe_anchors
+                .insert(self.active.clone(), (stamp, anchor));
         }
+        let row_probe = self.row_measurement_probe(window, cx);
+        self.correct_scroll(window);
         let visible_permission_id = if self.modal.is_none() {
             self.visible_permission().map(|item| item.request.id)
         } else {
@@ -7804,6 +8510,32 @@ mod tests {
     }
 
     #[test]
+    fn ten_thousand_offscreen_images_are_registered_without_decoding() {
+        let mut cache = super::ImageCache::default();
+        let rows: Vec<_> = (0..10_000)
+            .map(|index| {
+                let mut row = cache_row(&format!("image_{index}"), "caption");
+                row.images = vec!["data:image/png;base64,aGVsbG8=".into()];
+                row
+            })
+            .collect();
+        cache.update(
+            "ses_a",
+            &rows,
+            &super::ProjectionChange {
+                range: 0..rows.len(),
+                removed_images: Vec::new(),
+                old_rows: Vec::new(),
+                old_images: Default::default(),
+            },
+        );
+        assert_eq!(cache.entries.len(), 10_000);
+        assert_eq!(cache.decodes.get(), 0);
+        assert!(cache.get("ses_a", &rows[9999], 0).is_some());
+        assert_eq!(cache.decodes.get(), 1);
+    }
+
+    #[test]
     fn image_cache_reuses_arc_across_index_shift_and_revision_but_replaces_exact_url() {
         let mut cache = super::ImageCache::default();
         let mut image = cache_row("image", "caption");
@@ -7816,8 +8548,13 @@ mod tests {
             old_images: Default::default(),
         };
         cache.update("ses_a", &rows, &change);
+        assert_eq!(
+            cache.decodes.get(),
+            0,
+            "projection must not decode offscreen images"
+        );
         let original = cache.get("ses_a", &image, 0).unwrap().clone();
-        assert_eq!(cache.decodes, 1);
+        assert_eq!(cache.decodes.get(), 1);
         rows.insert(0, cache_row("earlier", "first"));
         image.render_revision += 1;
         rows[1] = image.clone();
@@ -7835,7 +8572,7 @@ mod tests {
             &original,
             cache.get("ses_a", &image, 0).unwrap()
         ));
-        assert_eq!(cache.decodes, 1);
+        assert_eq!(cache.decodes.get(), 1);
         image.images[0] = "data:image/png;base64,d29ybGQ=".into();
         rows[1] = image.clone();
         cache.update(
@@ -7852,14 +8589,15 @@ mod tests {
             &original,
             cache.get("ses_a", &image, 0).unwrap()
         ));
-        assert_eq!(cache.decodes, 2);
+        assert_eq!(cache.decodes.get(), 2);
 
         cache.update("ses_b", &[image.clone()], &change);
-        assert_eq!(cache.decodes, 3);
+        assert_eq!(cache.decodes.get(), 2);
         assert!(!std::sync::Arc::ptr_eq(
             cache.get("ses_a", &image, 0).unwrap(),
             cache.get("ses_b", &image, 0).unwrap()
         ));
+        assert_eq!(cache.decodes.get(), 3);
         cache.remove_session("ses_a");
         assert!(cache.get("ses_a", &image, 0).is_none());
         assert!(cache.get("ses_b", &image, 0).is_some());
@@ -7881,8 +8619,10 @@ mod tests {
         };
         cache.update("ses_a", &[row.clone()], &change);
         cache.update("ses_a", &[row.clone()], &change);
-        assert_eq!(cache.decodes, 2);
+        assert_eq!(cache.decodes.get(), 0);
         assert!(cache.get("ses_a", &row, 0).is_none());
+        assert!(cache.get("ses_a", &row, 0).is_none());
+        assert_eq!(cache.decodes.get(), 1, "invalid URL is memoized");
         row.images.truncate(1);
         cache.update(
             "ses_a",
@@ -8085,6 +8825,59 @@ mod tests {
     }
 
     #[test]
+    fn row_height_planner_bounds_cold_tail_and_preserves_semantic_keys() {
+        let stamp = RowLayoutStamp {
+            width: px(746.),
+            dark: false,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: 1,
+        };
+        let mut cache = RowHeightCache::default();
+        let mut rows: Vec<_> = (0..10_000)
+            .map(|index| cache_row(&format!("message-{index}"), "a line of Markdown"))
+            .collect();
+        assert_eq!(
+            cache.missing_tail(stamp, &rows, 32, px(1500.)),
+            (9968..10_000).collect::<Vec<_>>()
+        );
+        for row in rows.iter().skip(9968) {
+            cache.record(stamp, row.key.clone(), 0, px(36.));
+        }
+        assert!(
+            cache.missing_tail(stamp, &rows, 32, px(500.)).is_empty(),
+            "covered viewport must not trigger offscreen measurement"
+        );
+        assert_eq!(
+            cache.missing_tail(stamp, &rows, 32, px(1500.)),
+            (9936..9968).collect::<Vec<_>>()
+        );
+        rows.insert(0, cache_row("prepended", "older page"));
+        assert_eq!(
+            cache.missing_tail(stamp, &rows, 2, px(1500.)),
+            vec![9967, 9968]
+        );
+        let last = rows.last_mut().unwrap();
+        last.render_revision += 1;
+        assert_eq!(
+            cache.missing_tail(stamp, &rows, 32, px(500.)),
+            vec![10_000],
+            "streaming tail remeasures only the changed row"
+        );
+        assert_eq!(
+            cache.missing_tail(stamp, &rows, 2, px(1500.)),
+            vec![9968, 10_000]
+        );
+        let changed = RowLayoutStamp {
+            dark: true,
+            ..stamp
+        };
+        assert_eq!(
+            cache.missing_tail(changed, &rows, 2, px(1500.)),
+            vec![9999, 10_000]
+        );
+    }
+
+    #[test]
     fn row_height_cache_retains_prepend_and_invalidates_stream_snapshot_width_theme_and_style() {
         let stamp = RowLayoutStamp {
             width: px(746.),
@@ -8258,11 +9051,27 @@ mod tests {
             })
             .expect("headless window stays open");
         };
-        render(cx); // natural-height fallback and detached measurements
+        // Force one exact warm-up for this full-cache virtual-list test;
+        // ordinary cold opening intentionally leaves offscreen rows unmeasured.
+        cx.update_window(handle, |_, window, cx| {
+            let width = window.viewport_size().width
+                - px(super::SIDEBAR_WIDTH + super::TRANSCRIPT_SCROLLBAR_GUTTER);
+            client.update(cx, |client, cx| {
+                client.measurement_probe = Some((width, Rc::new(RefCell::new(Vec::new()))));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                client.measurement_probe = None;
+                cx.notify();
+            });
+        })
+        .unwrap();
+        render(cx);
         cx.update_window(handle, |_, window, cx| {
             let client = client.read(cx);
             let cache = client.row_heights[&client.active].borrow();
-            assert_eq!(cache.layouts, 300);
+            assert_eq!(cache.entries.len(), 300);
             assert_eq!(
                 cache.load_height.unwrap().1,
                 window.find("load-earlier").bounds().size.height
@@ -8355,7 +9164,7 @@ mod tests {
             let rows = &client.transcript[&client.active];
             let cache = client.row_heights[&client.active].borrow();
             let index = rows.iter().position(|row| row.key == anchor.key).unwrap();
-            let top = cache.prefix(rows, index, true).unwrap();
+            let top = cache.provisional_prefix(rows, index, true);
             assert_eq!(
                 client.scroll.offset().y,
                 -(top + anchor.within),
@@ -8527,6 +9336,653 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn measuring_an_offscreen_sticky_prompt_keeps_the_visible_semantic_row(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let width = window.viewport_size().width
+                - px(super::SIDEBAR_WIDTH + super::TRANSCRIPT_SCROLLBAR_GUTTER);
+            client.update(cx, |client, cx| {
+                let mut rows: Vec<_> = (0..1000)
+                    .map(|index| cache_row(&format!("history_{index}"), "Short response."))
+                    .collect();
+                rows[200].role = model::Role::User;
+                rows[200].body = "A very long user prompt.\n\n".repeat(100);
+                client.transcript.insert(client.active.clone(), rows);
+                let stamp = RowLayoutStamp {
+                    width,
+                    dark: client.dark,
+                    style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+                    epoch: client.conversations[&client.active].cache_epoch(),
+                };
+                let mut cache = RowHeightCache::default();
+                cache.prepare_stamp(stamp);
+                for row in &client.transcript[&client.active][490..530] {
+                    cache.record(stamp, row.key.clone(), 0, px(32.));
+                }
+                let top = cache.provisional_prefix(&client.transcript[&client.active], 500, false);
+                client
+                    .row_heights
+                    .insert(client.active.clone(), Rc::new(RefCell::new(cache)));
+                client.scroll = VirtualListScrollHandle::new();
+                let offset = point(px(0.), -(top + px(5.)));
+                client.scroll.set_offset(offset);
+                client.follow_bottom = None;
+                client
+                    .safe_scroll
+                    .insert(client.active.clone(), (stamp, offset));
+                client.safe_anchors.insert(
+                    client.active.clone(),
+                    (
+                        stamp,
+                        super::TranscriptAnchor {
+                            session: client.active.clone(),
+                            key: client.transcript[&client.active][500].key.clone(),
+                            within: px(5.),
+                            offset,
+                        },
+                    ),
+                );
+                cx.notify();
+            });
+        })
+        .unwrap();
+        let previous = cx.update(|cx| client.read(cx).scroll.offset().y);
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| {
+            let current = client.read(cx);
+            let rows = &current.transcript[&current.active];
+            let cache = current.row_heights[&current.active].borrow();
+            assert!(
+                cache
+                    .height(&rows[200])
+                    .is_some_and(|height| height > px(500.))
+            );
+            assert!(current.scroll.offset().y < previous - px(400.));
+            assert_eq!(current.transcript_anchor().unwrap().key, rows[500].key);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn resize_measures_tall_semantic_anchor_before_admitting_its_viewport(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let width = window.viewport_size().width
+                - px(super::SIDEBAR_WIDTH + super::TRANSCRIPT_SCROLLBAR_GUTTER);
+            client.update(cx, |client, cx| {
+                let mut rows: Vec<_> = (0..1000)
+                    .map(|index| cache_row(&format!("history_{index}"), "Short answer."))
+                    .collect();
+                rows[500].body =
+                    "A long paragraph that must wrap across the viewport.\n\n".repeat(200);
+                client.transcript.insert(client.active.clone(), rows);
+                let stamp = RowLayoutStamp {
+                    width,
+                    dark: client.dark,
+                    style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+                    epoch: client.conversations[&client.active].cache_epoch(),
+                };
+                let mut cache = RowHeightCache::default();
+                cache.prepare_stamp(stamp);
+                for (index, row) in client.transcript[&client.active].iter().enumerate() {
+                    cache.record(
+                        stamp,
+                        row.key.clone(),
+                        0,
+                        if index == 500 { px(1500.) } else { px(32.) },
+                    );
+                }
+                client
+                    .row_heights
+                    .insert(client.active.clone(), Rc::new(RefCell::new(cache)));
+                client.scroll = VirtualListScrollHandle::new();
+                client.scroll.set_offset(point(px(0.), px(-17_000.)));
+                client.follow_bottom = None;
+                client
+                    .safe_scroll
+                    .insert(client.active.clone(), (stamp, client.scroll.offset()));
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            });
+            window.resize(size(px(1130.), px(900.)));
+        })
+        .unwrap();
+        for _ in 0..4 {
+            cx.update_window(handle, |_, window, cx| {
+                client.read(cx).rendered_rows.borrow_mut().clear();
+                window.render_frame(cx);
+                let current = client.read(cx);
+                let painted = current.rendered_rows.borrow();
+                assert!(
+                    painted.len() < 256,
+                    "tall-row resize mounted history: {painted:?}"
+                );
+                assert!(
+                    painted.contains(&500),
+                    "tall anchor was not presented: {painted:?}"
+                );
+                let anchor = window.find(("message", 500usize)).bounds();
+                let viewport = current.scroll.bounds();
+                assert!(
+                    anchor.origin.y < viewport.origin.y + viewport.size.height
+                        && anchor.origin.y + anchor.size.height > viewport.origin.y,
+                    "tall row was constructed but missed viewport: {anchor:?} vs {viewport:?}"
+                );
+            })
+            .unwrap();
+        }
+        cx.update(|cx| {
+            let current = client.read(cx);
+            let rows = &current.transcript[&current.active];
+            let cache = current.row_heights[&current.active].borrow();
+            assert!(
+                cache
+                    .height(&rows[500])
+                    .is_some_and(|height| height > px(1000.))
+            );
+            assert_eq!(
+                current.scroll.offset().y,
+                -(cache.provisional_prefix(rows, 500, false) + px(1000.)),
+                "the old within-row offset must remain in the tall row"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn early_scroll_before_first_exact_tail_stays_bounded(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..1000)
+                        .map(|index| cache_row(&format!("history_{index}"), "A line."))
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                client.follow_bottom = Some((client.active.clone(), client.scroll.offset()));
+                client.scroll.set_offset(point(px(0.), px(-30_000.)));
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            });
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| {
+                client.read(cx).rendered_rows.borrow_mut().clear();
+                window.render_frame(cx);
+                let current = client.read(cx);
+                let painted = current.rendered_rows.borrow();
+                assert!(
+                    painted.len() < 256,
+                    "early scroll mounted all history: {painted:?}"
+                );
+            })
+            .unwrap();
+        }
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, _| {
+                let stamp = client.row_heights[&client.active].borrow().stamp.unwrap();
+                let old = client.transcript[&client.active][100].key.clone();
+                client.safe_scroll.remove(&client.active);
+                client.pending_jump = Some(super::PendingTranscriptJump {
+                    stamp,
+                    anchor: super::TranscriptAnchor {
+                        session: client.active.clone(),
+                        key: old.clone(),
+                        within: px(0.),
+                        offset: client.scroll.offset(),
+                    },
+                });
+                client.scroll.set_offset(point(px(0.), px(-40_000.)));
+                client.guard_unmeasured_scroll(window);
+                let newer = &client.pending_jump.as_ref().unwrap().anchor;
+                assert_ne!(
+                    newer.key, old,
+                    "user scroll must supersede the pending resize target"
+                );
+                assert_eq!(newer.offset, client.scroll.offset());
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn partial_prepend_at_load_control_keeps_a_bounded_old_first_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..400)
+                        .map(|index| cache_row(&format!("history_{index}"), "A short response."))
+                        .collect(),
+                );
+                client
+                    .conversations
+                    .get_mut(&client.active)
+                    .unwrap()
+                    .next_cursor = Some("older".into());
+                client.row_heights.remove(&client.active);
+                client.scroll = VirtualListScrollHandle::new();
+                client.follow_bottom = None;
+                cx.notify();
+            });
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let anchor = client
+                    .transcript_anchor()
+                    .expect("load control anchors first row");
+                assert_eq!(anchor.key.message_id, "history_0");
+                assert!(anchor.within < px(0.));
+                client.preserve_scroll = Some(anchor);
+                client.transcript.get_mut(&client.active).unwrap().splice(
+                    0..0,
+                    (0..80).map(|index| cache_row(&format!("older_{index}"), "Older response.")),
+                );
+                cx.notify();
+            });
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| {
+                client.read(cx).rendered_rows.borrow_mut().clear();
+                window.render_frame(cx);
+                let rendered = client.read(cx).rendered_rows.borrow();
+                assert!(
+                    rendered.len() < 256,
+                    "prepend mounted whole history: {rendered:?}"
+                );
+                assert!(
+                    rendered.contains(&80),
+                    "old first row disappeared: {rendered:?}"
+                );
+            })
+            .unwrap();
+        }
+        cx.update(|cx| {
+            let current = client.read(cx);
+            assert!(
+                current.preserve_scroll.is_some(),
+                "history remains partly measured"
+            );
+            current.scroll.set_offset(point(px(0.), px(-15_000.)));
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| {
+                client.read(cx).rendered_rows.borrow_mut().clear();
+                window.render_frame(cx);
+                let current = client.read(cx);
+                assert!(
+                    current.preserve_scroll.is_none(),
+                    "user movement cancels the anchor"
+                );
+                let rendered = current.rendered_rows.borrow();
+                assert!(
+                    rendered.len() < 256,
+                    "scroll after prepend remounted history: {rendered:?}"
+                );
+            })
+            .unwrap();
+        }
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let anchor = client.transcript_anchor().expect("visible semantic row");
+                client.preserve_scroll = Some(anchor.clone());
+                client
+                    .transcript
+                    .get_mut(&client.active)
+                    .unwrap()
+                    .retain(|row| row.key != anchor.key);
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let current = client.read(cx);
+            assert!(
+                current.preserve_scroll.is_none(),
+                "deleted anchor was not retired"
+            );
+            let rendered = current.rendered_rows.borrow();
+            assert!(
+                rendered.len() < 256,
+                "deleted anchor remounted history: {rendered:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn cold_ten_thousand_row_transcript_measures_a_bounded_tail_first(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..10_000)
+                        .map(|index| cache_row(&format!("history_{index}"), "A short answer."))
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                client.follow_bottom = Some((client.active.clone(), client.scroll.offset()));
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let current = client.read(cx);
+            let cache = current.row_heights[&current.active].borrow();
+            assert!(
+                cache.layouts <= super::TRANSCRIPT_MEASURE_BATCH * 2,
+                "first paint measured {} rows",
+                cache.layouts
+            );
+            let rendered = current.rendered_rows.borrow();
+            assert!(
+                rendered.len() <= super::TRANSCRIPT_MEASURE_BATCH * 2,
+                "first paint: {rendered:?}"
+            );
+            assert!(
+                rendered.contains(&9999),
+                "painted tail is present on first frame"
+            );
+        })
+        .unwrap();
+        cx.update(|cx| client.read(cx).rendered_rows.borrow_mut().clear());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let current = client.read(cx);
+            let cache = current.row_heights[&current.active].borrow();
+            assert!(
+                cache.layouts <= super::TRANSCRIPT_MEASURE_BATCH * 4,
+                "unbounded second layout"
+            );
+            assert!(
+                current.rendered_rows.borrow().contains(&9999),
+                "bottom row is mounted"
+            );
+            let _mounted = window.find(("message", 9999usize));
+        })
+        .unwrap();
+        let settled_layouts = cx.update(|cx| {
+            let current = client.read(cx);
+            current.row_heights[&current.active].borrow().layouts
+        });
+        for _ in 0..5 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| {
+            let current = client.read(cx);
+            assert_eq!(
+                current.row_heights[&current.active].borrow().layouts,
+                settled_layouts,
+                "idle cold open must not measure the other 10,000 rows"
+            );
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                assert!(
+                    client.follow_bottom.is_some(),
+                    "cold measurement still in progress"
+                );
+                client
+                    .transcript
+                    .get_mut(&client.active)
+                    .unwrap()
+                    .push(cache_row("history_10000", "Fresh reply at the tail."));
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let current = client.read(cx);
+            let painted = current.rendered_rows.borrow();
+            assert!(
+                painted.len() < 256,
+                "append remounted the history: {painted:?}"
+            );
+            assert!(
+                painted.contains(&9999),
+                "old tail disappeared before new row was measured"
+            );
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(client.read(cx).rendered_rows.borrow().contains(&10_000));
+        })
+        .unwrap();
+        let before_stream = cx.update(|cx| {
+            let current = client.read(cx);
+            current.row_heights[&current.active].borrow().layouts
+        });
+        for _ in 0..20 {
+            cx.update(|cx| {
+                client.update(cx, |client, cx| {
+                    let tail = client
+                        .transcript
+                        .get_mut(&client.active)
+                        .unwrap()
+                        .last_mut()
+                        .unwrap();
+                    tail.body.push_str(" One more token.");
+                    tail.render_revision += 1;
+                    cx.notify();
+                });
+            });
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| {
+            let current = client.read(cx);
+            let measured = current.row_heights[&current.active].borrow().layouts - before_stream;
+            assert!(
+                measured <= 40,
+                "streaming remeasured {measured} offscreen rows"
+            );
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, _| {
+                client.scroll.set_offset(point(px(0.), px(-300_000.)));
+                client.guard_unmeasured_scroll(window);
+                assert!(client.pending_jump.is_some());
+                let safe = client.safe_scroll[&client.active].1;
+                client.scroll.set_offset(point(safe.x, safe.y + px(100.)));
+                client.guard_unmeasured_scroll(window);
+                assert!(
+                    client.pending_jump.is_none(),
+                    "returning to a measured range cancels the jump"
+                );
+                client.guard_unmeasured_scroll(window);
+                assert!(client.pending_jump.is_none(), "canceled jump resumed");
+            });
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let current = client.read(cx);
+            assert!(current.safe_scroll.contains_key(&current.active));
+            current.scroll.set_offset(point(px(0.), px(-300_000.)));
+            current.rendered_rows.borrow_mut().clear();
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| {
+                client.read(cx).rendered_rows.borrow_mut().clear();
+                window.render_frame(cx);
+                let current = client.read(cx);
+                let rows = &current.transcript[&current.active];
+                let cache = current.row_heights[&current.active].borrow();
+                let viewport = cache.provisional_viewport(
+                    rows,
+                    false,
+                    current.scroll.offset(),
+                    current.scroll.bounds().size.height,
+                );
+                assert!(cache.viewport_ready(rows, false, false, viewport.clone()));
+                let painted = current.rendered_rows.borrow();
+                assert!(painted.len() < 256, "unbounded jump frame: {painted:?}");
+                assert!(
+                    painted.iter().any(|index| viewport.contains(index)),
+                    "blank visible jump frame at {viewport:?}: {painted:?}"
+                );
+            })
+            .unwrap();
+        }
+        cx.update(|cx| {
+            let current = client.read(cx);
+            let cache = current.row_heights[&current.active].borrow();
+            assert!(
+                cache.layouts < 600,
+                "jump measured unbounded history: {}",
+                cache.layouts
+            );
+            assert!(current.pending_jump.is_none(), "jump did not settle");
+            let rendered = current.rendered_rows.borrow();
+            assert!(
+                rendered.len() < 256,
+                "jump mounted all history: {rendered:?}"
+            );
+            assert!(
+                rendered.iter().any(|index| (4000..6000).contains(index)),
+                "no mid-history rows painted: {rendered:?}"
+            );
+        });
+        let changed_index = cx.update(|cx| {
+            let current = client.read(cx);
+            let cache = current.row_heights[&current.active].borrow();
+            cache
+                .provisional_viewport(
+                    &current.transcript[&current.active],
+                    false,
+                    current.scroll.offset(),
+                    current.scroll.bounds().size.height,
+                )
+                .start
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let row = &mut client.transcript.get_mut(&client.active).unwrap()[changed_index];
+                row.render_revision += 1;
+                row.body.push_str(" Newly streamed text.");
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let painted = client.read(cx).rendered_rows.borrow();
+            assert!(
+                painted.len() < 256,
+                "visible update remounted history: {painted:?}"
+            );
+            assert!(painted.contains(&changed_index));
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, _| {
+            window.resize(size(px(1130.), px(900.)));
+        })
+        .unwrap();
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| {
+                client.read(cx).rendered_rows.borrow_mut().clear();
+                window.render_frame(cx);
+                let current = client.read(cx);
+                let painted = current.rendered_rows.borrow();
+                assert!(painted.len() < 256, "resize mounted history: {painted:?}");
+                assert!(
+                    painted.iter().any(|index| (4000..6000).contains(index)),
+                    "resize lost the visible anchor: {painted:?}"
+                );
+            })
+            .unwrap();
+        }
+        let anchored = cx.update(|cx| {
+            let current = client.read(cx);
+            current
+                .transcript_anchor()
+                .expect("measured mid-history anchor")
+                .key
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.preserve_scroll = client.transcript_anchor();
+                assert!(client.preserve_scroll.is_some());
+                let history = (0..80)
+                    .map(|index| cache_row(&format!("older_{index}"), "An earlier response."));
+                client
+                    .transcript
+                    .get_mut(&client.active)
+                    .unwrap()
+                    .splice(0..0, history);
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            });
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| {
+                client.read(cx).rendered_rows.borrow_mut().clear();
+                window.render_frame(cx);
+                let current = client.read(cx);
+                let painted = current.rendered_rows.borrow();
+                assert!(
+                    painted.len() < 256,
+                    "prepend mounted all history: {painted:?}"
+                );
+                assert!(
+                    current
+                        .transcript_anchor()
+                        .is_some_and(|anchor| anchor.key == anchored),
+                    "prepend lost the semantic viewport anchor"
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
     fn long_stream_remeasures_one_row_without_remounting_history(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
@@ -8560,8 +10016,29 @@ mod tests {
             })
             .unwrap();
         };
+        // Explicitly warm the full list; ordinary cold opening now leaves
+        // offscreen history unmeasured until navigation requests it.
+        cx.update_window(handle, |_, window, cx| {
+            let width = window.viewport_size().width
+                - px(super::SIDEBAR_WIDTH + super::TRANSCRIPT_SCROLLBAR_GUTTER);
+            client.update(cx, |client, cx| {
+                client.measurement_probe = Some((width, Rc::new(RefCell::new(Vec::new()))));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                client.measurement_probe = None;
+                cx.notify();
+            });
+        })
+        .unwrap();
         render(cx);
-        render(cx);
+        let baseline_layouts = cx.update(|cx| {
+            let client = client.read(cx);
+            let cache = client.row_heights[&client.active].borrow();
+            assert_eq!(cache.entries.len(), 300);
+            cache.layouts
+        });
         for token in 1..=12 {
             cx.update(|cx| {
                 client.update(cx, |client, cx| {
@@ -8592,7 +10069,7 @@ mod tests {
                 );
                 assert_eq!(
                     client.row_heights[&client.active].borrow().layouts,
-                    300 + token
+                    baseline_layouts + token
                 );
             });
             cx.update_window(handle, |_, window, cx| {
