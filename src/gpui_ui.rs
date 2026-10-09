@@ -27,6 +27,7 @@ use opencode_gpui::{
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
     preview, protocol, tray,
 };
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
 use crate::Args;
@@ -590,11 +591,12 @@ enum MarkdownBlock {
     Paragraph(String),
     List(Vec<String>),
     Code(String, String),
+    Rich(String),
 }
 
 // Increment this when the row's typography or layout rules change. The other
 // parts of the stamp follow the live width, theme and conversation snapshot.
-const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 1;
+const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 2;
 const SIDEBAR_WIDTH: f32 = 270.;
 const TRANSCRIPT_SCROLLBAR_GUTTER: f32 = 14.;
 
@@ -1136,6 +1138,89 @@ fn permission_metadata(text: String, dark: bool) -> AnyElement {
 }
 
 fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut list_depth = 0;
+    let complex = Parser::new_ext(source, options).any(|event| match event {
+        Event::Start(Tag::List(start)) => {
+            list_depth += 1;
+            start.is_some() || list_depth > 1
+        }
+        Event::End(TagEnd::List(_)) => {
+            list_depth -= 1;
+            false
+        }
+        Event::Start(Tag::BlockQuote(_) | Tag::Table(_))
+        | Event::TaskListMarker(_)
+        | Event::Rule => true,
+        _ => false,
+    });
+    if complex {
+        // Keep the existing custom copy-code control for top-level fences,
+        // while letting GPUI Kit render tables, nested/ordered/task lists and
+        // blockquotes instead of displaying their delimiters as plain text.
+        let mut blocks = Vec::new();
+        let mut cursor = 0;
+        let mut container_depth = 0;
+        let mut code: Option<(usize, String, String)> = None;
+        for (event, span) in Parser::new_ext(source, options).into_offset_iter() {
+            if let Some((start, language, content)) = code.as_mut() {
+                match event {
+                    Event::End(TagEnd::CodeBlock) => {
+                        if let Some(prefix) = source
+                            .get(cursor..*start)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            blocks.push(MarkdownBlock::Rich(prefix.to_owned()));
+                        }
+                        blocks.push(MarkdownBlock::Code(
+                            language.clone(),
+                            content.trim_end_matches('\n').to_owned(),
+                        ));
+                        cursor = span.end;
+                        code = None;
+                    }
+                    Event::Text(text) | Event::Code(text) => content.push_str(&text),
+                    Event::SoftBreak | Event::HardBreak => content.push('\n'),
+                    _ => {}
+                }
+                continue;
+            }
+            match event {
+                Event::Start(Tag::List(_) | Tag::BlockQuote(_) | Tag::Table(_)) => {
+                    container_depth += 1
+                }
+                Event::End(TagEnd::List(_) | TagEnd::BlockQuote(_) | TagEnd::Table) => {
+                    container_depth -= 1
+                }
+                Event::Start(Tag::CodeBlock(kind)) if container_depth == 0 => {
+                    let language = match kind {
+                        CodeBlockKind::Fenced(language) => language
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
+                    code = Some((span.start, language, String::new()));
+                }
+                _ => {}
+            }
+        }
+        if let Some(tail) = source
+            .get(cursor..)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            blocks.push(MarkdownBlock::Rich(tail.to_owned()));
+        }
+        return blocks;
+    }
+    simple_markdown_blocks(source)
+}
+
+fn simple_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
     let mut lines = source.lines().peekable();
     let mut blocks = Vec::new();
     while let Some(line) = lines.next() {
@@ -1233,6 +1318,7 @@ impl Client {
                     .child(title)
                     .into_any_element(),
                 MarkdownBlock::Paragraph(text) => markdown(text).into_any_element(),
+                MarkdownBlock::Rich(text) => markdown(text).into_any_element(),
                 MarkdownBlock::List(items) => {
                     let mut list = div().flex().flex_col().gap(px(10.));
                     for item in items {
@@ -9949,5 +10035,49 @@ mod tests {
                 MarkdownBlock::Code("rust".into(), "paperclip_icon(22)".into()),
             ]
         );
+    }
+
+    #[test]
+    fn complex_markdown_uses_rich_renderer_but_keeps_top_level_copy_code() {
+        let source = "> A quoted line\n\n1. Ordered item\n   - Nested item\n\n| Name | Value |\n| --- | --- |\n| clip | 22px |\n\n```rust\nlet x = 22;\n```\n\n- [x] done";
+        let blocks = markdown_blocks(source);
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            matches!(&blocks[0], MarkdownBlock::Rich(text) if text.contains("> A quoted line") && text.contains("| clip | 22px |"))
+        );
+        assert_eq!(
+            blocks[1],
+            MarkdownBlock::Code("rust".into(), "let x = 22;".into())
+        );
+        assert_eq!(blocks[2], MarkdownBlock::Rich("- [x] done".into()));
+    }
+
+    #[gpui_kit::test]
+    fn complex_markdown_measures_and_renders_in_virtual_transcript(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let rows = client.transcript.get_mut(&client.active).unwrap();
+                let row = rows.iter_mut().find(|row| row.role == model::Role::Assistant).unwrap();
+                row.body = "> A quote\n\n| Name | Value |\n| --- | --- |\n| clip | 22px |\n\n1. Ordered\n   - Nested\n\n```rust\nlet x = 22;\n```".into();
+                row.render_revision += 1;
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            let state = client.read(cx);
+            assert!(state.row_heights[&state.active].borrow().layouts > 0);
+        })
+        .unwrap();
     }
 }
