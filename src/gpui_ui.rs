@@ -592,12 +592,24 @@ enum MarkdownBlock {
     Paragraph(String),
     List(Vec<String>),
     Code(String, String),
-    Rich(String),
+    Structured {
+        content: String,
+        marker: Option<String>,
+        list_depth: usize,
+        quote_depth: usize,
+        heading: Option<u8>,
+    },
+    Table {
+        header: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Rule,
 }
 
 // Increment this when the row's typography or layout rules change. The other
 // parts of the stamp follow the live width, theme and conversation snapshot.
 const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 2;
+const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
 const SIDEBAR_WIDTH: f32 = 270.;
 const TRANSCRIPT_SCROLLBAR_GUTTER: f32 = 14.;
 
@@ -1142,83 +1154,258 @@ fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut list_depth = 0;
-    let complex = Parser::new_ext(source, options).any(|event| match event {
-        Event::Start(Tag::List(start)) => {
-            list_depth += 1;
-            start.is_some() || list_depth > 1
-        }
-        Event::End(TagEnd::List(_)) => {
-            list_depth -= 1;
-            false
-        }
-        Event::Start(Tag::BlockQuote(_) | Tag::Table(_))
-        | Event::TaskListMarker(_)
-        | Event::Rule => true,
-        _ => false,
-    });
+    let complex = source
+        .lines()
+        .any(|line| line.trim_start().starts_with("~~~"))
+        || Parser::new_ext(source, options).any(|event| match event {
+            Event::Start(Tag::List(start)) => {
+                list_depth += 1;
+                start.is_some() || list_depth > 1
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_depth -= 1;
+                false
+            }
+            Event::Start(Tag::BlockQuote(_) | Tag::Table(_))
+            | Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))
+            | Event::TaskListMarker(_)
+            | Event::Rule => true,
+            Event::Start(Tag::CodeBlock(_)) if list_depth > 0 => true,
+            _ => false,
+        });
     if complex {
-        // Keep the existing custom copy-code control for top-level fences,
-        // while letting GPUI Kit render tables, nested/ordered/task lists and
-        // blockquotes instead of displaying their delimiters as plain text.
-        let mut blocks = Vec::new();
-        let mut cursor = 0;
-        let mut container_depth = 0;
-        let mut code: Option<(usize, String, String)> = None;
-        for (event, span) in Parser::new_ext(source, options).into_offset_iter() {
-            if let Some((start, language, content)) = code.as_mut() {
-                match event {
-                    Event::End(TagEnd::CodeBlock) => {
-                        if let Some(prefix) = source
-                            .get(cursor..*start)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        {
-                            blocks.push(MarkdownBlock::Rich(prefix.to_owned()));
-                        }
-                        blocks.push(MarkdownBlock::Code(
-                            language.clone(),
-                            content.trim_end_matches('\n').to_owned(),
-                        ));
-                        cursor = span.end;
-                        code = None;
-                    }
-                    Event::Text(text) | Event::Code(text) => content.push_str(&text),
-                    Event::SoftBreak | Event::HardBreak => content.push('\n'),
-                    _ => {}
-                }
-                continue;
-            }
-            match event {
-                Event::Start(Tag::List(_) | Tag::BlockQuote(_) | Tag::Table(_)) => {
-                    container_depth += 1
-                }
-                Event::End(TagEnd::List(_) | TagEnd::BlockQuote(_) | TagEnd::Table) => {
-                    container_depth -= 1
-                }
-                Event::Start(Tag::CodeBlock(kind)) if container_depth == 0 => {
-                    let language = match kind {
-                        CodeBlockKind::Fenced(language) => language
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or_default()
-                            .to_owned(),
-                        CodeBlockKind::Indented => String::new(),
-                    };
-                    code = Some((span.start, language, String::new()));
-                }
-                _ => {}
-            }
-        }
-        if let Some(tail) = source
-            .get(cursor..)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            blocks.push(MarkdownBlock::Rich(tail.to_owned()));
-        }
-        return blocks;
+        return complex_markdown_blocks(source, options);
     }
     simple_markdown_blocks(source)
+}
+
+struct InlineMarkdownBlock {
+    content: String,
+    marker: Option<String>,
+    list_depth: usize,
+    quote_depth: usize,
+    heading: Option<u8>,
+}
+
+#[derive(Default)]
+struct MarkdownTableBuilder {
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+}
+
+fn flush_inline(blocks: &mut Vec<MarkdownBlock>, current: &mut Option<InlineMarkdownBlock>) {
+    if let Some(block) = current.take().filter(|block| !block.content.is_empty()) {
+        blocks.push(MarkdownBlock::Structured {
+            content: block.content,
+            marker: block.marker,
+            list_depth: block.list_depth,
+            quote_depth: block.quote_depth,
+            heading: block.heading,
+        });
+    }
+}
+
+fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock> {
+    let mut blocks = Vec::new();
+    let mut current: Option<InlineMarkdownBlock> = None;
+    let mut code: Option<(String, String)> = None;
+    let mut table: Option<MarkdownTableBuilder> = None;
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    let mut marker: Option<String> = None;
+    let mut quote_depth = 0;
+    let mut links: Vec<String> = Vec::new();
+    for event in Parser::new_ext(source, options) {
+        if let Some((_, content)) = code.as_mut() {
+            match event {
+                Event::End(TagEnd::CodeBlock) => {
+                    let (language, content) = code.take().unwrap();
+                    blocks.push(MarkdownBlock::Code(
+                        language,
+                        content.trim_end_matches('\n').into(),
+                    ));
+                }
+                Event::Text(text) | Event::Code(text) => content.push_str(&text),
+                Event::SoftBreak | Event::HardBreak => content.push('\n'),
+                _ => {}
+            }
+            continue;
+        }
+        match event {
+            Event::Start(Tag::BlockQuote(_)) => {
+                flush_inline(&mut blocks, &mut current);
+                quote_depth += 1;
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                flush_inline(&mut blocks, &mut current);
+                quote_depth -= 1;
+            }
+            Event::Start(Tag::List(start)) => {
+                flush_inline(&mut blocks, &mut current);
+                lists.push(start);
+            }
+            Event::End(TagEnd::List(_)) => {
+                flush_inline(&mut blocks, &mut current);
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                flush_inline(&mut blocks, &mut current);
+                marker = Some(match lists.last_mut() {
+                    Some(Some(number)) => {
+                        let text = format!("{number}.");
+                        *number += 1;
+                        text
+                    }
+                    _ => "•".into(),
+                });
+            }
+            Event::End(TagEnd::Item) => {
+                flush_inline(&mut blocks, &mut current);
+                marker = None;
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                flush_inline(&mut blocks, &mut current);
+                let language = match kind {
+                    CodeBlockKind::Fenced(language) => language
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .into(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                code = Some((language, String::new()));
+            }
+            Event::Start(Tag::Table(_)) => {
+                flush_inline(&mut blocks, &mut current);
+                table = Some(MarkdownTableBuilder::default());
+            }
+            Event::Start(Tag::TableCell) => {
+                current = Some(InlineMarkdownBlock {
+                    content: String::new(),
+                    marker: None,
+                    list_depth: 0,
+                    quote_depth: 0,
+                    heading: None,
+                });
+            }
+            Event::End(TagEnd::TableCell) => {
+                if let Some(table) = table.as_mut() {
+                    table
+                        .current_row
+                        .push(current.take().map_or_else(String::new, |cell| cell.content));
+                }
+            }
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                if let Some(table) = table.as_mut() {
+                    if table.header.is_empty() {
+                        table.header = std::mem::take(&mut table.current_row);
+                    } else {
+                        table.rows.push(std::mem::take(&mut table.current_row));
+                    }
+                }
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(table) = table.take() {
+                    blocks.push(MarkdownBlock::Table {
+                        header: table.header,
+                        rows: table.rows,
+                    });
+                }
+            }
+            Event::Start(Tag::Paragraph) => {
+                flush_inline(&mut blocks, &mut current);
+                current = Some(InlineMarkdownBlock {
+                    content: String::new(),
+                    marker: marker.take(),
+                    list_depth: lists.len(),
+                    quote_depth,
+                    heading: None,
+                });
+            }
+            Event::Start(Tag::Heading { level, .. }) => {
+                flush_inline(&mut blocks, &mut current);
+                current = Some(InlineMarkdownBlock {
+                    content: String::new(),
+                    marker: marker.take(),
+                    list_depth: lists.len(),
+                    quote_depth,
+                    heading: Some(level as u8),
+                });
+            }
+            Event::End(TagEnd::Paragraph | TagEnd::Heading(_)) => {
+                flush_inline(&mut blocks, &mut current)
+            }
+            Event::Start(Tag::Strong) | Event::End(TagEnd::Strong) => {
+                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "**");
+            }
+            Event::Start(Tag::Emphasis) | Event::End(TagEnd::Emphasis) => {
+                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "*");
+            }
+            Event::Start(Tag::Strikethrough) | Event::End(TagEnd::Strikethrough) => {
+                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "~~");
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                links.push(dest_url.into_string());
+                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "[");
+            }
+            Event::End(TagEnd::Link) => {
+                let destination = links.pop().unwrap_or_default();
+                append_inline(
+                    &mut current,
+                    &mut marker,
+                    lists.len(),
+                    quote_depth,
+                    &format!("]({destination})"),
+                );
+            }
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                append_inline(&mut current, &mut marker, lists.len(), quote_depth, &text);
+            }
+            Event::Code(text) => {
+                append_inline(
+                    &mut current,
+                    &mut marker,
+                    lists.len(),
+                    quote_depth,
+                    &format!("`{text}`"),
+                );
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "\n")
+            }
+            Event::TaskListMarker(checked) => append_inline(
+                &mut current,
+                &mut marker,
+                lists.len(),
+                quote_depth,
+                if checked { "☑ " } else { "☐ " },
+            ),
+            Event::Rule => {
+                flush_inline(&mut blocks, &mut current);
+                blocks.push(MarkdownBlock::Rule);
+            }
+            _ => {}
+        }
+    }
+    flush_inline(&mut blocks, &mut current);
+    blocks
+}
+
+fn append_inline(
+    current: &mut Option<InlineMarkdownBlock>,
+    marker: &mut Option<String>,
+    list_depth: usize,
+    quote_depth: usize,
+    text: &str,
+) {
+    let block = current.get_or_insert_with(|| InlineMarkdownBlock {
+        content: String::new(),
+        marker: marker.take(),
+        list_depth,
+        quote_depth,
+        heading: None,
+    });
+    block.content.push_str(text);
 }
 
 fn simple_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
@@ -1319,7 +1506,77 @@ impl Client {
                     .child(title)
                     .into_any_element(),
                 MarkdownBlock::Paragraph(text) => markdown(text).into_any_element(),
-                MarkdownBlock::Rich(text) => markdown(text).into_any_element(),
+                MarkdownBlock::Structured {
+                    content,
+                    marker,
+                    list_depth,
+                    quote_depth,
+                    heading,
+                } => {
+                    let mut line = div().w_full().flex().items_start();
+                    if let Some(marker) = marker {
+                        line = line.child(
+                            div()
+                                .w(px(24.))
+                                .flex_shrink_0()
+                                .text_color(self.tone(0x777e7d, 0xaeb4b9))
+                                .child(marker),
+                        );
+                    }
+                    line = line.child(div().flex_1().min_w_0().child(markdown(content)));
+                    let mut block = div()
+                        .w_full()
+                        .pl(px(16. * list_depth.saturating_sub(1) as f32))
+                        .when_some(heading, |view, level| {
+                            view.text_size(px(if level == 1 {
+                                18.
+                            } else if level == 2 {
+                                16.
+                            } else {
+                                14.
+                            }))
+                            .font_weight(FontWeight::BOLD)
+                        });
+                    if quote_depth > 0 {
+                        block = block
+                            .border_l_1()
+                            .border_color(self.tone(0xb7b3ac, 0x50565b))
+                            .pl(px(10. + 12. * (quote_depth - 1) as f32))
+                            .text_color(self.tone(0x555b5c, 0xb5b9bb));
+                    }
+                    block.child(line).into_any_element()
+                }
+                MarkdownBlock::Table { header, rows } => {
+                    let mut table = div()
+                        .w_full()
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(self.tone(0xd2cdc5, 0x30353a));
+                    for (index, row) in std::iter::once(header).chain(rows).enumerate() {
+                        let mut line = div().w_full().flex().when(index == 0, |line| {
+                            line.font_weight(FontWeight::BOLD)
+                                .bg(self.tone(0xece9e2, 0x202429))
+                        });
+                        for cell in row {
+                            line = line.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .p(px(7.))
+                                    .border_r_1()
+                                    .border_color(self.tone(0xd2cdc5, 0x30353a))
+                                    .child(markdown(cell)),
+                            );
+                        }
+                        table = table.child(line);
+                    }
+                    table.into_any_element()
+                }
+                MarkdownBlock::Rule => div()
+                    .h(px(1.))
+                    .w_full()
+                    .bg(self.tone(0xc8c3ba, 0x343a3f))
+                    .into_any_element(),
                 MarkdownBlock::List(items) => {
                     let mut list = div().flex().flex_col().gap(px(10.));
                     for item in items {
@@ -3621,6 +3878,17 @@ impl Client {
                 conversations.insert(session.id.clone(), conversation);
             }
         }
+        let complex_markdown = overlay.as_deref() == Some("complex-markdown");
+        if complex_markdown
+            && let Some(row) = transcript.get_mut(&active).and_then(|rows| {
+                rows.iter_mut().find(|row| {
+                    row.role == model::Role::Assistant && row.kind == TranscriptRowKind::Normal
+                })
+            })
+        {
+            row.body = COMPLEX_MARKDOWN_PREVIEW.into();
+            row.render_revision += 1;
+        }
         let catalog = match fixture.handle(Command::LoadModels {
             directory: "/repo".into(),
         }) {
@@ -3696,7 +3964,11 @@ impl Client {
             composers: HashMap::new(),
             attachments_draft: Vec::new(),
             attachment_drafts: HashMap::new(),
-            overlay: if modal.is_none() { overlay } else { None },
+            overlay: if modal.is_none() && !complex_markdown {
+                overlay
+            } else {
+                None
+            },
             scroll,
             history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
@@ -7066,12 +7338,12 @@ mod tests {
     use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc};
 
     use super::{
-        Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
-        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, VirtualListScrollHandle,
-        filter_all_sessions, filter_levels, filter_models, filter_new_session_projects,
-        filter_tab_sessions, fuzzy_score, markdown_blocks, model, needs_new_connection,
-        new_session_choice, picker_list_height, reorder_tab_ids, safe_connection_error,
-        splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
+        COMPLEX_MARKDOWN_PREVIEW, Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp,
+        SESSION_PICKER_LIMIT, TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode,
+        VirtualListScrollHandle, filter_all_sessions, filter_levels, filter_models,
+        filter_new_session_projects, filter_tab_sessions, fuzzy_score, markdown_blocks, model,
+        needs_new_connection, new_session_choice, picker_list_height, reorder_tab_ids,
+        safe_connection_error, splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
         unread_on_server_switch, update_session_projection,
     };
     use gpui_kit::test::TestWindowExt;
@@ -10079,18 +10351,25 @@ mod tests {
     }
 
     #[test]
-    fn complex_markdown_uses_rich_renderer_but_keeps_top_level_copy_code() {
+    fn complex_markdown_preserves_structure_and_copy_code() {
         let source = "> A quoted line\n\n1. Ordered item\n   - Nested item\n\n| Name | Value |\n| --- | --- |\n| clip | 22px |\n\n```rust\nlet x = 22;\n```\n\n- [x] done";
         let blocks = markdown_blocks(source);
-        assert_eq!(blocks.len(), 3);
+        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, quote_depth: 1, .. } if content == "A quoted line")));
+        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, marker: Some(marker), list_depth: 1, .. } if content == "Ordered item" && marker == "1.")));
+        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, marker: Some(marker), list_depth: 2, .. } if content == "Nested item" && marker == "•")));
+        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Table { header, rows } if header == &["Name", "Value"] && rows == &[vec!["clip", "22px"]])));
+        assert!(blocks.contains(&MarkdownBlock::Code("rust".into(), "let x = 22;".into())));
+        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "☑ done")));
+        assert!(markdown_blocks(COMPLEX_MARKDOWN_PREVIEW)
+            .iter()
+            .any(|block| matches!(block, MarkdownBlock::Code(language, code) if language == "rust" && code.contains("paperclip_icon"))));
         assert!(
-            matches!(&blocks[0], MarkdownBlock::Rich(text) if text.contains("> A quoted line") && text.contains("| clip | 22px |"))
+            markdown_blocks("~~~sh\necho ok\n~~~")
+                .contains(&MarkdownBlock::Code("sh".into(), "echo ok".into()))
         );
-        assert_eq!(
-            blocks[1],
-            MarkdownBlock::Code("rust".into(), "let x = 22;".into())
-        );
-        assert_eq!(blocks[2], MarkdownBlock::Rich("- [x] done".into()));
+        assert!(markdown_blocks("- parent\n\n      code line").iter().any(
+            |block| matches!(block, MarkdownBlock::Code(_, code) if code.contains("code line"))
+        ));
     }
 
     #[gpui_kit::test]
@@ -10098,25 +10377,21 @@ mod tests {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
-                cx.new(|cx| Client::from_preview(window, cx, None))
+                cx.new(|cx| Client::from_preview(window, cx, Some("complex-markdown".into())))
             })
             .expect("headless transcript window")
-        });
-        cx.update(|cx| {
-            client.update(cx, |client, cx| {
-                let rows = client.transcript.get_mut(&client.active).unwrap();
-                let row = rows.iter_mut().find(|row| row.role == model::Role::Assistant).unwrap();
-                row.body = "> A quote\n\n| Name | Value |\n| --- | --- |\n| clip | 22px |\n\n1. Ordered\n   - Nested\n\n```rust\nlet x = 22;\n```".into();
-                row.render_revision += 1;
-                client.row_heights.remove(&client.active);
-                cx.notify();
-            });
         });
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             window.simulate_next_frame(cx);
             window.render_frame(cx);
             let state = client.read(cx);
+            assert!(
+                state.transcript[&state.active]
+                    .iter()
+                    .any(|row| row.kind == model::TranscriptRowKind::Normal
+                        && row.body == COMPLEX_MARKDOWN_PREVIEW)
+            );
             assert!(state.row_heights[&state.active].borrow().layouts > 0);
         })
         .unwrap();

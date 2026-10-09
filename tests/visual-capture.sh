@@ -128,6 +128,10 @@ if [[ "$CLIENT" == gpui && "$case_name" == main && -z "${INTERACTION:-}" && "${P
   # input state instead of misreporting GPUI's unfocused placeholder as a UI gap.
   xdotool mousemove --window "$win" 410 680 click 1
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == complex-top ]]; then
+  xdotool mousemove --window "$win" 550 350 click --repeat 30 --delay 20 4
+  sleep 1
+fi
 if [[ "$CLIENT" == gpui && ( "${INTERACTION:-}" == send || "${INTERACTION:-}" == type ) ]]; then
   xdotool mousemove --window "$win" 410 680 click 1
   sleep 0.2
