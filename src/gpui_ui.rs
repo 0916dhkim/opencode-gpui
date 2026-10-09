@@ -6155,6 +6155,7 @@ impl Client {
                 let list = div()
                     .w(px(if model { 368. } else { 268. }))
                     .h(px(70. + picker_list_height(model, count)))
+                    .relative()
                     .rounded(px(8.))
                     .border_1()
                     .border_color(self.tone(0xc8c3ba, 0x30353a))
@@ -6331,7 +6332,20 @@ impl Client {
                         );
                     }
                 }
-                list.child(rows).into_any_element()
+                list.child(rows)
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom(px(-20.))
+                            .left(px(if model { 174. } else { 119. }))
+                            .child(
+                                Icon::default()
+                                    .data(include_bytes!("icons/popover-arrow.svg"))
+                                    .with_size(px(20.))
+                                    .text_color(self.tone(0xfffdfa, 0x191c1f)),
+                            ),
+                    )
+                    .into_any_element()
             }
         };
         let backdrop = if matches!(modal, Modal::Model | Modal::Level) {
