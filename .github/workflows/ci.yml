@@ -13,34 +13,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # libcosmic 03d7dcb pulls cosmic-text 0.19, which needs Rust >= 1.93.
-      # 1.98.1 matches the toolchain in Dockerfile.
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # pinned action
         with:
+          toolchain: stable
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake libdbus-1-dev libexpat1-dev libfontconfig1-dev libfreetype6-dev \
-            libgl1-mesa-dev libxkbcommon-dev libwayland-dev pkg-config \
-            libgl1-mesa-dri libxkbcommon-x11-0 \
-            xvfb xdotool xauth python3
+            cmake fonts-noto-core libdbus-1-dev libexpat1-dev \
+            libfontconfig1-dev libfreetype6-dev libgl1-mesa-dev libssl-dev \
+            libwebkit2gtk-4.1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libzstd-dev libvulkan1 \
+            mesa-vulkan-drivers pkg-config python3 weston xvfb xdotool \
+            x11-utils imagemagick
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --all-targets --locked
       - name: Fake v2 server self-test
         run: python3 tests/fake_v2/selftest.py
+      - name: Build GPUI client
+        run: cargo build --locked
       - name: Headless smoke test
-        run: xvfb-run --auto-servernum bash tests/smoke-ui.sh
+        run: SMOKE_BINARY="$PWD/target/debug/opencode-gpui" bash tests/smoke-ui.sh
       - name: Headless keyboard-shortcut test
-        run: xvfb-run --auto-servernum bash tests/shortcut-ui.sh
-      # TODO(port): tests/remote-flow-ui.sh still drives the GTK client's widget
-      # layout (pixel coordinates) and its GTK-only cancel-form shortcut, so it
-      # cannot run against the COSMIC client yet.
+        run: SHORTCUT_BINARY="$PWD/target/debug/opencode-gpui" bash tests/shortcut-ui.sh
+      - name: Headless fake-server UI flow
+        run: FLOW_BINARY="$PWD/target/debug/opencode-gpui" bash tests/remote-flow-ui.sh
       # The real OpenCode 2.0.8 end-to-end run (tests/v2/e2e.sh) needs Docker and
       # downloads the pinned CLI when its image is built, so it runs locally only.
