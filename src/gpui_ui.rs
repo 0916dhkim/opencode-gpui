@@ -398,6 +398,7 @@ struct Client {
     saved_active: Option<String>,
     connection_status: String,
     disconnected: bool,
+    sse_connected_once: bool,
     server_version: Option<String>,
     conversations: HashMap<String, Conversation>,
     loading_messages: HashMap<String, Option<String>>,
@@ -1816,6 +1817,7 @@ impl Client {
             saved_active: None,
             connection_status: "Connecting".into(),
             disconnected: false,
+            sse_connected_once: false,
             server_version: None,
             conversations: HashMap::new(),
             loading_messages: HashMap::new(),
@@ -2462,6 +2464,7 @@ impl Client {
             |warning| format!("Connecting · {warning}"),
         );
         self.disconnected = false;
+        self.sse_connected_once = false;
         self.sessions.clear();
         self.unread = next_unread.expect("new connection has restored unread state");
         self.open_tabs = persisted
@@ -3066,6 +3069,30 @@ impl Client {
             .collect()
     }
 
+    fn invalidate_catalogs(&mut self, directory: Option<String>) -> Vec<String> {
+        let mut directories = if let Some(directory) = directory {
+            vec![directory]
+        } else {
+            let mut directories = self.active_directories();
+            directories.extend(self.catalogs.keys().cloned());
+            directories
+        };
+        directories.sort();
+        directories.dedup();
+        let active_directory = self
+            .sessions
+            .iter()
+            .find(|session| session.id == self.active)
+            .map(|session| session.directory.as_str());
+        for directory in &directories {
+            self.catalogs.remove(directory);
+            if active_directory == Some(directory.as_str()) {
+                self.catalog = ModelCatalog::default();
+            }
+        }
+        directories
+    }
+
     fn request_bootstrap(&mut self) {
         if self.bootstrap_in_flight {
             self.bootstrap_after_load = true;
@@ -3452,8 +3479,13 @@ impl Client {
                     .as_ref()
                     .map(|version| format!("Connected · {version}"))
                     .unwrap_or_else(|| "Connected".into());
-                // The stream reconnects independently of request workers; resync after outages.
-                if self.disconnected {
+                // Snapshot and SSE subscribe are independent workers. Even on
+                // the first connection, take a second snapshot after the
+                // stream is live: otherwise a change between the initial
+                // snapshot and subscribe is lost from both sources.
+                let first_subscription = !self.sse_connected_once;
+                self.sse_connected_once = true;
+                if first_subscription || self.disconnected {
                     self.refresh_open_tabs = true;
                     self.request_bootstrap();
                     self.disconnected = false;
@@ -3895,14 +3927,13 @@ impl Client {
                         self.running_jobs.apply_event(job_event, &context);
                         self.jobs = self.running_jobs.rows(Some(&self.active));
                     }
-                    if let Some(model::CatalogInvalidation {
-                        directory: Some(directory),
-                        ..
-                    }) = model::CatalogInvalidation::from_kind(&event, &kind)
+                    if let Some(invalidation) = model::CatalogInvalidation::from_kind(&event, &kind)
                     {
-                        self.catalogs.remove(&directory);
+                        let directories = self.invalidate_catalogs(invalidation.directory);
                         if let Some(api) = &self.api {
-                            api.send(Command::LoadModels { directory });
+                            for directory in directories {
+                                api.send(Command::LoadModels { directory });
+                            }
                         }
                     }
                     if let Some(change) =
@@ -4065,6 +4096,7 @@ impl Client {
             saved_active: None,
             connection_status: "Connected · preview".into(),
             disconnected: false,
+            sse_connected_once: false,
             server_version: None,
             conversations,
             loading_messages: HashMap::new(),
@@ -9916,6 +9948,49 @@ mod tests {
         .unwrap();
     }
 
+    #[gpui_kit::test]
+    fn first_sse_subscription_rechecks_the_bootstrap_snapshot(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.bootstrap_in_flight = true;
+                client.handle_live_event(
+                    super::UiEvent::Connection {
+                        connected: true,
+                        error: None,
+                    },
+                    cx,
+                );
+                assert!(
+                    client.bootstrap_after_load,
+                    "first subscribe coalesces a second snapshot"
+                );
+                assert!(client.refresh_open_tabs);
+                client.bootstrap_after_load = false;
+                client.bootstrap_in_flight = false;
+                client.refresh_open_tabs = false;
+                client.handle_live_event(
+                    super::UiEvent::Connection {
+                        connected: true,
+                        error: None,
+                    },
+                    cx,
+                );
+                assert!(
+                    !client.bootstrap_after_load,
+                    "duplicate connected status does not loop"
+                );
+                assert!(!client.refresh_open_tabs);
+            });
+        });
+    }
+
     #[test]
     fn canonical_server_key_recovers_raw_api_suffix_tabs_without_deleting_them() {
         let configured = "https://EXAMPLE.com/prefix/api/";
@@ -9970,6 +10045,37 @@ mod tests {
                         .servers
                         .contains_key("http://127.0.0.1:4096/api")
                 );
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn locationless_model_event_invalidates_all_loaded_and_open_catalogs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                assert!(!client.catalog.models.is_empty());
+                let other = client.catalog.clone();
+                client.catalogs.insert("/other".into(), other);
+                client.handle_live_event(
+                    super::UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                        directory: None,
+                        payload: json!({
+                            "id": "evt_catalog_global", "created": 1,
+                            "type": "model.updated", "data": {}
+                        }),
+                    }),
+                    cx,
+                );
+                assert!(client.catalogs.is_empty());
+                assert!(client.catalog.models.is_empty());
+                assert!(client.active_directories().contains(&"/repo".to_owned()));
             });
         });
     }
