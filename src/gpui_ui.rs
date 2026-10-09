@@ -2134,6 +2134,35 @@ impl Client {
         cx.notify();
     }
 
+    fn switch_settings_tab(
+        &mut self,
+        tab: SettingsTab,
+        focus_field: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.tab = tab;
+        if tab == SettingsTab::Sessions {
+            self.settings_highlight = None;
+            self.settings_sessions_scroll
+                .set_offset(point(px(0.), px(0.)));
+        }
+        if focus_field {
+            match tab {
+                SettingsTab::Connection => self.settings.server.focus_handle(cx).focus(window, cx),
+                SettingsTab::Sessions => self
+                    .settings
+                    .session_search
+                    .focus_handle(cx)
+                    .focus(window, cx),
+            }
+        } else {
+            let index = if tab == SettingsTab::Connection { 0 } else { 1 };
+            self.settings_tab_focus[index].focus(window, cx);
+        }
+        cx.notify();
+    }
+
     fn modal_choice_count(&self, cx: &Context<Self>) -> usize {
         let query = self.search.read(cx).value().to_lowercase();
         match self.modal {
@@ -6054,11 +6083,34 @@ impl Client {
                                     .focus_visible(|style| {
                                         style.border_color(self.tone(0x2356a8, 0x78baff))
                                     })
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, window, cx| {
+                                            match event.keystroke.key.as_str() {
+                                                "enter" | "space" => this.switch_settings_tab(
+                                                    SettingsTab::Connection,
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                ),
+                                                "down" | "right" => this.switch_settings_tab(
+                                                    SettingsTab::Sessions,
+                                                    false,
+                                                    window,
+                                                    cx,
+                                                ),
+                                                _ => return,
+                                            }
+                                            cx.stop_propagation();
+                                        },
+                                    ))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.settings.tab = SettingsTab::Connection;
-                                        this.settings.server.focus_handle(cx).focus(window, cx);
-                                        cx.notify();
+                                        this.switch_settings_tab(
+                                            SettingsTab::Connection,
+                                            true,
+                                            window,
+                                            cx,
+                                        );
                                     }))
                                     .mt(px(7.))
                                     .px(px(9.))
@@ -6105,17 +6157,34 @@ impl Client {
                                     .focus_visible(|style| {
                                         style.border_color(self.tone(0x2356a8, 0x78baff))
                                     })
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, window, cx| {
+                                            match event.keystroke.key.as_str() {
+                                                "enter" | "space" => this.switch_settings_tab(
+                                                    SettingsTab::Sessions,
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                ),
+                                                "up" | "left" => this.switch_settings_tab(
+                                                    SettingsTab::Connection,
+                                                    false,
+                                                    window,
+                                                    cx,
+                                                ),
+                                                _ => return,
+                                            }
+                                            cx.stop_propagation();
+                                        },
+                                    ))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.settings.tab = SettingsTab::Sessions;
-                                        this.settings_highlight = None;
-                                        this.settings_sessions_scroll
-                                            .set_offset(point(px(0.), px(0.)));
-                                        this.settings
-                                            .session_search
-                                            .focus_handle(cx)
-                                            .focus(window, cx);
-                                        cx.notify();
+                                        this.switch_settings_tab(
+                                            SettingsTab::Sessions,
+                                            true,
+                                            window,
+                                            cx,
+                                        );
                                     }))
                                     .mt(px(2.))
                                     .px(px(9.))
@@ -8140,16 +8209,41 @@ mod tests {
             let connection_focus = client.read(cx).settings_tab_focus[0].clone();
             connection_focus.focus(window, cx);
             window.render_frame(cx);
+            window.press("down", cx);
+            assert_eq!(window.find("settings-tab-sessions").selected(), Some(true));
+            assert!(client.read(cx).settings_tab_focus[1].is_focused(window));
+            window.press("up", cx);
+            assert_eq!(
+                window.find("settings-tab-connection").selected(),
+                Some(true)
+            );
+            assert!(client.read(cx).settings_tab_focus[0].is_focused(window));
             window.press("enter", cx);
             assert_eq!(
                 window.find("settings-tab-connection").selected(),
                 Some(true)
+            );
+            assert!(
+                client
+                    .read(cx)
+                    .settings
+                    .server
+                    .focus_handle(cx)
+                    .is_focused(window)
             );
             let sessions_focus = client.read(cx).settings_tab_focus[1].clone();
             sessions_focus.focus(window, cx);
             window.render_frame(cx);
             window.press("space", cx);
             assert_eq!(window.find("settings-tab-sessions").selected(), Some(true));
+            assert!(
+                client
+                    .read(cx)
+                    .settings
+                    .session_search
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
         })
         .unwrap();
         cx.update(|cx| assert!(!client.read(cx).settings.remember_password));
