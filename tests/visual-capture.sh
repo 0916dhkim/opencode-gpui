@@ -111,7 +111,7 @@ fi
 if [[ "$CLIENT" == gtk ]]; then case "$case_name" in
   main) ;;
   settings) xdotool key ctrl+comma ;;
-  settings-sessions) xdotool key ctrl+comma; sleep 1; xdotool mousemove 80 184 click 1 ;;
+  settings-sessions) xdotool key ctrl+comma; sleep 1; xdotool mousemove --window "$win" 80 192 click 1 ;;
   sessions) xdotool key ctrl+p ;;
   new-session) xdotool mousemove 70 76 click 1 ;;
   model) xdotool mousemove 420 758 click 1 ;;
