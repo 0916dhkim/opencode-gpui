@@ -46,6 +46,25 @@ fn tab_number_key(key: &str) -> Option<usize> {
     }
 }
 
+fn unread_on_server_switch(
+    state: &mut PersistedState,
+    previous: Option<(&str, &HashSet<String>)>,
+    next_key: &str,
+) -> HashSet<String> {
+    if let Some((previous_key, unread)) = previous {
+        state
+            .servers
+            .entry(previous_key.trim_end_matches('/').to_owned())
+            .or_default()
+            .unread = unread.clone();
+    }
+    state
+        .servers
+        .get(next_key)
+        .map(|saved| saved.unread.clone())
+        .unwrap_or_default()
+}
+
 fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
@@ -1947,6 +1966,15 @@ impl Client {
             log::warn!("{warning}");
         }
         let mut persisted = self.settings.persisted.clone();
+        let next_unread = next_connection.as_ref().map(|(_, _, key)| {
+            unread_on_server_switch(
+                &mut persisted,
+                self.api
+                    .as_ref()
+                    .map(|_| (old.base_url.as_str(), &self.unread)),
+                key,
+            )
+        });
         persisted.connection = ConnectionSettings {
             server: server.clone(),
             username,
@@ -1972,6 +2000,7 @@ impl Client {
         );
         self.disconnected = false;
         self.sessions.clear();
+        self.unread = next_unread.expect("new connection has restored unread state");
         self.open_tabs = persisted
             .servers
             .get(&key)
@@ -6618,7 +6647,7 @@ pub fn run(args: Args) {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, path::PathBuf, rc::Rc};
+    use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc};
 
     use super::{
         Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
@@ -6627,7 +6656,7 @@ mod tests {
         filter_tab_sessions, fuzzy_score, markdown_blocks, model, needs_new_connection,
         new_session_choice, picker_list_height, reorder_tab_ids, safe_connection_error,
         splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
-        update_session_projection,
+        unread_on_server_switch, update_session_projection,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -8479,6 +8508,31 @@ mod tests {
             });
         })
         .unwrap();
+    }
+
+    #[test]
+    fn switching_servers_restores_only_that_servers_unread_marks() {
+        let mut persisted = PersistedState::default();
+        let a = "https://a.example.com";
+        let b = "https://b.example.com";
+        let a_unread = HashSet::from(["ses_a".to_owned()]);
+        let b_unread = HashSet::from(["ses_b".to_owned()]);
+
+        let mut current = unread_on_server_switch(&mut persisted, Some((a, &a_unread)), b);
+        assert!(current.is_empty(), "A's unread mark leaked into B");
+        current.insert("ses_b".into());
+        let restored_a = unread_on_server_switch(&mut persisted, Some((b, &current)), a);
+        assert_eq!(restored_a, a_unread);
+        let restored_b = unread_on_server_switch(
+            &mut persisted,
+            Some(("https://a.example.com/", &restored_a)),
+            b,
+        );
+        assert_eq!(restored_b, b_unread);
+
+        // A failed initial connection must not overwrite the old server's
+        // saved marks with an empty, uninitialized in-memory set.
+        assert_eq!(unread_on_server_switch(&mut persisted, None, a), a_unread);
     }
 
     #[test]
