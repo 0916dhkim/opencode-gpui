@@ -183,16 +183,17 @@ timeout 5 xdotool windowfocus --sync "$window" >/dev/null || fail 'could not foc
 # The X11 keys below are ASCII only. Actual Hangul must come from the IME's
 # Wayland preedit/commit events, never from an injected Unicode key or paste.
 sleep 2  # X window can exist before the GPUI surface is ready for input.
-line_before="$(wc -l <"$temporary/app.log")"
 xdotool mousemove --window "$window" 410 680 click 1
+# A restored live session can focus its composer during bootstrap, before the
+# click. In that case Wayland sends enable only once, before this point. The
+# later preedit/commit and server-prompt assertions still prove live IME input.
 for _ in $(seq 1 50); do
-  if tail -n "+$((line_before + 1))" "$temporary/app.log" \
-      | grep -Eq 'zwp_text_input_v3@[0-9]+\.enable\('; then break; fi
+  if grep -Eq 'zwp_text_input_v3@[0-9]+\.enable\(' "$temporary/app.log"; then break; fi
   kill -0 "$app_pid" 2>/dev/null || fail 'GPUI exited after composer click'
   sleep 0.1
 done
-tail -n "+$((line_before + 1))" "$temporary/app.log" \
-  | grep -Eq 'zwp_text_input_v3@[0-9]+\.enable\(' || fail 'composer did not enable text-input-v3'
+grep -Eq 'zwp_text_input_v3@[0-9]+\.enable\(' "$temporary/app.log" \
+  || fail 'composer did not enable text-input-v3'
 for _ in $(seq 1 60); do
   timeout 5 fcitx5-remote -s hangul >/dev/null 2>&1 || true
   timeout 5 fcitx5-remote -o >/dev/null 2>&1 || true
