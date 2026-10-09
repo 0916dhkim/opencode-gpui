@@ -426,6 +426,7 @@ struct Client {
     sessions_picker_scroll: ScrollHandle,
     picker_list_scroll: ScrollHandle,
     projects_picker_scroll: ScrollHandle,
+    picker_choice_focus: HashMap<String, FocusHandle>,
     unread: HashSet<String>,
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
@@ -1416,6 +1417,7 @@ impl Client {
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
             projects_picker_scroll: ScrollHandle::new(),
+            picker_choice_focus: HashMap::new(),
             unread: HashSet::new(),
             statuses: HashMap::new(),
             jobs: Vec::new(),
@@ -2415,6 +2417,85 @@ impl Client {
                     cx.notify();
                     return;
                 }
+            }
+        }
+        if matches!(key.as_str(), "enter" | "space") {
+            let query = self.search.read(cx).value();
+            let focused = match self.modal {
+                Some(Modal::Sessions) => filter_tab_sessions(&self.sessions, &query)
+                    .into_iter()
+                    .find(|session| {
+                        self.picker_choice_focus
+                            .get(&format!("session:{}", session.id))
+                            .is_some_and(|focus| focus.is_focused(window))
+                    })
+                    .map(|session| (false, session.id.clone())),
+                Some(Modal::NewSession) => filter_new_session_projects(
+                    &self.projects,
+                    &self.sessions,
+                    self.sessions
+                        .iter()
+                        .find(|session| session.id == self.active)
+                        .map(|session| session.directory.as_str()),
+                    &query,
+                )
+                .into_iter()
+                .find(|(_, directory)| {
+                    self.picker_choice_focus
+                        .get(&format!("project:{directory}"))
+                        .is_some_and(|focus| focus.is_focused(window))
+                })
+                .map(|(_, directory)| (true, directory)),
+                _ => None,
+            };
+            if let Some((create, id)) = focused {
+                if create {
+                    self.create_session(id, cx);
+                } else {
+                    self.select_session(id);
+                    self.modal = None;
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            let focused_model = match self.modal {
+                Some(Modal::Model) => filter_models(&self.catalog.models, &query)
+                    .into_iter()
+                    .find(|option| {
+                        self.picker_choice_focus
+                            .get(&format!("model:{}:{}", option.provider_id, option.model_id))
+                            .is_some_and(|focus| focus.is_focused(window))
+                    })
+                    .map(|option| protocol::ModelRef {
+                        id: option.model_id.clone(),
+                        provider_id: option.provider_id.clone(),
+                        variant: None,
+                    }),
+                Some(Modal::Level) => self.selected_model().and_then(|selection| {
+                    let variants = self.catalog.find(&selection)?.variants.clone();
+                    filter_levels(&variants, &query)
+                        .into_iter()
+                        .find(|variant| {
+                            self.picker_choice_focus
+                                .get(&format!(
+                                    "level:{}",
+                                    variant.as_deref().unwrap_or("Default")
+                                ))
+                                .is_some_and(|focus| focus.is_focused(window))
+                        })
+                        .map(|variant| protocol::ModelRef {
+                            id: selection.model_id,
+                            provider_id: selection.provider_id,
+                            variant,
+                        })
+                }),
+                _ => None,
+            };
+            if let Some(model) = focused_model {
+                self.choose_model(model, cx);
+                cx.stop_propagation();
+                return;
             }
         }
         if matches!(key.as_str(), "up" | "down") && self.modal_choice_count(cx) > 0 {
@@ -3533,6 +3614,7 @@ impl Client {
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
             projects_picker_scroll: ScrollHandle::new(),
+            picker_choice_focus: HashMap::new(),
             unread: server.unread,
             statuses: bootstrap.statuses,
             jobs,
@@ -5667,6 +5749,17 @@ impl Client {
                         list = list.child(
                             div()
                                 .id(format!("session-choice-{}", session.id))
+                                .role(Role::Button)
+                                .aria_label(format!("Open session: {}", session.title))
+                                .test_support()
+                                .track_focus(
+                                    self.picker_choice_focus
+                                        .get(&format!("session:{}", session.id))
+                                        .expect("session choice focus"),
+                                )
+                                .focus_visible(|style| {
+                                    style.border_color(self.tone(0x2356a8, 0x78baff))
+                                })
                                 .h(px(44.))
                                 .flex_shrink_0()
                                 .mx(px(10.))
@@ -5798,6 +5891,17 @@ impl Client {
                         list = list.child(
                             div()
                                 .id(format!("project-choice-{directory}"))
+                                .role(Role::Button)
+                                .aria_label(format!("Create session in {label}: {directory}"))
+                                .test_support()
+                                .track_focus(
+                                    self.picker_choice_focus
+                                        .get(&format!("project:{directory}"))
+                                        .expect("project choice focus"),
+                                )
+                                .focus_visible(|style| {
+                                    style.border_color(self.tone(0x2356a8, 0x78baff))
+                                })
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.create_session(directory.clone(), cx);
@@ -6419,6 +6523,20 @@ impl Client {
                                     "pick-model-{}-{}",
                                     option.provider_id, option.model_id
                                 ))
+                                .role(Role::Button)
+                                .aria_label(format!("Choose model: {}", option.label))
+                                .test_support()
+                                .track_focus(
+                                    self.picker_choice_focus
+                                        .get(&format!(
+                                            "model:{}:{}",
+                                            option.provider_id, option.model_id
+                                        ))
+                                        .expect("model choice focus"),
+                                )
+                                .focus_visible(|style| {
+                                    style.border_color(self.tone(0x2356a8, 0x78baff))
+                                })
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.choose_model(selection.clone(), cx);
@@ -6496,6 +6614,17 @@ impl Client {
                         rows = rows.child(
                             div()
                                 .id(format!("pick-level-{level}"))
+                                .role(Role::Button)
+                                .aria_label(format!("Choose reasoning level: {level}"))
+                                .test_support()
+                                .track_focus(
+                                    self.picker_choice_focus
+                                        .get(&format!("level:{level}"))
+                                        .expect("level choice focus"),
+                                )
+                                .focus_visible(|style| {
+                                    style.border_color(self.tone(0x2356a8, 0x78baff))
+                                })
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(model) = &model_ref {
@@ -6614,6 +6743,58 @@ impl Render for Client {
                     .entry(id)
                     .or_insert_with(|| cx.focus_handle().tab_stop(true));
             }
+        }
+        let picker_focus_keys: Vec<_> = match self.modal {
+            Some(Modal::Sessions) => {
+                let query = self.search.read(cx).value();
+                filter_tab_sessions(&self.sessions, &query)
+                    .into_iter()
+                    .map(|session| format!("session:{}", session.id))
+                    .collect()
+            }
+            Some(Modal::NewSession) => {
+                let query = self.search.read(cx).value();
+                filter_new_session_projects(
+                    &self.projects,
+                    &self.sessions,
+                    self.sessions
+                        .iter()
+                        .find(|session| session.id == self.active)
+                        .map(|session| session.directory.as_str()),
+                    &query,
+                )
+                .into_iter()
+                .map(|(_, directory)| format!("project:{directory}"))
+                .collect()
+            }
+            Some(Modal::Model) => {
+                let query = self.search.read(cx).value();
+                filter_models(&self.catalog.models, &query)
+                    .into_iter()
+                    .map(|option| format!("model:{}:{}", option.provider_id, option.model_id))
+                    .collect()
+            }
+            Some(Modal::Level) => {
+                let query = self.search.read(cx).value();
+                let variants = self
+                    .selected_model()
+                    .as_ref()
+                    .and_then(|selection| self.catalog.find(selection))
+                    .map(|option| option.variants.clone())
+                    .unwrap_or_default();
+                filter_levels(&variants, &query)
+                    .into_iter()
+                    .map(|variant| format!("level:{}", variant.as_deref().unwrap_or("Default")))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        self.picker_choice_focus
+            .retain(|key, _| picker_focus_keys.contains(key));
+        for key in picker_focus_keys {
+            self.picker_choice_focus
+                .entry(key)
+                .or_insert_with(|| cx.focus_handle().tab_stop(true));
         }
         let mut deferred = Vec::new();
         for (id, text, attachments) in std::mem::take(&mut self.clear_accepted_drafts) {
@@ -8376,6 +8557,113 @@ mod tests {
         })
         .unwrap();
         cx.update(|cx| assert!(!client.read(cx).settings.remember_password));
+    }
+
+    #[gpui_kit::test]
+    fn picker_rows_are_named_focusable_keyboard_actions(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("sessions".into())))
+            })
+            .expect("headless picker window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let session = client
+                .read(cx)
+                .sessions
+                .iter()
+                .find(|s| s.id != client.read(cx).active)
+                .unwrap()
+                .clone();
+            let control = window.find(format!("session-choice-{}", session.id));
+            assert_eq!(control.role(), Some(Role::Button));
+            assert_eq!(
+                control.label(),
+                Some(format!("Open session: {}", session.title).as_str())
+            );
+            let focus =
+                client.read(cx).picker_choice_focus[&format!("session:{}", session.id)].clone();
+            focus.focus(window, cx);
+            assert!(focus.is_focused(window));
+            window.press("enter", cx);
+            assert_eq!(client.read(cx).active, session.id);
+            assert!(client.read(cx).modal.is_none());
+
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::NewSession, window, cx)
+            });
+            window.render_frame(cx);
+            let query = client.read(cx).search.read(cx).value();
+            let first = filter_new_session_projects(
+                &client.read(cx).projects,
+                &client.read(cx).sessions,
+                Some(session.directory.as_str()),
+                &query,
+            )[0]
+            .clone();
+            let control = window.find(format!("project-choice-{}", first.1));
+            assert_eq!(control.role(), Some(Role::Button));
+            let focus =
+                client.read(cx).picker_choice_focus[&format!("project:{}", first.1)].clone();
+            focus.focus(window, cx);
+            window.press("space", cx);
+            assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn model_and_level_rows_activate_the_focused_choice(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("model".into())))
+            })
+            .expect("headless picker window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let option = client
+                .read(cx)
+                .catalog
+                .models
+                .iter()
+                .find(|option| option.variants.len() > 1)
+                .unwrap()
+                .clone();
+            let key = format!("model:{}:{}", option.provider_id, option.model_id);
+            let control = window.find(format!(
+                "pick-model-{}-{}",
+                option.provider_id, option.model_id
+            ));
+            assert_eq!(control.role(), Some(Role::Button));
+            assert_eq!(
+                control.label(),
+                Some(format!("Choose model: {}", option.label).as_str())
+            );
+            let focus = client.read(cx).picker_choice_focus[&key].clone();
+            focus.focus(window, cx);
+            window.press("space", cx);
+            assert_eq!(
+                client.read(cx).selected_model().unwrap().model_id,
+                option.model_id
+            );
+            client.update(cx, |client, cx| client.show_modal(Modal::Level, window, cx));
+            window.render_frame(cx);
+            let variant = option.variants.last().unwrap().clone();
+            let control = window.find(format!("pick-level-{variant}"));
+            assert_eq!(control.role(), Some(Role::Button));
+            let focus = client.read(cx).picker_choice_focus[&format!("level:{variant}")].clone();
+            focus.focus(window, cx);
+            window.press("enter", cx);
+            assert_eq!(
+                client.read(cx).selected_model().unwrap().variant.as_deref(),
+                Some(variant.as_str())
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
