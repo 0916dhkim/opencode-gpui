@@ -120,6 +120,12 @@ for name in ('Attach file', 'Choose model', 'Choose reasoning level'):
     assert 'Action' in control.get_interfaces(), f'{name} lacks Action'
     assert pyatspi.STATE_FOCUSABLE in control.getState().getStates(), (
         f'{name} is not keyboard-focusable')
+copy_buttons = [child for child in frames[0]
+                if child.getRoleName() == 'push button' and child.name == 'Copy code']
+assert len(copy_buttons) == 1, 'The code-block copy control lacks a platform-accessible name'
+assert 'Action' in copy_buttons[0].get_interfaces(), 'Copy code lacks Action'
+assert pyatspi.STATE_FOCUSABLE in copy_buttons[0].getState().getStates(), (
+    'Copy code is not keyboard-focusable')
 send_buttons = [child for child in frames[0]
                 if child.getRoleName() == 'push button' and child.name == 'Send prompt']
 assert len(send_buttons) == 1, 'The Send button lacks a platform-accessible name'
@@ -132,5 +138,5 @@ for interface in ('Text', 'EditableText'):
     except NotImplementedError:
         print(f'Composer does not support {interface} interface')
 print(f'PASS GPUI application, window, named composer, {len(session_buttons)} '
-      'session buttons and three actionable composer controls are exposed through AT-SPI')
+      'session buttons, three composer controls and Copy code are actionable in AT-SPI')
 PY

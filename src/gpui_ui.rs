@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use gpui_kit::base::{Checkbox, CheckboxIndicator, CheckboxState};
+use gpui_kit::base::{Button as BaseButton, Checkbox, CheckboxIndicator, CheckboxState};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::markdown;
@@ -1253,9 +1253,8 @@ impl Client {
                                 .child(language)
                                 .child(div().flex_1())
                                 .child(
-                                    div()
-                                        .id(format!("copy-code-{row_index}-{block_index}"))
-                                        .cursor_pointer()
+                                    BaseButton::new(format!("copy-code-{row_index}-{block_index}"))
+                                        .accessibility_label("Copy code")
                                         .on_click(cx.listener(move |_, _, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 copy.clone(),
@@ -8822,6 +8821,45 @@ mod tests {
                     .insert(client.active.clone(), (1, String::new(), vec![]));
             });
             assert!(!client.update(cx, |client, cx| client.can_send(cx)));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn code_copy_is_a_named_button_with_a_clipboard_action(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let (row_index, block_index) = {
+                let client = client.read(cx);
+                client.transcript[&client.active]
+                    .iter()
+                    .enumerate()
+                    .find_map(|(row_index, row)| {
+                        markdown_blocks(&row.body)
+                            .iter()
+                            .position(|block| matches!(block, MarkdownBlock::Code(_, _)))
+                            .map(|block_index| (row_index, block_index))
+                    })
+                    .expect("preview has a code block")
+            };
+            let id = format!("copy-code-{row_index}-{block_index}");
+            let control = window.find(id.clone());
+            assert_eq!(control.role(), Some(Role::Button));
+            assert_eq!(control.label(), Some("Copy code"));
+            window.click(id, cx);
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            assert!(copied.is_some_and(|text| text.contains("paperclip_icon")));
+            cx.write_to_clipboard(super::ClipboardItem::new_string("cleared".to_owned()));
+            window.press("space", cx);
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            assert!(copied.is_some_and(|text| text.contains("paperclip_icon")));
         })
         .unwrap();
     }
