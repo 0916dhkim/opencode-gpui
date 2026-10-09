@@ -6304,12 +6304,12 @@ impl Client {
                                 .items_center()
                                 .bg(self.tone(
                                     if selected || self.picker_highlight == Some(index) {
-                                        0x3584df
+                                        0x3584e4
                                     } else {
                                         0xfffdfa
                                     },
                                     if selected || self.picker_highlight == Some(index) {
-                                        0x2563eb
+                                        0x15539e
                                     } else {
                                         0x191c1f
                                     },
