@@ -4894,8 +4894,18 @@ impl Client {
         }
     }
 
+    fn open_web_ui(&mut self, cx: &mut Context<Self>) {
+        match opencode_gpui::api::web_ui_url(&self.settings.current.base_url) {
+            Ok(url) => cx.open_url(&url),
+            Err(error) => {
+                self.connection_status = format!("Could not open the web UI: {error:#}");
+                cx.notify();
+            }
+        }
+    }
+
     fn form_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let notice = self.forms.notice(Some(&self.active), &HashMap::new())?;
+        let notice = self.forms.notice(Some(&self.active), &self.child_parents)?;
         let mut bar = div()
             .mx(px(16.))
             .mb(px(8.))
@@ -4916,7 +4926,9 @@ impl Client {
                     .child(notice.text),
             )
             .child(
-                div()
+                BaseButton::new("open-web-ui")
+                    .accessibility_label("Open web UI to answer form")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_web_ui(cx)))
                     .text_color(self.tone(0x4d5354, 0xc4c8ca))
                     .child("Open web UI"),
             );
@@ -8821,6 +8833,10 @@ mod tests {
         });
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
+            let web = window.find("open-web-ui");
+            assert_eq!(web.role(), Some(Role::Button));
+            assert_eq!(web.label(), Some("Open web UI to answer form"));
+            window.click("open-web-ui", cx);
             let cancel = window.find("cancel-form");
             assert_eq!(cancel.role(), Some(Role::Button));
             assert_eq!(cancel.label(), Some("Cancel waiting form"));
@@ -8856,6 +8872,7 @@ mod tests {
             assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
         })
         .unwrap();
+        assert_eq!(cx.opened_url().as_deref(), Some("http://127.0.0.1:4096/"));
     }
 
     #[gpui_kit::test]
