@@ -6242,7 +6242,13 @@ impl Client {
                                         .flex()
                                         .flex_col()
                                         .gap(px(2.))
-                                        .child(option.label.clone())
+                                        .child(
+                                            div()
+                                                .when(selected, |title| {
+                                                    title.text_color(self.tone(0x2563eb, 0x62bceb))
+                                                })
+                                                .child(option.label.clone()),
+                                        )
                                         .child(
                                             div()
                                                 .text_size(px(11.))
@@ -6253,7 +6259,11 @@ impl Client {
                                                 )),
                                         ),
                                 )
-                                .child(if selected { "✓" } else { "" }),
+                                .child(
+                                    div()
+                                        .text_color(self.tone(0x2563eb, 0x62bceb))
+                                        .child(if selected { "✓" } else { "" }),
+                                ),
                         );
                     }
                 } else {
