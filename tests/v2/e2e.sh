@@ -6,7 +6,7 @@
 # 1. Brings up the harness (tests/v2/harness.sh; `--build` rebuilds its image).
 # 2. API-level live test: `api::live_tests` (ignored by default) in the builder
 #    image, joined to `ocgtk-v2h-net`, through a loopback forward.
-# 3. GUI smoke on a fresh server: the real app under Xvfb in the UI test image
+# 3. GUI smoke on a fresh server: GPUI under nested Weston/Xvfb in the builder
 #    (tests/v2/gui_smoke.sh), with a screenshot in --shots (default DIR/shots).
 # 4. Always takes the harness down again.
 #
@@ -18,10 +18,10 @@ set -uo pipefail
 export PATH="/usr/local/bin:$PATH"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-BUILDER="${E2E_BUILDER_IMAGE:-opencode-cosmic-builder-amd64:latest}"
-UI_IMAGE="${E2E_UI_IMAGE:-opencode-cosmic-ui-test-amd64-v4:latest}"
-CARGO_VOLUME="${E2E_CARGO_VOLUME:-opencode-cosmic-e2e-cargo}"
-TARGET_VOLUME="${E2E_TARGET_VOLUME:-opencode-cosmic-e2e-target}"
+BUILDER="${E2E_BUILDER_IMAGE:-opencode-gpui-builder-amd64:latest}"
+UI_IMAGE="${E2E_UI_IMAGE:-opencode-gpui-builder-amd64:latest}"
+CARGO_VOLUME="${E2E_CARGO_VOLUME:-opencode-gpui-e2e-cargo}"
+TARGET_VOLUME="${E2E_TARGET_VOLUME:-opencode-gpui-e2e-target}"
 PREFIX="${OCGTK_V2H_PREFIX:-ocgtk-v2h}"
 NET="$PREFIX-net"
 UPSTREAM="$PREFIX-server"
@@ -102,6 +102,7 @@ if [ -z "$skip_gui" ]; then
     -v "$state/password":/run/ocgtk/password:ro \
     -v "$shots":/shots \
     -e GUI_PASSWORD_FILE=/run/ocgtk/password \
+    -e GUI_BINARY=/app/target/debug/opencode-gpui \
     -e GUI_SHOTS=/shots \
     -e GUI_UPSTREAM_HOST="$UPSTREAM" \
     "$UI_IMAGE" bash tests/v2/gui_smoke.sh; then

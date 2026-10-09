@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# GUI smoke test against the real 2.0.8 harness server. Run by tests/v2/e2e.sh
-# inside the UI test image, joined to `ocgtk-v2h-net`, never on a desktop.
+# GPUI smoke test against the real 2.0.8 harness server. Run by tests/v2/e2e.sh
+# inside the builder image, joined to `ocgtk-v2h-net`, never on a desktop.
 #
 # Needs: the built client at $GUI_BINARY, the Basic password at
 # $GUI_PASSWORD_FILE, and optionally $GUI_SHOTS for the screenshot.
@@ -15,7 +15,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -z "${GUI_IN_DBUS:-}" ]]; then
   GUI_IN_DBUS=1 exec dbus-run-session -- bash "$0" "$@"
 fi
 
-binary="${GUI_BINARY:-target/debug/opencode-cosmic}"
+binary="${GUI_BINARY:-target/debug/opencode-gpui}"
 password_file="${GUI_PASSWORD_FILE:?GUI_PASSWORD_FILE is required}"
 upstream_host="${GUI_UPSTREAM_HOST:-ocgtk-v2h-server}"
 workspace="${GUI_WORKSPACE:-/state/workspace}"
@@ -26,10 +26,13 @@ base="http://127.0.0.1:${local_port}"
 temporary="$(mktemp -d)"
 pids=()
 failures=0
+app_pid='' xvfb_pid='' weston_pid='' window=''
+source tests/gpui-headless.sh
 
 cleanup() {
   for pid in "${pids[@]}"; do kill "${pid}" 2>/dev/null || true; done
-  wait 2>/dev/null || true
+  gpui_stop_display
+  for pid in "${pids[@]}"; do wait "${pid}" 2>/dev/null || true; done
   rm -rf "${temporary}"
 }
 trap cleanup EXIT
@@ -50,10 +53,7 @@ if [[ ! -s "${temporary}/forward-ready" ]]; then
   exit 1
 fi
 
-Xvfb :95 -screen 0 1180x820x24 -nolisten tcp >/dev/null 2>&1 &
-pids+=($!)
-export DISPLAY=:95
-for _ in $(seq 1 50); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.1; done
+gpui_start_display || exit 1
 
 # api METHOD PATH [JSON] -- prints the JSON response; the password stays in the file.
 api() {
@@ -82,8 +82,8 @@ session="$(api POST /api/session "{\"location\":{\"directory\":\"${workspace}\"}
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')"
 [[ -n "${session}" ]] && pass "session.created ${session}" || { fail "session.created" "no session"; exit 1; }
 
-mkdir -p "${temporary}/config/opencode-cosmic"
-python3 - "${base}" "${session}" "${workspace}" "${temporary}/config/opencode-cosmic/state.json" <<'PY'
+mkdir -p "${temporary}/config/opencode-gpui"
+python3 - "${base}" "${session}" "${workspace}" "${temporary}/config/opencode-gpui/state.json" <<'PY'
 import json, sys
 server, session, workspace, path = sys.argv[1:]
 json.dump({
@@ -99,30 +99,21 @@ XDG_CONFIG_HOME="${temporary}/config" \
 XDG_DATA_HOME="${temporary}/data" \
 XDG_CACHE_HOME="${temporary}/cache" \
 GSETTINGS_BACKEND=memory \
-GDK_BACKEND=x11 \
-GTK_A11Y=none \
 NO_AT_BRIDGE=1 \
 "${binary}" --server "${base}" --username opencode >"${temporary}/app.log" 2>&1 &
 app=$!
+app_pid=$app
 pids+=("${app}")
 
-window=""
-for _ in $(seq 1 200); do
-  window="$(xdotool search --onlyvisible --name '^OpenCode$' 2>/dev/null | tail -n 1)"
-  [[ -n "${window}" ]] && break
-  kill -0 "${app}" 2>/dev/null || break
-  sleep 0.1
-done
-if [[ -n "${window}" ]]; then pass "ui.window"; else fail "ui.window" "no main window"; tail -20 "${temporary}/app.log" >&2; exit 1; fi
+if gpui_wait_window; then pass "ui.window"; else fail "ui.window" "no GPUI window"; tail -20 "${temporary}/app.log" >&2; exit 1; fi
 
 # Let bootstrap, history and the model catalog load before typing.
 sleep 4
-xdotool windowfocus --sync "${window}" 2>/dev/null || xdotool windowfocus "${window}" 2>/dev/null || true
-xdotool key --clearmodifiers ctrl+g
-sleep 0.3
-xdotool type --delay 20 --clearmodifiers "Hello from the GUI smoke test [[scenario:text]]"
-sleep 0.3
-xdotool key --clearmodifiers Return
+# The first live bootstrap can still move focus after the window maps. Click
+# the visible composer rather than depending on an earlier focus shortcut.
+gpui_click 410 680
+gpui_type "Hello from the GUI smoke test [[scenario:text]]"
+gpui_key Return
 
 check_messages() {
   api GET "/api/session/${session}/message?limit=20" | python3 -c '
@@ -147,7 +138,7 @@ fi
 sleep 1.5
 if [[ -n "${shots}" ]]; then
   mkdir -p "${shots}"
-  if import -window root "${shots}/e2e-gui-real-server.png" 2>/dev/null; then
+  if import -window "${window}" "${shots}/e2e-gui-real-server.png" 2>/dev/null; then
     pass "screenshot ${shots}/e2e-gui-real-server.png"
   else
     fail "screenshot" "import failed"
