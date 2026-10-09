@@ -163,7 +163,9 @@ if [[ -n "$new_session" ]]; then
   gpui_click 680 607
   expect tray.steer "http and route == 'session.inbox.update' and b.get('delivery') == 'steer' and r['status'] == 204"
   mark_now
-  gpui_click 680 607
+  # The same named switch control remains focused after the delivery flips;
+  # Space must dispatch the reverse action through its semantic button.
+  gpui_key space
   expect tray.queue "http and route == 'session.inbox.update' and b.get('delivery') == 'queue' and r['status'] == 204"
   # GPUI's stop button is in the footer; the server must see an interrupt.
   mark_now

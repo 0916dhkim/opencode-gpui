@@ -5474,12 +5474,12 @@ impl Client {
                         },
                         |header, (id, request)| {
                             header.child(
-                                div()
-                                    .id("resume-tray")
-                                    .cursor_pointer()
+                                BaseButton::new("resume-tray")
+                                    .accessibility_label("Resume waiting prompts")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.act_on_tray(id.clone(), request, cx);
                                     }))
+                                    .line_height(px(16.))
                                     .px(px(10.))
                                     .py(px(4.))
                                     .rounded_full()
@@ -5509,6 +5509,7 @@ impl Client {
                 let cancel = tray::row_request(&row, tray::RowAction::Cancel, paused);
                 let badge = tray::badge_text(row.delivery);
                 let label = tray::switch_label(row.delivery);
+                let summary = row.summary.clone();
                 let mut line = div()
                     .px(px(8.))
                     .py(px(2.))
@@ -5547,12 +5548,19 @@ impl Client {
                 if let Some(request) = switch {
                     let id = row.id.clone();
                     line = line.child(
-                        div()
-                            .id(format!("switch-waiting-{id}"))
-                            .cursor_pointer()
+                        BaseButton::new(format!("switch-waiting-{id}"))
+                            .accessibility_label(format!(
+                                "Switch to {}: {summary}",
+                                if label.contains("Queue") {
+                                    "queue"
+                                } else {
+                                    "steer"
+                                }
+                            ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.act_on_tray(id.clone(), request, cx);
                             }))
+                            .line_height(px(16.))
                             .px(px(8.))
                             .py(px(4.))
                             .rounded(px(5.))
@@ -5564,12 +5572,12 @@ impl Client {
                 if let Some(request) = cancel {
                     let id = row.id.clone();
                     line = line.child(
-                        div()
-                            .id(format!("cancel-waiting-{id}"))
-                            .cursor_pointer()
+                        BaseButton::new(format!("cancel-waiting-{id}"))
+                            .accessibility_label(format!("Cancel waiting prompt: {summary}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.act_on_tray(id.clone(), request, cx);
                             }))
+                            .line_height(px(16.))
                             .px(px(8.))
                             .py(px(4.))
                             .rounded(px(5.))
@@ -8902,6 +8910,48 @@ mod tests {
             assert_eq!(remove.role(), Some(Role::Button));
             window.press("space", cx);
             assert!(client.read(cx).attachments_draft.is_empty());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn waiting_tray_actions_are_named_keyboard_buttons(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let parked = client
+                    .sessions
+                    .iter()
+                    .find(|session| session.title.starts_with("Stopped with parked"))
+                    .unwrap()
+                    .id
+                    .clone();
+                client.select_session(parked);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let resume = window.find("resume-tray");
+            assert_eq!(resume.role(), Some(Role::Button));
+            assert_eq!(resume.label(), Some("Resume waiting prompts"));
+            let id = client.read(cx).conversations[&client.read(cx).active].tray_items()[0]
+                .id
+                .clone();
+            let switch = window.find(format!("switch-waiting-{id}"));
+            assert_eq!(switch.role(), Some(Role::Button));
+            assert!(switch.label().unwrap().starts_with("Switch to "));
+            let cancel = window.find(format!("cancel-waiting-{id}"));
+            assert_eq!(cancel.role(), Some(Role::Button));
+            assert!(cancel.label().unwrap().starts_with("Cancel waiting prompt"));
+            window.click(format!("switch-waiting-{id}"), cx);
+            window.press("space", cx);
         })
         .unwrap();
     }
