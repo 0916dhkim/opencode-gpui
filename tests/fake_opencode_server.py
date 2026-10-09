@@ -711,7 +711,8 @@ class Server:
                 def ready():
                     with self.lock:
                         self.catalog_empty = False
-                    self.emit("model.updated", {}, directory=directory)
+                    if not self.args.model_no_ready_event:
+                        self.emit("model.updated", {}, directory=directory)
 
                 threading.Timer(self.args.model_ready_ms / 1000, ready).start()
             return self.catalog_empty
@@ -2581,7 +2582,9 @@ def parse_args(argv=None):
                         help="once: mutate state + emit an event while ROUTE is in flight (rename|create|delete|append)")
     parser.add_argument("--reply-404", action="store_true", help="permission reply and form settle routes return 404")
     parser.add_argument("--models-empty-once", action="store_true",
-                        help="first /api/model returns [] then model.updated (observed at 2.0.8 startup)")
+                         help="first /api/model returns [] then model.updated (observed at 2.0.8 startup)")
+    parser.add_argument("--model-no-ready-event", action="store_true",
+                        help="make an empty catalog recover without a model.updated event")
     return parser.parse_args(argv)
 
 

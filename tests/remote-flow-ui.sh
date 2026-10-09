@@ -59,7 +59,7 @@ FAKE_OPENCODE_PASSWORD="$password" python3 tests/fake_opencode_server.py \
   --address-file "$temporary/address" --log-file "$log" \
   --workspace /state/workspace --other-directory /state/other --cwd /state/home \
   --history-turns 120 --extra-sessions 120 --boot-permission --background-jobs \
-  --heartbeat-s 2 --slow-delay-ms 700 --slow-deltas 40 --models-empty-once \
+  --heartbeat-s 2 --slow-delay-ms 700 --slow-deltas 40 --models-empty-once --model-no-ready-event \
   --delay-bootstrap-ms 600 --race session.list:rename \
   >"$temporary/server.log" 2>&1 & server_pid=$!
 for _ in {1..100}; do [[ -s "$temporary/address" ]] && break; sleep 0.1; done
@@ -94,8 +94,9 @@ expect bootstrap.permissions 'http and route == "permission.request.list" and "l
 expect bootstrap.forms 'http and route == "form.list" and "location[directory]" in q'
 if expect bootstrap.models 'http and route == "model.list" and "location[directory]" in q'; then
   first_models="$(field "$found" 'r["seq"]')"
+  first_models_directory="$(field "$found" 'r["query"]["location[directory]"]')"
   mark="$first_models"
-  expect models.refetch-after-empty 'http and route == "model.list" and "location[directory]" in q'
+  expect models.refetch-after-empty "http and route == 'model.list' and q.get('location[directory]') == '$first_models_directory'" 20
   mark=0
 fi
 expect bootstrap.history "http and route == 'message.list' and p.get('sessionID') == '$main' and 'cursor' not in q"

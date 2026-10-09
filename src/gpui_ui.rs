@@ -428,6 +428,8 @@ struct Client {
     preserve_scroll: Option<TranscriptAnchor>,
     follow_bottom: Option<(String, Point<Pixels>)>,
     catalogs: HashMap<String, ModelCatalog>,
+    model_retry_count: HashMap<String, u8>,
+    model_retry_scheduled: HashSet<String>,
     running_jobs: Jobs,
     sessions: Vec<Session>,
     open_tabs: Vec<String>,
@@ -2021,6 +2023,8 @@ impl Client {
             preserve_scroll: None,
             follow_bottom: None,
             catalogs: HashMap::new(),
+            model_retry_count: HashMap::new(),
+            model_retry_scheduled: HashSet::new(),
             running_jobs: Jobs::default(),
             sessions: Vec::new(),
             open_tabs: Vec::new(),
@@ -2226,7 +2230,12 @@ impl Client {
                 .get(&session.directory)
                 .cloned()
                 .unwrap_or_default();
-            if !self.catalogs.contains_key(&session.directory) {
+            if self
+                .catalogs
+                .get(&session.directory)
+                .is_none_or(|catalog| catalog.models.is_empty())
+                && !self.model_retry_scheduled.contains(&session.directory)
+            {
                 api.send(Command::LoadModels {
                     directory: session.directory.clone(),
                 });
@@ -2721,6 +2730,8 @@ impl Client {
         self.preserve_scroll = None;
         self.follow_bottom = None;
         self.catalogs.clear();
+        self.model_retry_count.clear();
+        self.model_retry_scheduled.clear();
         self.statuses.clear();
         self.forms.clear();
         self.permissions.clear();
@@ -3313,11 +3324,51 @@ impl Client {
             .map(|session| session.directory.as_str());
         for directory in &directories {
             self.catalogs.remove(directory);
+            self.model_retry_count.remove(directory);
+            self.model_retry_scheduled.remove(directory);
             if active_directory == Some(directory.as_str()) {
                 self.catalog = ModelCatalog::default();
             }
         }
         directories
+    }
+
+    fn schedule_empty_catalog_retry(&mut self, directory: String, cx: &mut Context<Self>) {
+        if self.api.is_none()
+            || !self.active_directories().contains(&directory)
+            || self.model_retry_scheduled.contains(&directory)
+        {
+            return;
+        }
+        let attempts = self.model_retry_count.entry(directory.clone()).or_default();
+        if *attempts >= 5 {
+            return;
+        }
+        let delay = 1u64 << (*attempts).min(4);
+        *attempts += 1;
+        self.model_retry_scheduled.insert(directory.clone());
+        let generation = self.connection_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(delay))
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if this.connection_generation != generation
+                    || !this.model_retry_scheduled.remove(&directory)
+                    || !this.active_directories().contains(&directory)
+                    || this
+                        .catalogs
+                        .get(&directory)
+                        .is_some_and(|catalog| !catalog.models.is_empty())
+                {
+                    return;
+                }
+                if let Some(api) = &this.api {
+                    api.send(Command::LoadModels { directory });
+                }
+            });
+        })
+        .detach();
     }
 
     fn request_bootstrap(&mut self) {
@@ -4133,6 +4184,12 @@ impl Client {
                 directory,
                 result: Ok(catalog),
             } => {
+                if catalog.models.is_empty() {
+                    self.schedule_empty_catalog_retry(directory.clone(), cx);
+                } else {
+                    self.model_retry_count.remove(&directory);
+                    self.model_retry_scheduled.remove(&directory);
+                }
                 self.catalogs.insert(directory.clone(), catalog.clone());
                 if self
                     .sessions
@@ -4143,8 +4200,12 @@ impl Client {
                 }
             }
             UiEvent::ModelsLoaded {
-                result: Err(error), ..
-            } => self.connection_status = format!("Models failed: {error}"),
+                directory,
+                result: Err(error),
+            } => {
+                self.connection_status = format!("Models failed: {error}");
+                self.schedule_empty_catalog_retry(directory, cx);
+            }
             UiEvent::SessionCreated { request_id, result } => match result {
                 Ok(session) => {
                     let id = session.id.clone();
@@ -4580,6 +4641,8 @@ impl Client {
             preserve_scroll: None,
             follow_bottom: Some((active.clone(), scroll.offset())),
             catalogs: HashMap::new(),
+            model_retry_count: HashMap::new(),
+            model_retry_scheduled: HashSet::new(),
             running_jobs,
             sessions,
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
@@ -11707,6 +11770,44 @@ mod tests {
             super::model_button_presentation(&catalog, None),
             ("Choose model".into(), None)
         );
+    }
+
+    #[gpui_kit::test]
+    fn empty_model_catalog_schedules_bounded_retry_and_recovers(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let recovered = client.catalog.clone();
+                let (api, _receiver, _) = opencode_gpui::api::ApiHandle::preview();
+                client.api = Some(api);
+                client.handle_live_event(
+                    super::UiEvent::ModelsLoaded {
+                        directory: "/repo".into(),
+                        result: Ok(model::ModelCatalog::default()),
+                    },
+                    cx,
+                );
+                assert!(client.catalog.models.is_empty());
+                assert!(client.model_retry_scheduled.contains("/repo"));
+                assert_eq!(client.model_retry_count["/repo"], 1);
+                client.handle_live_event(
+                    super::UiEvent::ModelsLoaded {
+                        directory: "/repo".into(),
+                        result: Ok(recovered),
+                    },
+                    cx,
+                );
+                assert!(!client.catalog.models.is_empty());
+                assert!(!client.model_retry_scheduled.contains("/repo"));
+                assert!(!client.model_retry_count.contains_key("/repo"));
+            });
+        });
     }
 
     #[gpui_kit::test]
