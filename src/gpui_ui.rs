@@ -621,6 +621,8 @@ impl MessageSpan {
 struct ProjectionChange {
     range: std::ops::Range<usize>,
     removed_images: Vec<(TranscriptRowKey, usize)>,
+    old_rows: Vec<TranscriptRow>,
+    old_images: HashMap<(TranscriptRowKey, usize), Arc<Image>>,
 }
 
 /// Keep the unchanged message prefix and suffix intact. Their row indices may
@@ -674,11 +676,13 @@ fn splice_transcript(
         .iter()
         .flat_map(|row| (0..row.images.len()).map(|index| (row.key.clone(), index)))
         .collect();
-    rows.splice(start..end, replacements);
+    let old_rows = rows.splice(start..end, replacements).collect();
     spans.splice(prefix..spans.len() - suffix, new_spans);
     Some(ProjectionChange {
         range: start..new_end,
         removed_images,
+        old_rows,
+        old_images: HashMap::new(),
     })
 }
 
@@ -749,31 +753,51 @@ fn update_session_projection(
     rows: &mut Vec<TranscriptRow>,
     spans: &mut Vec<MessageSpan>,
     images: &mut ImageCache,
-) {
+) -> Option<ProjectionChange> {
     if spans
         .first()
         .is_some_and(|span| span.epoch != conversation.cache_epoch())
     {
         images.remove_session(session);
     }
-    if let Some(change) = splice_transcript(conversation, rows, spans) {
+    splice_transcript(conversation, rows, spans).map(|mut change| {
+        for row in &change.old_rows {
+            for index in 0..row.images.len() {
+                if let Some(image) = images.get(session, row, index) {
+                    change
+                        .old_images
+                        .insert((row.key.clone(), index), image.clone());
+                }
+            }
+        }
         images.update(session, rows, &change);
-    }
+        change
+    })
 }
 
 #[derive(Default)]
 struct RowHeightCache {
     stamp: Option<RowLayoutStamp>,
     entries: HashMap<TranscriptRowKey, CachedRowHeight>,
+    /// Only replaced measured rows, retained until the next exact layout.
+    stale: HashMap<TranscriptRowKey, StaleMeasuredRow>,
     load_height: Option<(bool, Pixels)>,
     #[cfg(test)]
     layouts: usize,
+}
+
+#[derive(Clone)]
+struct StaleMeasuredRow {
+    row: TranscriptRow,
+    height: Pixels,
+    images: Vec<Option<Arc<Image>>>,
 }
 
 impl RowHeightCache {
     fn missing(&mut self, stamp: RowLayoutStamp, rows: &[TranscriptRow]) -> Vec<usize> {
         if self.stamp != Some(stamp) {
             self.entries.clear();
+            self.stale.clear();
             self.load_height = None;
             self.stamp = Some(stamp);
         }
@@ -792,6 +816,7 @@ impl RowHeightCache {
     ) {
         // A superseding render can replace the snapshot before this layout runs.
         if self.stamp == Some(stamp) {
+            self.stale.remove(&key);
             self.entries
                 .insert(key, CachedRowHeight { revision, height });
             #[cfg(test)]
@@ -805,6 +830,41 @@ impl RowHeightCache {
         self.entries
             .get(&row.key)
             .and_then(|entry| (entry.revision == row.render_revision()).then_some(entry.height))
+    }
+
+    fn retain_replaced(&mut self, rows: &[TranscriptRow], change: &ProjectionChange) {
+        // The key is semantic, not the row index: prepends may shift the slot.
+        // Keep the first still-measured revision through rapid token updates.
+        let current: HashMap<_, _> = rows.iter().map(|row| (&row.key, row)).collect();
+        self.stale.retain(|key, old| {
+            current
+                .get(key)
+                .is_some_and(|row| row.render_revision() != old.row.render_revision())
+        });
+        for row in &change.old_rows {
+            let Some(new) = current.get(&row.key) else {
+                continue;
+            };
+            if new.render_revision() == row.render_revision() || self.stale.contains_key(&row.key) {
+                continue;
+            }
+            let Some(entry) = self.entries.get(&row.key).copied() else {
+                continue;
+            };
+            if entry.revision != row.render_revision() {
+                continue;
+            }
+            self.stale.insert(
+                row.key.clone(),
+                StaleMeasuredRow {
+                    row: row.clone(),
+                    height: entry.height,
+                    images: (0..row.images.len())
+                        .map(|index| change.old_images.get(&(row.key.clone(), index)).cloned())
+                        .collect(),
+                },
+            );
+        }
     }
 
     fn prefix(&self, rows: &[TranscriptRow], index: usize, has_load: bool) -> Option<Pixels> {
@@ -835,10 +895,9 @@ impl RowHeightCache {
         Some(Rc::new(sizes))
     }
 
-    /// A miss is represented by an empty placeholder for precisely one layout
-    /// frame. The old measured height (or a small new-row placeholder) is only
-    /// used for scroll geometry: no unmeasured content is laid out in that
-    /// definite-height virtual slot, so a growing Markdown row cannot clip.
+    /// A new-row miss is an empty placeholder for one layout frame. A changed
+    /// row can instead paint its last measured snapshot at this exact height;
+    /// the unmeasured revision never enters a definite-height virtual slot.
     fn provisional_sizes(
         &self,
         rows: &[TranscriptRow],
@@ -2657,7 +2716,20 @@ impl Client {
             .entry(session_id.to_owned())
             .or_default();
         let rows = self.transcript.entry(session_id.to_owned()).or_default();
-        update_session_projection(session_id, conversation, rows, spans, &mut self.attachments);
+        if let Some(change) =
+            update_session_projection(session_id, conversation, rows, spans, &mut self.attachments)
+            && let Some(cache) = self.row_heights.get(session_id)
+        {
+            let mut cache = cache.borrow_mut();
+            if cache
+                .stamp
+                .is_some_and(|stamp| stamp.epoch == conversation.cache_epoch())
+            {
+                cache.retain_replaced(rows, &change);
+            } else {
+                cache.stale.clear();
+            }
+        }
     }
 
     fn prepare_follow_bottom(&mut self, session_id: &str) {
@@ -3286,7 +3358,7 @@ impl Client {
                 }
                 let mut rows = Vec::new();
                 let mut spans = Vec::new();
-                update_session_projection(
+                let _ = update_session_projection(
                     &session.id,
                     &conversation,
                     &mut rows,
@@ -3961,6 +4033,16 @@ impl Client {
     // Keep the actual row and the detached measurement probe on this same
     // renderer. A text-length estimate cannot model GPUI's Markdown wrapping.
     fn message_row(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> Stateful<Div> {
+        self.message_row_with_images(row, index, None, cx)
+    }
+
+    fn message_row_with_images(
+        &self,
+        row: &TranscriptRow,
+        index: usize,
+        stale_images: Option<&[Option<Arc<Image>>]>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let user = row.role.label() == "YOU";
         let shade = if user {
             self.tone(0xe4ddd0, 0x1c242b)
@@ -3988,7 +4070,11 @@ impl Client {
             _ => body = body.child(row.body.clone()),
         }
         for (image_index, image) in row.images.iter().enumerate() {
-            let source = self.attachments.get(&self.active, row, image_index);
+            let source = if let Some(stale_images) = stale_images {
+                stale_images.get(image_index).and_then(Option::as_ref)
+            } else {
+                self.attachments.get(&self.active, row, image_index)
+            };
             let thumbnail = div()
                 .h(px(120.))
                 .w(px(200.))
@@ -4054,9 +4140,19 @@ impl Client {
     }
 
     fn message(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> AnyElement {
+        self.message_with_images(row, index, None, cx)
+    }
+
+    fn message_with_images(
+        &self,
+        row: &TranscriptRow,
+        index: usize,
+        stale_images: Option<&[Option<Arc<Image>>]>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         #[cfg(test)]
         self.rendered_rows.borrow_mut().push(index);
-        let element = self.message_row(row, index, cx);
+        let element = self.message_row_with_images(row, index, stale_images, cx);
         #[cfg(test)]
         {
             use gpui_kit::base::TestSupportExt as _;
@@ -4521,17 +4617,34 @@ impl Client {
                         ready.push(load_current);
                     }
                     ready.extend(transcript.iter().map(|row| cache.height(row).is_some()));
+                    let stale = transcript
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, row)| {
+                            (!ready[index + usize::from(has_load)])
+                                .then(|| cache.stale.get(&row.key))
+                                .flatten()
+                                .filter(|old| {
+                                    old.row.render_revision() != row.render_revision()
+                                        && cache.entries.get(&row.key).is_some_and(|entry| {
+                                            entry.revision == old.row.render_revision()
+                                                && entry.height == old.height
+                                        })
+                                })
+                                .map(|old| (index, old.clone()))
+                        })
+                        .collect::<HashMap<_, _>>();
                     let sizes = if ready.iter().all(|ready| *ready) {
                         cache.sizes(transcript, has_load, width)
                     } else {
                         None
                     }
                     .unwrap_or_else(|| cache.provisional_sizes(transcript, has_load, width));
-                    (sizes, ready)
+                    (sizes, ready, stale)
                 })
             })
         });
-        let content: AnyElement = if let Some((sizes, ready)) = layout {
+        let content: AnyElement = if let Some((sizes, ready, stale)) = layout {
             let session = self.active.clone();
             v_virtual_list(
                 cx.entity(),
@@ -4547,13 +4660,27 @@ impl Client {
                         .is_some_and(|conversation| conversation.next_cursor.is_some());
                     range
                         .map(|index| {
-                            if !ready[index] {
-                                div().into_any_element()
-                            } else if has_load && index == 0 {
+                            if has_load && index == 0 {
+                                if !ready[index] {
+                                    return div().into_any_element();
+                                }
                                 let loading = client.loading_messages.contains_key(&session);
                                 let cursor =
                                     client.conversations[&session].next_cursor.clone().unwrap();
                                 client.load_earlier_element(cursor, loading, cx)
+                            } else if !ready[index] {
+                                let row_index = index - usize::from(has_load);
+                                stale.get(&row_index).map_or_else(
+                                    || div().into_any_element(),
+                                    |old| {
+                                        client.message_with_images(
+                                            &old.row,
+                                            row_index,
+                                            Some(&old.images),
+                                            cx,
+                                        )
+                                    },
+                                )
                             } else {
                                 let row_index = index - usize::from(has_load);
                                 client.message(&transcript[row_index], row_index, cx)
@@ -6512,6 +6639,8 @@ mod tests {
         let change = super::ProjectionChange {
             range: 0..1,
             removed_images: Vec::new(),
+            old_rows: Vec::new(),
+            old_images: Default::default(),
         };
         cache.update("ses_a", &rows, &change);
         let original = cache.get("ses_a", &image, 0).unwrap().clone();
@@ -6525,6 +6654,8 @@ mod tests {
             &super::ProjectionChange {
                 range: 1..2,
                 removed_images: vec![(image.key.clone(), 0)],
+                old_rows: Vec::new(),
+                old_images: Default::default(),
             },
         );
         assert!(std::sync::Arc::ptr_eq(
@@ -6540,6 +6671,8 @@ mod tests {
             &super::ProjectionChange {
                 range: 1..2,
                 removed_images: vec![(image.key.clone(), 0)],
+                old_rows: Vec::new(),
+                old_images: Default::default(),
             },
         );
         assert!(!std::sync::Arc::ptr_eq(
@@ -6570,6 +6703,8 @@ mod tests {
         let change = super::ProjectionChange {
             range: 0..1,
             removed_images: Vec::new(),
+            old_rows: Vec::new(),
+            old_images: Default::default(),
         };
         cache.update("ses_a", &[row.clone()], &change);
         cache.update("ses_a", &[row.clone()], &change);
@@ -6582,6 +6717,8 @@ mod tests {
             &super::ProjectionChange {
                 range: 0..1,
                 removed_images: vec![(row.key.clone(), 0), (row.key.clone(), 1)],
+                old_rows: Vec::new(),
+                old_images: Default::default(),
             },
         );
         assert_eq!(cache.entries.len(), 1);
@@ -6591,6 +6728,8 @@ mod tests {
             &super::ProjectionChange {
                 range: 0..0,
                 removed_images: vec![(row.key.clone(), 0)],
+                old_rows: Vec::new(),
+                old_images: Default::default(),
             },
         );
         assert!(cache.entries.is_empty());
@@ -6610,17 +6749,131 @@ mod tests {
         let mut rows = Vec::new();
         let mut spans = Vec::new();
         let mut images = super::ImageCache::default();
-        update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
+        let _ =
+            update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
         assert_eq!(rows, full_rows(&conversation));
         let before = images.get("ses_a", &rows[0], 0).unwrap().clone();
         snapshot(&mut conversation, vec![entry(encoded)]);
-        update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
+        let _ =
+            update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
         assert_eq!(rows, full_rows(&conversation));
         assert!(!std::sync::Arc::ptr_eq(
             &before,
             images.get("ses_a", &rows[0], 0).unwrap()
         ));
         assert_eq!(images.entries.len(), 1);
+    }
+
+    #[test]
+    fn stale_row_keeps_exact_image_when_url_changes_and_clears_on_invalidation() {
+        let stamp = RowLayoutStamp {
+            width: px(746.),
+            dark: false,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: 1,
+        };
+        let mut old = cache_row("image", "old caption");
+        old.images = vec!["data:image/png;base64,aGVsbG8=".into()];
+        let mut images = super::ImageCache::default();
+        images.update(
+            "ses_a",
+            std::slice::from_ref(&old),
+            &super::ProjectionChange {
+                range: 0..1,
+                removed_images: Vec::new(),
+                old_rows: Vec::new(),
+                old_images: Default::default(),
+            },
+        );
+        let old_image = images.get("ses_a", &old, 0).unwrap().clone();
+        let mut cache = RowHeightCache::default();
+        cache.missing(stamp, std::slice::from_ref(&old));
+        cache.record(stamp, old.key.clone(), old.render_revision(), px(180.));
+
+        let mut new = old.clone();
+        new.render_revision += 1;
+        new.body = "new caption".into();
+        new.images[0] = "data:image/png;base64,d29ybGQ=".into();
+        let mut change = super::ProjectionChange {
+            range: 0..1,
+            removed_images: vec![(old.key.clone(), 0)],
+            old_rows: vec![old.clone()],
+            old_images: Default::default(),
+        };
+        change
+            .old_images
+            .insert((old.key.clone(), 0), old_image.clone());
+        images.update("ses_a", std::slice::from_ref(&new), &change);
+        cache.retain_replaced(std::slice::from_ref(&new), &change);
+        let stale = &cache.stale[&old.key];
+        assert_eq!(stale.row, old);
+        assert_eq!(stale.height, px(180.));
+        assert!(std::sync::Arc::ptr_eq(
+            stale.images[0].as_ref().unwrap(),
+            &old_image
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            images.get("ses_a", &new, 0).unwrap(),
+            &old_image
+        ));
+        cache.retain_replaced(&[], &change);
+        assert!(cache.stale.is_empty());
+        cache.retain_replaced(std::slice::from_ref(&new), &change);
+        assert_eq!(cache.stale.len(), 1);
+        cache.missing(
+            RowLayoutStamp {
+                width: px(700.),
+                ..stamp
+            },
+            std::slice::from_ref(&new),
+        );
+        assert!(cache.stale.is_empty());
+        cache.missing(stamp, std::slice::from_ref(&old));
+        cache.record(stamp, old.key.clone(), old.render_revision(), px(180.));
+        cache.retain_replaced(std::slice::from_ref(&new), &change);
+        cache.record(stamp, new.key.clone(), new.render_revision(), px(200.));
+        assert!(cache.stale.is_empty());
+    }
+
+    #[test]
+    fn superseding_tokens_keep_the_last_measured_revision_until_layout() {
+        let stamp = RowLayoutStamp {
+            width: px(746.),
+            dark: false,
+            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            epoch: 1,
+        };
+        let old = cache_row("stream", "measured");
+        let mut cache = RowHeightCache::default();
+        cache.missing(stamp, std::slice::from_ref(&old));
+        cache.record(stamp, old.key.clone(), 0, px(88.));
+        let mut current = old.clone();
+        for revision in 1..=4 {
+            let mut next = current.clone();
+            next.render_revision = revision;
+            next.body.push_str(" more");
+            cache.retain_replaced(
+                &[next.clone()],
+                &super::ProjectionChange {
+                    range: 0..1,
+                    removed_images: Vec::new(),
+                    old_rows: vec![current],
+                    old_images: Default::default(),
+                },
+            );
+            let stale = &cache.stale[&old.key];
+            assert_eq!(stale.row, old);
+            assert_eq!(stale.height, px(88.));
+            current = next;
+        }
+        cache.record(
+            stamp,
+            current.key.clone(),
+            current.render_revision(),
+            px(130.),
+        );
+        assert!(cache.stale.is_empty());
+        assert_eq!(cache.height(&current), Some(px(130.)));
     }
 
     fn cache_row(id: &str, body: &str) -> model::TranscriptRow {
@@ -6946,6 +7199,130 @@ mod tests {
         assert_eq!(new_offset - old_offset, px(-55.));
         assert_eq!(new_top + new_offset, old_top + old_offset);
         assert_eq!(cache.provisional_positions(&new, true)[index], new_top);
+    }
+
+    #[gpui_kit::test]
+    fn streamed_replacement_renders_old_measured_row_then_corrected_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let id = client.active.clone();
+                let messages = (0..150)
+                    .map(|index| {
+                        protocol::SessionMessage::from_value(json!({
+                            "id": format!("stream_{index}"),
+                            "type": "assistant",
+                            "time": { "created": 1 },
+                            "content": [{ "type": "text", "text": "Short answer." }]
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                client
+                    .conversations
+                    .get_mut(&id)
+                    .unwrap()
+                    .replace_from_api(&messages, None);
+                client.update_transcript(&id);
+                cx.notify();
+            });
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        render(cx);
+        render(cx);
+        cx.update(|cx| client.read(cx).scroll.base_handle().scroll_to_bottom());
+        render(cx);
+        let mut last_height = cx.update(|cx| {
+            let client = client.read(cx);
+            client.row_heights[&client.active]
+                .borrow()
+                .height(client.transcript[&client.active].last().unwrap())
+                .unwrap()
+        });
+        let mut previous_body = "Short answer.".to_owned();
+        for token in 1..=3 {
+            cx.update(|cx| {
+                client.update(cx, |client, cx| {
+                    let id = client.active.clone();
+                    let event = json!({
+                        "id": format!("evt_0000000000000000000000000{token}"),
+                        "created": 2000,
+                        "type": "session.text.delta",
+                        "data": {
+                            "sessionID": id,
+                            "assistantMessageID": "stream_149",
+                            "ordinal": 0,
+                            "delta": " A much longer streamed paragraph with wrapping words.".repeat(10),
+                        }
+                    });
+                    assert!(client.conversations.get_mut(&id).unwrap().apply_event(&event));
+                    client.update_transcript(&id);
+                    let cache = client.row_heights[&id].borrow();
+                    let old = cache.stale.values().next().expect("retained measured row");
+                    assert_eq!(old.height, last_height);
+                    assert_eq!(old.row.body, previous_body);
+                    assert_eq!(
+                        cache.provisional_sizes(&client.transcript[&id], false, cache.stamp.unwrap().width)[149].height,
+                        last_height,
+                        "the pending revision keeps the prior exact-height slot"
+                    );
+                    previous_body = client.transcript[&id].last().unwrap().body.clone();
+                    assert_eq!(cache.stale.len(), 1);
+                    client.rendered_rows.borrow_mut().clear();
+                    cx.notify();
+                });
+            });
+            // The probe measures the new revision during layout. The virtual
+            // callback must still use the old, exact-height snapshot here.
+            render(cx);
+            cx.update_window(handle, |_, window, cx| {
+                let client = client.read(cx);
+                let rendered = client.rendered_rows.borrow();
+                assert!(rendered.contains(&149), "no blank streaming row");
+                assert!(rendered.len() < 50, "mounted history: {rendered:?}");
+                let _mounted = window.find(("message", 149usize));
+            })
+            .unwrap();
+            cx.update(|cx| client.read(cx).rendered_rows.borrow_mut().clear());
+            render(cx);
+            last_height = cx
+                .update_window(handle, |_, window, cx| {
+                    let client = client.read(cx);
+                    let rendered = client.rendered_rows.borrow();
+                    assert!(rendered.contains(&149), "corrected row was not rendered");
+                    assert!(
+                        rendered.len() < 50,
+                        "corrected frame mounted history: {rendered:?}"
+                    );
+                    let cache = client.row_heights[&client.active].borrow();
+                    assert!(cache.stale.is_empty(), "corrected row releases snapshot");
+                    let exact = cache
+                        .height(client.transcript[&client.active].last().unwrap())
+                        .unwrap();
+                    let _mounted = window.find(("message", 149usize));
+                    assert_eq!(
+                        cache
+                            .sizes(
+                                &client.transcript[&client.active],
+                                false,
+                                cache.stamp.unwrap().width,
+                            )
+                            .unwrap()[149]
+                            .height,
+                        exact
+                    );
+                    exact
+                })
+                .unwrap();
+        }
     }
 
     #[gpui_kit::test]
@@ -7462,6 +7839,8 @@ mod tests {
                         &super::ProjectionChange {
                             range: 0..rows.len(),
                             removed_images: Vec::new(),
+                            old_rows: Vec::new(),
+                            old_images: Default::default(),
                         },
                     );
                     cx.notify();
