@@ -51,6 +51,9 @@ def main():
         ready, args = args[1], args[2:]
     listen_port, host, port = int(args[0]), args[1], int(args[2])
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # A reconnect test deliberately restarts this forwarder on the same port
+    # while accepted connections may still be in TCP TIME_WAIT.
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server.bind(("127.0.0.1", listen_port))
     except OSError as error:

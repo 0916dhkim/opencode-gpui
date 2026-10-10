@@ -128,6 +128,16 @@ assistant = [e for e in entries if e["type"] == "assistant"
               and any(c.get("type") == "text" and c.get("text") for c in e.get("content", []))]
 sys.exit(0 if user and assistant else 1)' "$2"
 }
+check_reply_after() {
+  api GET "/api/session/$1/message?limit=20" | python3 -c '
+import json,sys
+entries=json.load(sys.stdin)["data"]
+users=[e for e in entries if e["type"]=="user" and sys.argv[1] in e.get("text","")]
+last=max((e.get("time",{}).get("created",0) for e in users),default=0)
+reply=any(e["type"]=="assistant" and e.get("time",{}).get("created",0)>=last
+  and any(c.get("type")=="text" and c.get("text") for c in e.get("content",[])) for e in entries)
+sys.exit(0 if len(users)==1 and reply else 1)' "$2"
+}
 ok=""
 for _ in $(seq 1 60); do
   if check_messages "${session}" "GUI smoke test"; then ok=1; break; fi
@@ -272,25 +282,60 @@ PY
   gpui_click 410 680
   gpui_type "After settings reconnect [[scenario:text]]"
   gpui_key Return
-  check_after_settings() {
-    api GET "/api/session/${session}/message?limit=20" | python3 -c '
-import json,sys
-entries=json.load(sys.stdin)["data"]
-users=[e for e in entries if e["type"]=="user" and "After settings reconnect" in e.get("text","")]
-last=max((e.get("time",{}).get("created",0) for e in users),default=0)
-reply=any(e["type"]=="assistant" and e.get("time",{}).get("created",0)>=last
-  and any(c.get("type")=="text" and c.get("text") for c in e.get("content",[])) for e in entries)
-sys.exit(0 if len(users)==1 and reply else 1)'
-  }
   reconnected=''
   for _ in $(seq 1 60); do
-    if check_after_settings; then reconnected=1; break; fi
+    if check_reply_after "${session}" "After settings reconnect"; then reconnected=1; break; fi
     sleep 0.5
   done
   if [[ -n "${reconnected}" ]]; then
     pass "settings.gui-prompt-after-url-switch"
   else
     fail "settings.gui-prompt-after-url-switch" "no reply after applying alternate URL"
+  fi
+fi
+
+if [[ "${GUI_DROP_FORWARDER:-0}" == 1 ]]; then
+  # Drop only this private test container's TCP forwarder, not the v2 server.
+  # The live client must restore its SSE/API connection without a restart.
+  kill "${forwarder}" 2>/dev/null || true
+  wait "${forwarder}" 2>/dev/null || true
+  pids=("${app}")
+  if api GET /api/info >/dev/null 2>&1; then
+    fail "reconnect.forwarder-dropped" "loopback API stayed reachable"
+  else
+    pass "reconnect.forwarder-dropped"
+  fi
+  sleep 2
+  python3 tests/v2/loopback.py --ready "${temporary}/forward-restarted" "${local_port}" "${upstream_host}" 4096 &
+  forwarder=$!
+  pids=("${app}" "${forwarder}")
+  ready=''
+  for _ in $(seq 1 50); do
+    if [[ -s "${temporary}/forward-restarted" ]] && api GET /api/info >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ -n "${ready}" ]]; then
+    pass "reconnect.forwarder-restored"
+  else
+    fail "reconnect.forwarder-restored" "private loopback API did not recover"
+    exit 1
+  fi
+  sleep 3
+  gpui_click 410 680
+  gpui_type "After dropped forwarder [[scenario:text]]"
+  gpui_key Return
+  recovered=''
+  for _ in $(seq 1 60); do
+    if check_reply_after "${session}" "After dropped forwarder"; then recovered=1; break; fi
+    sleep 0.5
+  done
+  if [[ -n "${recovered}" ]]; then
+    pass "reconnect.gui-prompt-after-sse-disconnect"
+  else
+    fail "reconnect.gui-prompt-after-sse-disconnect" "no reply after TCP forwarder recovery"
   fi
 fi
 
