@@ -456,6 +456,8 @@ struct Client {
     running_jobs: Jobs,
     sessions: Vec<Session>,
     open_tabs: Vec<String>,
+    sidebar_visible: bool,
+    sidebar_toggle_focus: FocusHandle,
     tab_focus: HashMap<String, [FocusHandle; 3]>,
     tab_shortcut_hint: bool,
     tab_drop_target: Option<(String, bool)>,
@@ -2249,6 +2251,8 @@ impl Client {
             running_jobs: Jobs::default(),
             sessions: Vec::new(),
             open_tabs: Vec::new(),
+            sidebar_visible: true,
+            sidebar_toggle_focus: cx.focus_handle().tab_stop(true),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
             tab_drop_target: None,
@@ -2486,6 +2490,29 @@ impl Client {
         if self.bootstrapped {
             self.persist_tabs();
         }
+    }
+
+    fn transcript_width(&self, window: &Window) -> Pixels {
+        window.viewport_size().width
+            - px(if self.sidebar_visible {
+                SIDEBAR_WIDTH
+            } else {
+                0.
+            })
+            - px(TRANSCRIPT_SCROLLBAR_GUTTER)
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        let offset = self.scroll.offset();
+        if self.pending_jump.is_none() && offset.y + self.scroll.max_offset().y <= px(16.) {
+            self.preserve_scroll = None;
+            self.follow_bottom = Some((self.active.clone(), offset));
+        } else if self.pending_jump.is_none() {
+            self.preserve_scroll = self.transcript_anchor();
+            self.follow_bottom = None;
+        }
+        self.sidebar_visible = !self.sidebar_visible;
+        cx.notify();
     }
 
     fn request_newest(&mut self, id: &str) {
@@ -3667,6 +3694,23 @@ impl Client {
         if !modifiers.control || modifiers.alt || modifiers.platform {
             return;
         }
+        if key == "x" && modifiers.shift {
+            if let Some(target) = self
+                .forms
+                .notice(Some(&self.active), &self.child_parents)
+                .and_then(|notice| notice.cancel)
+            {
+                self.cancel_waiting_form(&target);
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if key == "b" && !modifiers.shift {
+            self.toggle_sidebar(cx);
+            cx.stop_propagation();
+            return;
+        }
         let action = match key.as_str() {
             "t" => Some(Modal::NewSession),
             "p" => Some(Modal::Sessions),
@@ -4395,7 +4439,7 @@ impl Client {
             // A user movement or deletion of the anchored row supersedes it.
             self.preserve_scroll = None;
         }
-        let width = window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        let width = self.transcript_width(window);
         let stamp = RowLayoutStamp {
             width,
             dark: self.dark,
@@ -4552,7 +4596,7 @@ impl Client {
         let Some(rows) = self.transcript.get(&self.active) else {
             return;
         };
-        let width = window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        let width = self.transcript_width(window);
         let stamp = RowLayoutStamp {
             width,
             dark: self.dark,
@@ -5495,6 +5539,8 @@ impl Client {
             running_jobs,
             sessions,
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
+            sidebar_visible: true,
+            sidebar_toggle_focus: cx.focus_handle().tab_stop(true),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
             tab_drop_target: None,
@@ -5993,6 +6039,85 @@ impl Client {
             .into_any_element()
     }
 
+    fn session_header(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.sidebar_visible {
+            return None;
+        }
+        let title = self
+            .sessions
+            .iter()
+            .find(|session| session.id == self.active)
+            .map(|session| session.title.trim())
+            .filter(|title| !title.is_empty())
+            .unwrap_or("OpenCode");
+        let has_jobs = self
+            .running_jobs
+            .sessions_with_jobs()
+            .contains(&self.active);
+        let (gear, attention) = tab_indicator(
+            self.is_running(&self.active),
+            self.unread.contains(&self.active),
+            has_jobs,
+        );
+        let dot_color = match attention {
+            TabAttention::Busy => self.tone(0xa46910, 0xe5b567),
+            TabAttention::Unread => self.tone(0x176899, 0x62bceb),
+            TabAttention::Read => self.tone(0x7c8682, 0x68736f),
+        };
+        let status: AnyElement = if gear {
+            Icon::default()
+                .data(include_bytes!("icons/settings.svg"))
+                .with_size(px(14.))
+                .text_color(dot_color)
+                .into_any_element()
+        } else {
+            div()
+                .w(px(9.))
+                .h(px(9.))
+                .rounded_full()
+                .bg(dot_color)
+                .into_any_element()
+        };
+        Some(
+            div()
+                .id("session-header")
+                .test_support()
+                .h(px(50.))
+                .w_full()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(28.))
+                .border_b_1()
+                .border_color(self.tone(0xc8c3ba, 0x2a2e32))
+                .bg(self.tone(0xf4f1eb, 0x14171a))
+                .child(div().w(px(14.)).flex_shrink_0().child(status))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.to_owned()),
+                )
+                .child(
+                    BaseButton::new("session-header-switch")
+                        .accessibility_label("Switch session")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_modal(Modal::Sessions, window, cx);
+                        }))
+                        .text_size(px(11.))
+                        .text_color(self.tone(0x87908d, 0x899097))
+                        .child("Ctrl+P to switch"),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn sidebar(&self, cx: &Context<Self>) -> AnyElement {
         let mut tabs = div()
             .flex()
@@ -6349,8 +6474,7 @@ impl Client {
         cx: &Context<Self>,
     ) -> Option<TranscriptMeasurementProbe> {
         let transcript = self.transcript.get(&self.active)?;
-        let content_width =
-            window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        let content_width = self.transcript_width(window);
         #[cfg(test)]
         let (width, heights) = self
             .measurement_probe
@@ -7013,7 +7137,7 @@ impl Client {
             .conversations
             .get(&self.active)
             .is_some_and(|conversation| conversation.next_cursor.is_some());
-        let width = window.viewport_size().width - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER);
+        let width = self.transcript_width(window);
         let stamp = RowLayoutStamp {
             width,
             dark: self.dark,
@@ -7327,9 +7451,7 @@ impl Client {
             cache.stamp.is_some_and(|stamp| {
                 stamp.dark == self.dark
                     && stamp.style_revision == TRANSCRIPT_ROW_STYLE_REVISION
-                    && stamp.width
-                        == window.viewport_size().width
-                            - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER)
+                    && stamp.width == self.transcript_width(window)
                     && stamp.epoch
                         == self
                             .conversations
@@ -9041,9 +9163,7 @@ impl Client {
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
-        self.transcript_content_width = (window.viewport_size().width
-            - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER + 56.))
-        .max(px(1.));
+        self.transcript_content_width = (self.transcript_width(window) - px(56.)).max(px(1.));
         self.sync_composer(window, cx);
         if self.focus_composer_pending
             && self.modal.is_none()
@@ -9332,7 +9452,44 @@ impl Render for Client {
                     .border_b_1()
                     .border_color(self.tone(0xc8c3ba, 0x2a2e32))
                     .bg(self.tone(0xf4f1eb, 0x14171a))
-                    .child(div().w(px(270.)).pl(px(16.)).child("◫"))
+                    .child(
+                        div()
+                            .w(px(if self.sidebar_visible {
+                                SIDEBAR_WIDTH
+                            } else {
+                                48.
+                            }))
+                            .pl(px(16.))
+                            .child(
+                                div()
+                                    .id("sidebar-toggle")
+                                    .role(Role::Button)
+                                    .aria_label(if self.sidebar_visible {
+                                        "Hide sidebar"
+                                    } else {
+                                        "Show sidebar"
+                                    })
+                                    .test_support()
+                                    .track_focus(&self.sidebar_toggle_focus)
+                                    .focus_visible(|style| {
+                                        style.border_color(self.tone(0x2356a8, 0x78baff))
+                                    })
+                                    .cursor_pointer()
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, _, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.toggle_sidebar(cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+                                    .child("◫"),
+                            ),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -9368,13 +9525,14 @@ impl Render for Client {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.sidebar(cx))
+                    .when(self.sidebar_visible, |view| view.child(self.sidebar(cx)))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
+                            .when_some(self.session_header(cx), |view, header| view.child(header))
                             .child(self.chat(window, cx))
                             .when_some(self.overlay.as_ref(), |view, overlay| {
                                 view.child(overlay.clone())
@@ -12712,6 +12870,57 @@ mod tests {
             window.press("escape", cx);
             window.click("new-session", cx);
             assert!(client.read(cx).modal == Some(Modal::NewSession));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_toggle_shortcut_reflows_the_transcript_and_restores_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let initial_width = client.read(cx).transcript_width(window);
+            let toggle = window.find("sidebar-toggle");
+            assert_eq!(toggle.role(), Some(Role::Button));
+            assert_eq!(toggle.label(), Some("Hide sidebar"));
+            assert!(window.try_find("new-session").is_some());
+            client.read(cx).scroll.base_handle().scroll_to_bottom();
+            window.render_frame(cx);
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-b", cx);
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            assert!(!client.read(cx).sidebar_visible);
+            let scroll = &client.read(cx).scroll;
+            assert!(scroll.offset().y + scroll.max_offset().y <= px(16.));
+            assert_eq!(
+                client.read(cx).transcript_width(window),
+                initial_width + px(270.)
+            );
+            assert!(window.try_find("new-session").is_none());
+            assert!(window.try_find("session-header").is_some());
+            let switch = window.find("session-header-switch");
+            assert_eq!(switch.role(), Some(Role::Button));
+            assert_eq!(switch.label(), Some("Switch session"));
+            assert_eq!(window.find("sidebar-toggle").label(), Some("Show sidebar"));
+            window.click("session-header-switch", cx);
+            assert!(client.read(cx).modal == Some(Modal::Sessions));
+            window.press("escape", cx);
+            window.click("sidebar-toggle", cx);
+            window.render_frame(cx);
+            assert!(client.read(cx).sidebar_visible);
+            assert_eq!(client.read(cx).transcript_width(window), initial_width);
+            assert!(window.try_find("new-session").is_some());
+            assert!(window.try_find("session-header").is_none());
         })
         .unwrap();
     }

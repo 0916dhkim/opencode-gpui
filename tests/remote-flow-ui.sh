@@ -147,7 +147,7 @@ if [[ -n "$new_session" ]]; then
     sleep 1
     if [[ -n "${FLOW_SHOTS:-}" ]]; then import -window "$window" "${FLOW_SHOTS%.png}-form.png"; fi
     mark_now
-    gpui_click 716 600
+    gpui_key ctrl+shift+x
     expect form.cancel "http and route == 'session.form.cancel' and p.get('sessionID') in ('$new_session', 'global') and r['status'] in (204, 409)"
   fi
   mark_now
