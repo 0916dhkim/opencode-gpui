@@ -487,9 +487,16 @@ struct Client {
     focus_composer_pending: bool,
     next_model_request_id: u64,
     model_switches: HashMap<String, PendingModelPick>,
-    pending_prompts: HashMap<String, (u64, String, Vec<PathBuf>)>,
+    pending_prompts: HashMap<String, PendingPromptSend>,
+    failed_prompt_drafts: HashMap<String, FailedPromptDraft>,
     tray_in_flight: HashSet<String>,
-    clear_accepted_drafts: Vec<(String, String, Vec<PathBuf>)>,
+    draft_actions: Vec<DraftAction>,
+    composer_edit_generation: HashMap<String, u64>,
+    local_busy: HashSet<String>,
+    local_run_message_ids: HashMap<String, String>,
+    deferred_abort: HashSet<String>,
+    abort_timeout_tokens: HashMap<String, u64>,
+    next_abort_timeout_token: u64,
     modal: Option<Modal>,
     rename_target: Option<String>,
     rename_pending: Option<u64>,
@@ -923,6 +930,53 @@ struct StaleMeasuredRow {
 struct PendingModelPick {
     request_id: u64,
     selection: ModelSelection,
+}
+
+#[derive(Clone)]
+struct PendingPromptSend {
+    request_id: u64,
+    message_id: String,
+    text: String,
+    attachments: Vec<PathBuf>,
+    delivery: Option<protocol::Delivery>,
+    edit_generation: u64,
+}
+
+#[derive(Clone)]
+struct FailedPromptDraft {
+    message_id: String,
+    text: String,
+    attachments: Vec<PathBuf>,
+}
+
+enum DraftAction {
+    Clear {
+        session: String,
+        pending: PendingPromptSend,
+    },
+    Restore {
+        session: String,
+        pending: PendingPromptSend,
+    },
+}
+
+fn should_clear_submitted(
+    current: &str,
+    submitted: &str,
+    current_generation: u64,
+    sent_generation: u64,
+) -> bool {
+    current == submitted && current_generation == sent_generation
+}
+
+fn restored_failed_text(current: &str, submitted: &str) -> String {
+    if current.starts_with(submitted) {
+        current.to_owned()
+    } else if current.is_empty() {
+        submitted.to_owned()
+    } else {
+        format!("{submitted}\n{current}")
+    }
 }
 
 impl RowHeightCache {
@@ -2088,8 +2142,15 @@ impl Client {
             next_model_request_id: 0,
             model_switches: HashMap::new(),
             pending_prompts: HashMap::new(),
+            failed_prompt_drafts: HashMap::new(),
             tray_in_flight: HashSet::new(),
-            clear_accepted_drafts: Vec::new(),
+            draft_actions: Vec::new(),
+            composer_edit_generation: HashMap::new(),
+            local_busy: HashSet::new(),
+            local_run_message_ids: HashMap::new(),
+            deferred_abort: HashSet::new(),
+            abort_timeout_tokens: HashMap::new(),
+            next_abort_timeout_token: 0,
             modal: None,
             rename_target: None,
             rename_pending: None,
@@ -2098,13 +2159,21 @@ impl Client {
             search: cx.new(|cx| InputState::new(window, cx).placeholder("Search models (fuzzy)…")),
             rename: cx.new(|cx| InputState::new(window, cx)),
         };
-        cx.subscribe(&client.composer, |this, _, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { secondary, shift } = event
-                && !shift
-            {
-                this.send_prompt(*secondary, cx);
-            }
-        })
+        cx.subscribe(
+            &client.composer,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    *this
+                        .composer_edit_generation
+                        .entry(this.composer_session.clone())
+                        .or_default() += 1;
+                }
+                InputEvent::PressEnter { secondary, shift } if !shift => {
+                    this.send_prompt(*secondary, cx);
+                }
+                _ => {}
+            },
+        )
         .detach();
         cx.subscribe(
             &client.search,
@@ -2338,7 +2407,122 @@ impl Client {
         {
             self.persist_tabs();
         }
-        self.statuses.insert(id, status);
+        if status.is_busy() {
+            if self.local_prompt_delivered(&id) {
+                self.local_busy.remove(&id);
+            }
+        } else if !self.local_busy.contains(&id) && !self.pending_prompts.contains_key(&id) {
+            self.deferred_abort.remove(&id);
+            self.abort_timeout_tokens.remove(&id);
+            self.local_run_message_ids.remove(&id);
+        }
+        self.statuses.insert(id.clone(), status);
+        self.maybe_dispatch_deferred_abort(&id);
+    }
+
+    fn local_prompt_delivered(&self, session: &str) -> bool {
+        self.local_run_message_ids
+            .get(session)
+            .is_some_and(|message_id| {
+                self.conversations
+                    .get(session)
+                    .is_some_and(|conversation| conversation.has_delivered_user_message(message_id))
+            })
+    }
+
+    fn maybe_dispatch_deferred_abort(&mut self, session: &str) {
+        if !self.statuses.get(session).is_some_and(RunStatus::is_busy)
+            || !self.local_prompt_delivered(session)
+        {
+            return;
+        }
+        self.local_busy.remove(session);
+        if !self.deferred_abort.remove(session) {
+            return;
+        }
+        self.abort_timeout_tokens.remove(session);
+        if let Some(api) = &self.api {
+            api.send(Command::Abort {
+                session_id: session.to_owned(),
+            });
+        }
+    }
+
+    fn is_running(&self, session: &str) -> bool {
+        self.statuses.get(session).is_some_and(RunStatus::is_busy)
+            || self.local_busy.contains(session)
+            || self
+                .pending_prompts
+                .get(session)
+                .is_some_and(|pending| pending.delivery.is_none())
+    }
+
+    fn stop_active(&mut self, cx: &mut Context<Self>) {
+        if self.active.is_empty() {
+            return;
+        }
+        let session = self.active.clone();
+        if (self.local_busy.contains(&session)
+            || self
+                .pending_prompts
+                .get(&session)
+                .is_some_and(|pending| pending.delivery.is_none()))
+            && (!self.statuses.get(&session).is_some_and(RunStatus::is_busy)
+                || !self.local_prompt_delivered(&session))
+        {
+            if self.deferred_abort.insert(session.clone()) {
+                self.schedule_deferred_abort_check(session, cx);
+            }
+        } else if let Some(api) = &self.api {
+            api.send(Command::Abort {
+                session_id: session,
+            });
+        }
+        cx.notify();
+    }
+
+    fn schedule_deferred_abort_check(&mut self, session: String, cx: &mut Context<Self>) {
+        self.next_abort_timeout_token += 1;
+        let token = self.next_abort_timeout_token;
+        self.abort_timeout_tokens.insert(session.clone(), token);
+        let generation = self.connection_generation;
+        cx.spawn(async move |this, cx| {
+            for attempt in 0..10 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200 * (attempt + 1)))
+                    .await;
+                let keep_waiting = this
+                    .update(cx, |this, cx| {
+                        if this.connection_generation != generation
+                            || this.abort_timeout_tokens.get(&session) != Some(&token)
+                            || !this.deferred_abort.contains(&session)
+                        {
+                            return false;
+                        }
+                        if attempt == 9 {
+                            // Never abort a later, unrelated run because this
+                            // one never exposed a Busy state.
+                            this.deferred_abort.remove(&session);
+                            this.abort_timeout_tokens.remove(&session);
+                            if !this.pending_prompts.contains_key(&session) {
+                                this.local_busy.remove(&session);
+                            }
+                            this.connection_status =
+                                "Stop could not confirm the run started; retry if it is still running"
+                                    .into();
+                            cx.notify();
+                            return false;
+                        }
+                        this.request_bootstrap();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_waiting {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -2374,8 +2558,17 @@ impl Client {
         self.composers.remove(id);
         self.attachment_drafts.remove(id);
         self.pending_prompts.remove(id);
-        self.clear_accepted_drafts
-            .retain(|(session, _, _)| session != id);
+        self.failed_prompt_drafts.remove(id);
+        self.local_busy.remove(id);
+        self.local_run_message_ids.remove(id);
+        self.deferred_abort.remove(id);
+        self.abort_timeout_tokens.remove(id);
+        self.draft_actions.retain(|action| match action {
+            DraftAction::Clear { session, .. } | DraftAction::Restore { session, .. } => {
+                session != id
+            }
+        });
+        self.composer_edit_generation.remove(id);
         self.persist_tabs();
         cx.notify();
     }
@@ -2400,13 +2593,22 @@ impl Client {
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             });
-            cx.subscribe(&composer, |this, _, event: &InputEvent, cx| {
-                if let InputEvent::PressEnter { secondary, shift } = event
-                    && !shift
-                {
-                    this.send_prompt(*secondary, cx);
-                }
-            })
+            let session = self.active.clone();
+            cx.subscribe(
+                &composer,
+                move |this, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        *this
+                            .composer_edit_generation
+                            .entry(session.clone())
+                            .or_default() += 1;
+                    }
+                    InputEvent::PressEnter { secondary, shift } if !shift => {
+                        this.send_prompt(*secondary, cx);
+                    }
+                    _ => {}
+                },
+            )
             .detach();
             self.composers.insert(self.active.clone(), composer.clone());
             self.composer = composer;
@@ -2713,7 +2915,13 @@ impl Client {
         self.attachment_drafts.clear();
         self.pending_prompts.clear();
         self.model_switches.clear();
-        self.clear_accepted_drafts.clear();
+        self.failed_prompt_drafts.clear();
+        self.draft_actions.clear();
+        self.composer_edit_generation.clear();
+        self.local_busy.clear();
+        self.local_run_message_ids.clear();
+        self.deferred_abort.clear();
+        self.abort_timeout_tokens.clear();
         self.transcript.clear();
         self.transcript_spans.clear();
         self.attachments = ImageCache::default();
@@ -3585,29 +3793,55 @@ impl Client {
         let Some(api) = &self.api else {
             return;
         };
+        if let Err(error) = opencode_gpui::api::check_attachments(&self.attachments_draft) {
+            self.connection_status = format!("Cannot send attachment: {error}");
+            cx.notify();
+            return;
+        }
         self.next_prompt_request_id += 1;
         let request_id = self.next_prompt_request_id;
-        let delivery = self
-            .statuses
-            .get(&self.active)
-            .is_some_and(RunStatus::is_busy)
-            .then_some(if queue {
-                protocol::Delivery::Queue
-            } else {
-                protocol::Delivery::Steer
-            });
+        let delivery = self.is_running(&self.active).then_some(if queue {
+            protocol::Delivery::Queue
+        } else {
+            protocol::Delivery::Steer
+        });
+        let attachments = std::mem::take(&mut self.attachments_draft);
+        let message_id = self
+            .failed_prompt_drafts
+            .remove(&self.active)
+            .filter(|failed| failed.text == text && failed.attachments == attachments)
+            .map_or_else(protocol::new_message_id, |failed| failed.message_id);
+        let pending = PendingPromptSend {
+            request_id,
+            message_id: message_id.clone(),
+            text: text.clone(),
+            attachments: attachments.clone(),
+            delivery,
+            edit_generation: self
+                .composer_edit_generation
+                .get(&self.active)
+                .copied()
+                .unwrap_or_default(),
+        };
         api.send(Command::SendPrompt {
             request_id,
-            message_id: protocol::new_message_id(),
+            message_id,
             session_id: self.active.clone(),
-            text: text.clone(),
-            attachments: self.attachments_draft.clone(),
+            text,
+            attachments,
             delivery,
         });
-        self.pending_prompts.insert(
-            self.active.clone(),
-            (request_id, text, self.attachments_draft.clone()),
-        );
+        self.pending_prompts
+            .insert(self.active.clone(), pending.clone());
+        if delivery.is_none() {
+            self.local_busy.insert(self.active.clone());
+            self.local_run_message_ids
+                .insert(self.active.clone(), pending.message_id.clone());
+        }
+        self.draft_actions.push(DraftAction::Clear {
+            session: self.active.clone(),
+            pending,
+        });
         cx.notify();
     }
 
@@ -4034,10 +4268,32 @@ impl Client {
                         }
                     }
                 }
+                let observed_busy: Vec<_> = data
+                    .statuses
+                    .iter()
+                    .filter(|(_, status)| status.is_busy())
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for (id, status) in &data.statuses {
+                    if status.is_busy() {
+                        if self.local_prompt_delivered(id) {
+                            self.local_busy.remove(id);
+                        }
+                    } else if !self.pending_prompts.contains_key(id)
+                        && !self.local_busy.contains(id)
+                    {
+                        self.deferred_abort.remove(id);
+                        self.abort_timeout_tokens.remove(id);
+                        self.local_run_message_ids.remove(id);
+                    }
+                }
                 if data.statuses_complete {
                     self.statuses = data.statuses;
                 } else {
                     self.statuses.extend(data.statuses);
+                }
+                for id in observed_busy {
+                    self.maybe_dispatch_deferred_abort(&id);
                 }
                 if !data.retry_needed {
                     self.tray_in_flight.clear();
@@ -4162,6 +4418,7 @@ impl Client {
                                     self.message_events_during_load.remove(&session_id);
                                 }
                                 self.update_transcript(&session_id);
+                                self.maybe_dispatch_deferred_abort(&session_id);
                             }
                             Err(MessageLoadError::SessionNotFound) => {
                                 self.close_tab(&session_id, cx);
@@ -4300,14 +4557,34 @@ impl Client {
                 if self
                     .pending_prompts
                     .get(&session_id)
-                    .is_some_and(|(pending, _, _)| *pending == request_id)
-                    && let Some((_, text, attachments)) = self.pending_prompts.remove(&session_id)
+                    .is_some_and(|pending| pending.request_id == request_id)
+                    && let Some(pending) = self.pending_prompts.remove(&session_id)
                 {
                     match result {
-                        Ok(()) => self
-                            .clear_accepted_drafts
-                            .push((session_id, text, attachments)),
-                        Err(error) => self.connection_status = format!("Send failed: {error}"),
+                        Ok(()) => {
+                            if self.deferred_abort.contains(&session_id) {
+                                // Inbox acceptance is not evidence that the
+                                // run has started. Abort only after a Busy
+                                // status (SSE or a refreshed snapshot).
+                                self.request_bootstrap();
+                            }
+                        }
+                        Err(error) => {
+                            if pending.delivery.is_none()
+                                && self.local_run_message_ids.get(&session_id)
+                                    == Some(&pending.message_id)
+                            {
+                                self.local_busy.remove(&session_id);
+                                self.local_run_message_ids.remove(&session_id);
+                                self.deferred_abort.remove(&session_id);
+                                self.abort_timeout_tokens.remove(&session_id);
+                            }
+                            self.connection_status = format!("Send failed: {error}");
+                            self.draft_actions.push(DraftAction::Restore {
+                                session: session_id,
+                                pending,
+                            });
+                        }
                     }
                 }
             }
@@ -4430,8 +4707,16 @@ impl Client {
                             self.composers.remove(&id);
                             self.attachment_drafts.remove(&id);
                             self.pending_prompts.remove(&id);
-                            self.clear_accepted_drafts
-                                .retain(|(session, _, _)| session != &id);
+                            self.failed_prompt_drafts.remove(&id);
+                            self.local_busy.remove(&id);
+                            self.local_run_message_ids.remove(&id);
+                            self.deferred_abort.remove(&id);
+                            self.abort_timeout_tokens.remove(&id);
+                            self.draft_actions.retain(|action| match action {
+                                DraftAction::Clear { session, .. }
+                                | DraftAction::Restore { session, .. } => session != &id,
+                            });
+                            self.composer_edit_generation.remove(&id);
                             self.unread.remove(&id);
                         }
                     }
@@ -4451,6 +4736,7 @@ impl Client {
                             .apply(&event, &kind)
                     {
                         self.update_transcript(id);
+                        self.maybe_dispatch_deferred_abort(id);
                     }
                     if let Some(job_event) =
                         jobs::job_event(&event, &kind, envelope.directory.as_deref())
@@ -4710,8 +4996,15 @@ impl Client {
             next_model_request_id: 0,
             model_switches: HashMap::new(),
             pending_prompts: HashMap::new(),
+            failed_prompt_drafts: HashMap::new(),
             tray_in_flight: HashSet::new(),
-            clear_accepted_drafts: Vec::new(),
+            draft_actions: Vec::new(),
+            composer_edit_generation: HashMap::new(),
+            local_busy: HashSet::new(),
+            local_run_message_ids: HashMap::new(),
+            deferred_abort: HashSet::new(),
+            abort_timeout_tokens: HashMap::new(),
+            next_abort_timeout_token: 0,
             modal,
             rename_target: None,
             rename_pending: None,
@@ -4800,6 +5093,16 @@ impl Client {
                 window.on_next_frame(move |window, cx| focus.focus(window, cx));
             }
         }
+        let initial_session = client.active.clone();
+        cx.subscribe(&client.composer, move |this, _, event: &InputEvent, _| {
+            if matches!(event, InputEvent::Change) {
+                *this
+                    .composer_edit_generation
+                    .entry(initial_session.clone())
+                    .or_default() += 1;
+            }
+        })
+        .detach();
         client
     }
 
@@ -6422,10 +6725,7 @@ impl Client {
         if rows.is_empty() {
             return None;
         }
-        let running = self
-            .statuses
-            .get(&self.active)
-            .is_some_and(RunStatus::is_busy);
+        let running = self.is_running(&self.active);
         let paused = !running;
         let mut card = div()
             .id("queue-tray")
@@ -6603,10 +6903,7 @@ impl Client {
                 model::format_context_usage(used, limit)
             })
             .unwrap_or_default();
-        let running = self
-            .statuses
-            .get(&self.active)
-            .is_some_and(RunStatus::is_busy);
+        let running = self.is_running(&self.active);
         let mut files = div().px(px(13.)).flex().gap(px(7.));
         for (index, path) in self.attachments_draft.iter().enumerate() {
             let target = path.clone();
@@ -6789,23 +7086,13 @@ impl Client {
                                 })
                                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                                     if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                        if let Some(api) = &this.api {
-                                            api.send(Command::Abort {
-                                                session_id: this.active.clone(),
-                                            });
-                                        }
+                                        this.stop_active(cx);
                                         cx.stop_propagation();
-                                        cx.notify();
                                     }
                                 }))
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(api) = &this.api {
-                                        api.send(Command::Abort {
-                                            session_id: this.active.clone(),
-                                        });
-                                    }
-                                    cx.notify();
+                                    this.stop_active(cx);
                                 }))
                                 .w(px(32.))
                                 .h(px(32.))
@@ -8189,22 +8476,60 @@ impl Render for Client {
                 .entry(key)
                 .or_insert_with(|| cx.focus_handle().tab_stop(true));
         }
-        let mut deferred = Vec::new();
-        for (id, text, attachments) in std::mem::take(&mut self.clear_accepted_drafts) {
-            if self.active == id {
-                if self.composer.read(cx).value().as_ref() == text {
-                    self.composer.update(cx, |input, cx| {
-                        input.set_value("", window, cx);
-                    });
-                }
-                if self.attachments_draft == attachments {
-                    self.attachments_draft.clear();
-                }
+        for action in std::mem::take(&mut self.draft_actions) {
+            let (session, pending, restore) = match action {
+                DraftAction::Clear { session, pending } => (session, pending, false),
+                DraftAction::Restore { session, pending } => (session, pending, true),
+            };
+            let composer = if session == self.active {
+                Some(self.composer.clone())
             } else {
-                deferred.push((id, text, attachments));
+                self.composers.get(&session).cloned()
+            };
+            let Some(composer) = composer else { continue };
+            let current = composer.read(cx).value().to_string();
+            if !restore {
+                if should_clear_submitted(
+                    &current,
+                    &pending.text,
+                    self.composer_edit_generation
+                        .get(&session)
+                        .copied()
+                        .unwrap_or_default(),
+                    pending.edit_generation,
+                ) {
+                    composer.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                // Submitted files moved out of the session draft at enqueue.
+                continue;
+            }
+            let restored = restored_failed_text(&current, &pending.text);
+            if restored != current {
+                composer.update(cx, |input, cx| {
+                    input.set_value(restored.clone(), window, cx);
+                });
+            }
+            let attachments = if session == self.active {
+                &mut self.attachments_draft
+            } else {
+                self.attachment_drafts.entry(session.clone()).or_default()
+            };
+            let mut restored_files = pending.attachments.clone();
+            restored_files.append(attachments);
+            *attachments = restored_files;
+            if restored == pending.text && *attachments == pending.attachments {
+                self.failed_prompt_drafts.insert(
+                    session.clone(),
+                    FailedPromptDraft {
+                        message_id: pending.message_id,
+                        text: pending.text,
+                        attachments: pending.attachments,
+                    },
+                );
+            } else {
+                self.failed_prompt_drafts.remove(&session);
             }
         }
-        self.clear_accepted_drafts = deferred;
         self.guard_unmeasured_scroll(window);
         if self.preserve_scroll.is_none()
             && self.pending_jump.is_none()
@@ -12308,6 +12633,208 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn replacing_the_composer_before_send_clear_never_discards_new_text(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = opencode_gpui::api::ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("hi", window, cx));
+                client.send_prompt(false, cx);
+                client.composer.update(cx, |input, cx| {
+                    input.set_value("high priority", window, cx);
+                });
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                client.read(cx).composer.read(cx).value().as_ref(),
+                "high priority"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn stop_during_first_pending_post_defers_abort_until_acceptance(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = opencode_gpui::api::ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("Run a task", window, cx));
+                client.send_prompt(false, cx);
+                assert!(client.is_running(&client.active));
+                assert!(client.pending_prompts[&client.active].delivery.is_none());
+            });
+            window.render_frame(cx);
+            let _stop = window.find("stop-run");
+            client.update(cx, |client, cx| {
+                client.stop_active(cx);
+                assert!(client.deferred_abort.contains(&client.active));
+                let pending = client.pending_prompts[&client.active].clone();
+                client.handle_live_event(
+                    super::UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: client.active.clone(),
+                        result: Ok(()),
+                    },
+                    cx,
+                );
+                assert!(client.deferred_abort.contains(&client.active));
+                assert!(client.is_running(&client.active));
+                client.update_tab_status(client.active.clone(), RunStatus::Idle);
+                assert!(
+                    client.is_running(&client.active),
+                    "stale Idle must not hide local Busy"
+                );
+                assert!(client.deferred_abort.contains(&client.active));
+                client.composer.update(cx, |input, cx| {
+                    input.set_value("Follow-up", window, cx);
+                });
+                client.send_prompt(true, cx);
+                let follow_up = client.pending_prompts[&client.active].clone();
+                assert_eq!(follow_up.delivery, Some(protocol::Delivery::Queue));
+                client.handle_live_event(
+                    super::UiEvent::PromptAccepted {
+                        request_id: follow_up.request_id,
+                        session_id: client.active.clone(),
+                        result: Err("queue failed".into()),
+                    },
+                    cx,
+                );
+                assert!(client.local_busy.contains(&client.active));
+                assert!(client.deferred_abort.contains(&client.active));
+                client.update_tab_status(client.active.clone(), RunStatus::Busy);
+                assert!(
+                    client.deferred_abort.contains(&client.active),
+                    "another client's Busy must not abort this prompt before delivery"
+                );
+                assert!(client.local_busy.contains(&client.active));
+                let message = protocol::SessionMessage::from_value(json!({
+                    "id": pending.message_id, "type": "user", "time": { "created": 1 },
+                    "content": [{ "type": "text", "text": "Run a task" }]
+                }));
+                client
+                    .conversations
+                    .get_mut(&client.active)
+                    .unwrap()
+                    .replace_from_api(&[message], None);
+                let active = client.active.clone();
+                client.maybe_dispatch_deferred_abort(&active);
+                assert!(!client.deferred_abort.contains(&client.active));
+                client.update_tab_status(client.active.clone(), RunStatus::Idle);
+                assert!(!client.is_running(&client.active));
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn failed_prompt_restores_draft_and_reuses_id_only_when_unchanged(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = opencode_gpui::api::ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("First draft", window, cx));
+                client.send_prompt(false, cx);
+                assert!(client.pending_prompts.contains_key(&client.active));
+                assert_eq!(client.composer.read(cx).value().as_ref(), "First draft");
+            });
+            let first_id = client.read(cx).pending_prompts[&client.read(cx).active]
+                .message_id
+                .clone();
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).composer.read(cx).value().as_ref(), "");
+            client.update(cx, |client, cx| {
+                let pending = client.pending_prompts[&client.active].clone();
+                client.handle_live_event(
+                    super::UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: client.active.clone(),
+                        result: Err("transient failure".into()),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                assert_eq!(client.composer.read(cx).value().as_ref(), "First draft");
+                let retry = client.failed_prompt_drafts[&client.active]
+                    .message_id
+                    .clone();
+                client.send_prompt(false, cx);
+                assert_eq!(client.pending_prompts[&client.active].message_id, retry);
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let pending = client.pending_prompts[&client.active].clone();
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("New draft", window, cx));
+                client.handle_live_event(
+                    super::UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: client.active.clone(),
+                        result: Err("another failure".into()),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                assert_eq!(
+                    client.composer.read(cx).value().as_ref(),
+                    "First draft\nNew draft"
+                );
+                assert!(!client.failed_prompt_drafts.contains_key(&client.active));
+                client.send_prompt(false, cx);
+                assert_ne!(client.pending_prompts[&client.active].message_id, first_id);
+            });
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn draft_text_transitions_preserve_new_input() {
+        assert!(!super::should_clear_submitted("high priority", "hi", 1, 1));
+        assert!(!super::should_clear_submitted("hi", "hi", 2, 1));
+        assert!(super::should_clear_submitted("hi", "hi", 1, 1));
+        assert_eq!(super::restored_failed_text("new", "sent"), "sent\nnew");
+        assert_eq!(
+            super::restored_failed_text("sent again", "sent"),
+            "sent again"
+        );
+    }
+
+    #[gpui_kit::test]
     fn composer_send_requires_model_input_and_supported_attachments(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
@@ -12337,9 +12864,17 @@ mod tests {
             assert!(!client.update(cx, |client, cx| client.can_send(cx)));
             client.update(cx, |client, _| {
                 client.attachments_draft.clear();
-                client
-                    .pending_prompts
-                    .insert(client.active.clone(), (1, String::new(), vec![]));
+                client.pending_prompts.insert(
+                    client.active.clone(),
+                    super::PendingPromptSend {
+                        request_id: 1,
+                        message_id: "pending".into(),
+                        text: String::new(),
+                        attachments: vec![],
+                        delivery: None,
+                        edit_generation: 0,
+                    },
+                );
             });
             assert!(!client.update(cx, |client, cx| client.can_send(cx)));
         })
