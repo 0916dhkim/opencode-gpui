@@ -169,12 +169,17 @@ fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
 
 const SESSION_PICKER_LIMIT: usize = 200;
 
-fn filter_tab_sessions<'a>(sessions: &'a [Session], query: &str) -> Vec<&'a Session> {
+fn filter_tab_sessions<'a>(
+    sessions: &'a [Session],
+    open_tabs: &[String],
+    query: &str,
+) -> Vec<&'a Session> {
     let query = query.trim();
-    let mut scored: Vec<_> = sessions
+    let mut scored: Vec<_> = open_tabs
         .iter()
         .enumerate()
-        .filter_map(|(index, session)| {
+        .filter_map(|(index, id)| {
+            let session = sessions.iter().find(|session| &session.id == id)?;
             let score = if query.is_empty() {
                 Some(0)
             } else {
@@ -3327,7 +3332,9 @@ impl Client {
     fn modal_choice_count(&self, cx: &Context<Self>) -> usize {
         let query = self.search.read(cx).value().to_lowercase();
         match self.modal {
-            Some(Modal::Sessions) => filter_tab_sessions(&self.sessions, &query).len(),
+            Some(Modal::Sessions) => {
+                filter_tab_sessions(&self.sessions, &self.open_tabs, &query).len()
+            }
             Some(Modal::NewSession) => filter_new_session_projects(
                 &self.projects,
                 &self.sessions,
@@ -3357,7 +3364,7 @@ impl Client {
         let index = self.picker_highlight.unwrap_or_default();
         match self.modal {
             Some(Modal::Sessions) => {
-                let id = filter_tab_sessions(&self.sessions, &query)
+                let id = filter_tab_sessions(&self.sessions, &self.open_tabs, &query)
                     .get(index)
                     .map(|session| session.id.clone());
                 if let Some(id) = id {
@@ -3554,8 +3561,8 @@ impl Client {
                         )
                     } else {
                         Some(
-                            (self.settings_highlight.unwrap_or_default() + 1)
-                                .min(choices.len() - 1),
+                            self.settings_highlight
+                                .map_or(0, |current| (current + 1).min(choices.len() - 1)),
                         )
                     };
                     self.settings_highlight = next;
@@ -3579,14 +3586,16 @@ impl Client {
         if matches!(key.as_str(), "enter" | "space") {
             let query = self.search.read(cx).value();
             let focused = match self.modal {
-                Some(Modal::Sessions) => filter_tab_sessions(&self.sessions, &query)
-                    .into_iter()
-                    .find(|session| {
-                        self.picker_choice_focus
-                            .get(&format!("session:{}", session.id))
-                            .is_some_and(|focus| focus.is_focused(window))
-                    })
-                    .map(|session| (false, session.id.clone())),
+                Some(Modal::Sessions) => {
+                    filter_tab_sessions(&self.sessions, &self.open_tabs, &query)
+                        .into_iter()
+                        .find(|session| {
+                            self.picker_choice_focus
+                                .get(&format!("session:{}", session.id))
+                                .is_some_and(|focus| focus.is_focused(window))
+                        })
+                        .map(|session| (false, session.id.clone()))
+                }
                 Some(Modal::NewSession) => filter_new_session_projects(
                     &self.projects,
                     &self.sessions,
@@ -3657,11 +3666,11 @@ impl Client {
         }
         if matches!(key.as_str(), "up" | "down") && self.modal_choice_count(cx) > 0 {
             let len = self.modal_choice_count(cx);
-            let current = self.picker_highlight.unwrap_or_default();
             self.picker_highlight = Some(if key == "up" {
-                current.saturating_sub(1)
+                self.picker_highlight.unwrap_or_default().saturating_sub(1)
             } else {
-                (current + 1).min(len - 1)
+                self.picker_highlight
+                    .map_or(0, |current| (current + 1).min(len - 1))
             });
             if self.modal == Some(Modal::Sessions) {
                 self.sessions_picker_scroll
@@ -8213,9 +8222,10 @@ impl Client {
                         .track_scroll(&self.sessions_picker_scroll)
                         .flex()
                         .flex_col();
-                    for (index, session) in filter_tab_sessions(&self.sessions, &query)
-                        .into_iter()
-                        .enumerate()
+                    for (index, session) in
+                        filter_tab_sessions(&self.sessions, &self.open_tabs, &query)
+                            .into_iter()
+                            .enumerate()
                     {
                         let selected = session.id == self.active;
                         let id = session.id.clone();
@@ -9250,7 +9260,7 @@ impl Render for Client {
         let picker_focus_keys: Vec<_> = match self.modal {
             Some(Modal::Sessions) => {
                 let query = self.search.read(cx).value();
-                filter_tab_sessions(&self.sessions, &query)
+                filter_tab_sessions(&self.sessions, &self.open_tabs, &query)
                     .into_iter()
                     .map(|session| format!("session:{}", session.id))
                     .collect()
@@ -12682,7 +12692,21 @@ mod tests {
             .expect("headless picker window")
         });
         cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                let mut closed = client.sessions[0].clone();
+                closed.id = "ses_not_an_open_tab".into();
+                client.sessions.push(closed);
+                cx.notify();
+            });
             window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("session-choice-ses_not_an_open_tab")
+                    .is_none()
+            );
+            client.read(cx).search.focus_handle(cx).focus(window, cx);
+            window.press("down", cx);
+            assert_eq!(client.read(cx).picker_highlight, Some(0));
             let session = client
                 .read(cx)
                 .sessions
@@ -12980,16 +13004,29 @@ mod tests {
             });
         }
         sessions[150].title = "Refactor the retry logic".into();
+        let tabs: Vec<_> = sessions.iter().map(|session| session.id.clone()).collect();
         assert_eq!(
-            filter_tab_sessions(&sessions, "").len(),
+            filter_tab_sessions(&sessions, &tabs, "").len(),
             SESSION_PICKER_LIMIT
         );
-        assert_eq!(filter_tab_sessions(&sessions, "rtrl")[0].id, "ses_150");
         assert_eq!(
-            filter_tab_sessions(&sessions, "project-209")[0].id,
+            filter_tab_sessions(&sessions, &tabs, "rtrl")[0].id,
+            "ses_150"
+        );
+        assert_eq!(
+            filter_tab_sessions(&sessions, &tabs, "project-209")[0].id,
             "ses_209"
         );
-        assert!(filter_tab_sessions(&sessions, "zqx").is_empty());
+        assert!(filter_tab_sessions(&sessions, &tabs, "zqx").is_empty());
+        let open = vec!["ses_150".to_owned(), "ses_0".to_owned()];
+        assert_eq!(
+            filter_tab_sessions(&sessions, &open, "")
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ses_150", "ses_0"]
+        );
+        assert!(filter_tab_sessions(&sessions, &open, "project-209").is_empty());
     }
 
     #[test]
@@ -13798,7 +13835,7 @@ mod tests {
             });
             window.render_frame(cx);
             assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
-            for _ in 0..12 {
+            for _ in 0..13 {
                 window.press("down", cx);
             }
             window.render_frame(cx);
@@ -13834,7 +13871,7 @@ mod tests {
             client.update(cx, |client, cx| client.show_modal(Modal::Model, window, cx));
             window.render_frame(cx);
             assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
-            for _ in 0..12 {
+            for _ in 0..13 {
                 window.press("down", cx);
             }
             window.render_frame(cx);
@@ -13880,7 +13917,7 @@ mod tests {
             client.update(cx, |client, cx| client.show_modal(Modal::Level, window, cx));
             window.render_frame(cx);
             assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
-            for _ in 0..12 {
+            for _ in 0..13 {
                 window.press("down", cx);
             }
             window.render_frame(cx);
@@ -13911,6 +13948,7 @@ mod tests {
                     let mut session = client.sessions[0].clone();
                     session.id = format!("ses_extra_{index}");
                     session.title = format!("Extra session {index}");
+                    client.open_tabs.push(session.id.clone());
                     client.sessions.push(session);
                 }
                 cx.notify();
@@ -13925,8 +13963,12 @@ mod tests {
                 client.read(cx).search.focus_handle(cx).is_focused(window),
                 "sessions picker search must receive focus when opened"
             );
-            assert_eq!(filter_tab_sessions(&client.read(cx).sessions, "").len(), 20);
-            for _ in 0..12 {
+            assert_eq!(
+                filter_tab_sessions(&client.read(cx).sessions, &client.read(cx).open_tabs, "")
+                    .len(),
+                20
+            );
+            for _ in 0..13 {
                 window.press("down", cx);
             }
             window.render_frame(cx);
