@@ -1896,7 +1896,10 @@ impl Client {
                     .font_weight(FontWeight::BOLD)
                     .child(title)
                     .into_any_element(),
-                MarkdownBlock::Paragraph(text) => markdown(text).into_any_element(),
+                MarkdownBlock::Paragraph(text) => div()
+                    .line_height(px(22.))
+                    .child(markdown(text))
+                    .into_any_element(),
                 MarkdownBlock::Structured {
                     content,
                     marker,
@@ -1918,6 +1921,7 @@ impl Client {
                     let mut block = div()
                         .w_full()
                         .pl(px(16. * list_depth.saturating_sub(1) as f32))
+                        .when(heading.is_none(), |view| view.line_height(px(22.)))
                         .when_some(heading, |view, level| {
                             view.text_size(px(if level == 1 {
                                 18.
@@ -1974,6 +1978,7 @@ impl Client {
                         list = list.child(
                             div()
                                 .flex()
+                                .line_height(px(22.))
                                 .gap(px(9.))
                                 .child(
                                     div()
@@ -6035,7 +6040,7 @@ impl Client {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(if user { 10. } else { 6. }))
             .px(px(28.))
             .pt(px(18.))
             .pb(px(20.))
