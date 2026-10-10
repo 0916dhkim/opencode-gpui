@@ -8,7 +8,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
-use gpui_kit::base::{Button as BaseButton, Checkbox, CheckboxIndicator, CheckboxState};
+use gpui_kit::base::{
+    Button as BaseButton, Checkbox, CheckboxIndicator, CheckboxState, FocusTrapElement,
+};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::markdown;
@@ -537,6 +539,7 @@ struct Client {
     abort_timeout_tokens: HashMap<String, u64>,
     next_abort_timeout_token: u64,
     modal: Option<Modal>,
+    modal_container_focus: FocusHandle,
     rename_target: Option<String>,
     rename_action_focus: [FocusHandle; 3],
     rename_pending: Option<u64>,
@@ -2338,6 +2341,7 @@ impl Client {
             abort_timeout_tokens: HashMap::new(),
             next_abort_timeout_token: 0,
             modal: None,
+            modal_container_focus: cx.focus_handle(),
             rename_target: None,
             rename_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             rename_pending: None,
@@ -3352,6 +3356,45 @@ impl Client {
             self.settings_tab_focus[index].focus(window, cx);
         }
         cx.notify();
+    }
+
+    fn picker_focus_keys(&self, cx: &Context<Self>) -> Vec<String> {
+        let query = self.search.read(cx).value();
+        match self.modal {
+            Some(Modal::Sessions) => filter_tab_sessions(&self.sessions, &self.open_tabs, &query)
+                .into_iter()
+                .map(|session| format!("session:{}", session.id))
+                .collect(),
+            Some(Modal::NewSession) => filter_new_session_projects(
+                &self.projects,
+                &self.sessions,
+                self.sessions
+                    .iter()
+                    .find(|session| session.id == self.active)
+                    .map(|session| session.directory.as_str()),
+                &query,
+            )
+            .into_iter()
+            .map(|(_, directory)| format!("project:{directory}"))
+            .collect(),
+            Some(Modal::Model) => filter_models(&self.catalog.models, &query)
+                .into_iter()
+                .map(|option| format!("model:{}:{}", option.provider_id, option.model_id))
+                .collect(),
+            Some(Modal::Level) => {
+                let variants = self
+                    .selected_model()
+                    .as_ref()
+                    .and_then(|selection| self.catalog.find(selection))
+                    .map(|option| option.variants.clone())
+                    .unwrap_or_default();
+                filter_levels(&variants, &query)
+                    .into_iter()
+                    .map(|variant| format!("level:{}", variant.as_deref().unwrap_or("Default")))
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn modal_choice_count(&self, cx: &Context<Self>) -> usize {
@@ -5681,6 +5724,7 @@ impl Client {
             abort_timeout_tokens: HashMap::new(),
             next_abort_timeout_token: 0,
             modal,
+            modal_container_focus: cx.focus_handle(),
             rename_target: None,
             rename_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             rename_pending: None,
@@ -9289,7 +9333,8 @@ impl Client {
                     div()
                         .id("modal-panel")
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(panel),
+                        .child(panel)
+                        .focus_trap("client-modal", &self.modal_container_focus),
                 )
                 .into_any_element(),
         )
@@ -9358,51 +9403,7 @@ impl Render for Client {
                     .or_insert_with(|| cx.focus_handle().tab_stop(true));
             }
         }
-        let picker_focus_keys: Vec<_> = match self.modal {
-            Some(Modal::Sessions) => {
-                let query = self.search.read(cx).value();
-                filter_tab_sessions(&self.sessions, &self.open_tabs, &query)
-                    .into_iter()
-                    .map(|session| format!("session:{}", session.id))
-                    .collect()
-            }
-            Some(Modal::NewSession) => {
-                let query = self.search.read(cx).value();
-                filter_new_session_projects(
-                    &self.projects,
-                    &self.sessions,
-                    self.sessions
-                        .iter()
-                        .find(|session| session.id == self.active)
-                        .map(|session| session.directory.as_str()),
-                    &query,
-                )
-                .into_iter()
-                .map(|(_, directory)| format!("project:{directory}"))
-                .collect()
-            }
-            Some(Modal::Model) => {
-                let query = self.search.read(cx).value();
-                filter_models(&self.catalog.models, &query)
-                    .into_iter()
-                    .map(|option| format!("model:{}:{}", option.provider_id, option.model_id))
-                    .collect()
-            }
-            Some(Modal::Level) => {
-                let query = self.search.read(cx).value();
-                let variants = self
-                    .selected_model()
-                    .as_ref()
-                    .and_then(|selection| self.catalog.find(selection))
-                    .map(|option| option.variants.clone())
-                    .unwrap_or_default();
-                filter_levels(&variants, &query)
-                    .into_iter()
-                    .map(|variant| format!("level:{}", variant.as_deref().unwrap_or("Default")))
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
+        let picker_focus_keys = self.picker_focus_keys(cx);
         self.picker_choice_focus
             .retain(|key, _| picker_focus_keys.contains(key));
         for key in picker_focus_keys {
@@ -13134,6 +13135,60 @@ mod tests {
             window.simulate_next_frame(cx);
             window.render_frame(cx);
             assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn tab_wraps_inside_picker_rename_and_settings_modals(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::Sessions, window, cx)
+            });
+            window.render_frame(cx);
+            let last_key =
+                client.update(cx, |client, cx| client.picker_focus_keys(cx).pop().unwrap());
+            let last_choice = client.read(cx).picker_choice_focus[&last_key].clone();
+            assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
+            last_choice.focus(window, cx);
+            window.press("tab", cx);
+            assert!(client.read(cx).search.focus_handle(cx).is_focused(window));
+            window.press("shift-tab", cx);
+            assert!(last_choice.is_focused(window));
+
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::Rename, window, cx)
+            });
+            window.render_frame(cx);
+            window.press("shift-tab", cx);
+            assert!(client.read(cx).rename_action_focus[2].is_focused(window));
+            window.press("tab", cx);
+            assert!(client.read(cx).rename.focus_handle(cx).is_focused(window));
+
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::Settings, window, cx)
+            });
+            window.render_frame(cx);
+            let first = client.read(cx).settings_tab_focus[0].clone();
+            first.focus(window, cx);
+            window.press("shift-tab", cx);
+            assert!(client.read(cx).settings_action_focus[1].is_focused(window));
+            window.press("tab", cx);
+            assert!(first.is_focused(window));
+            window.click("settings-tab-sessions", cx);
+            window.render_frame(cx);
+            first.focus(window, cx);
+            window.press("shift-tab", cx);
+            assert!(client.read(cx).settings_action_focus[0].is_focused(window));
+            window.press("tab", cx);
+            assert!(first.is_focused(window));
         })
         .unwrap();
     }
