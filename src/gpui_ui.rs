@@ -424,6 +424,9 @@ struct Client {
     server_version: Option<String>,
     conversations: HashMap<String, Conversation>,
     loading_messages: HashMap<String, Option<String>>,
+    /// Locally accepted IDs while an older newest-history request was in
+    /// flight. Its stale response cannot prove those sends are absent.
+    skip_prune_for_load: HashMap<String, HashSet<String>>,
     message_events_during_load: HashMap<String, Vec<protocol::Event>>,
     reload_after_load: HashSet<String>,
     preserve_scroll: Option<TranscriptAnchor>,
@@ -491,6 +494,7 @@ struct Client {
     model_switches: HashMap<String, PendingModelPick>,
     pending_prompts: HashMap<String, PendingPromptSend>,
     failed_prompt_drafts: HashMap<String, FailedPromptDraft>,
+    confirmed_prompt_residue: HashMap<String, FailedPromptDraft>,
     tray_in_flight: HashSet<String>,
     draft_actions: Vec<DraftAction>,
     composer_edit_generation: HashMap<String, u64>,
@@ -948,7 +952,9 @@ struct PendingPromptSend {
 struct FailedPromptDraft {
     message_id: String,
     text: String,
+    restored_text: String,
     attachments: Vec<PathBuf>,
+    edit_generation: u64,
 }
 
 enum DraftAction {
@@ -959,6 +965,10 @@ enum DraftAction {
     Restore {
         session: String,
         pending: PendingPromptSend,
+    },
+    ClearConfirmed {
+        session: String,
+        failed: FailedPromptDraft,
     },
 }
 
@@ -971,11 +981,20 @@ fn should_clear_submitted(
     current == submitted && current_generation == sent_generation
 }
 
-fn restored_failed_text(current: &str, submitted: &str) -> String {
-    if current.starts_with(submitted) {
+fn has_restored_prompt_prefix(current: &str, submitted: &str) -> bool {
+    !submitted.is_empty()
+        && current
+            .strip_prefix(submitted)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('\n'))
+}
+
+fn restored_failed_text(current: &str, submitted: &str, original_unchanged: bool) -> String {
+    if original_unchanged {
         current.to_owned()
     } else if current.is_empty() {
         submitted.to_owned()
+    } else if submitted.is_empty() {
+        current.to_owned()
     } else {
         format!("{submitted}\n{current}")
     }
@@ -2074,6 +2093,7 @@ impl Client {
             server_version: None,
             conversations: HashMap::new(),
             loading_messages: HashMap::new(),
+            skip_prune_for_load: HashMap::new(),
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
             preserve_scroll: None,
@@ -2146,6 +2166,7 @@ impl Client {
             model_switches: HashMap::new(),
             pending_prompts: HashMap::new(),
             failed_prompt_drafts: HashMap::new(),
+            confirmed_prompt_residue: HashMap::new(),
             tray_in_flight: HashSet::new(),
             draft_actions: Vec::new(),
             composer_edit_generation: HashMap::new(),
@@ -2509,6 +2530,7 @@ impl Client {
                             this.abort_timeout_tokens.remove(&session);
                             if !this.pending_prompts.contains_key(&session) {
                                 this.local_busy.remove(&session);
+                                this.local_run_message_ids.remove(&session);
                             }
                             this.connection_status =
                                 "Stop could not confirm the run started; retry if it is still running"
@@ -2535,6 +2557,7 @@ impl Client {
         self.tab_focus.remove(id);
         self.conversations.remove(id);
         self.loading_messages.remove(id);
+        self.skip_prune_for_load.remove(id);
         self.message_events_during_load.remove(id);
         self.reload_after_load.remove(id);
         self.transcript.remove(id);
@@ -2562,14 +2585,15 @@ impl Client {
         self.attachment_drafts.remove(id);
         self.pending_prompts.remove(id);
         self.failed_prompt_drafts.remove(id);
+        self.confirmed_prompt_residue.remove(id);
         self.local_busy.remove(id);
         self.local_run_message_ids.remove(id);
         self.deferred_abort.remove(id);
         self.abort_timeout_tokens.remove(id);
         self.draft_actions.retain(|action| match action {
-            DraftAction::Clear { session, .. } | DraftAction::Restore { session, .. } => {
-                session != id
-            }
+            DraftAction::Clear { session, .. }
+            | DraftAction::Restore { session, .. }
+            | DraftAction::ClearConfirmed { session, .. } => session != id,
         });
         self.composer_edit_generation.remove(id);
         self.prune_owned_pastes();
@@ -2921,6 +2945,7 @@ impl Client {
         self.prune_owned_pastes();
         self.model_switches.clear();
         self.failed_prompt_drafts.clear();
+        self.confirmed_prompt_residue.clear();
         self.draft_actions.clear();
         self.composer_edit_generation.clear();
         self.local_busy.clear();
@@ -2938,6 +2963,7 @@ impl Client {
         self.pending_jump = None;
         self.conversations.clear();
         self.loading_messages.clear();
+        self.skip_prune_for_load.clear();
         self.message_events_during_load.clear();
         self.reload_after_load.clear();
         self.preserve_scroll = None;
@@ -3888,6 +3914,45 @@ impl Client {
         });
     }
 
+    fn resolve_late_prompt_confirmation(&mut self, session: &str) {
+        let failed_id = self
+            .failed_prompt_drafts
+            .get(session)
+            .map(|failed| failed.message_id.clone())
+            .or_else(|| {
+                self.draft_actions.iter().find_map(|action| match action {
+                    DraftAction::Restore {
+                        session: id,
+                        pending,
+                    } if id == session => Some(pending.message_id.clone()),
+                    _ => None,
+                })
+            });
+        let Some(message_id) = failed_id else { return };
+        if !self
+            .conversations
+            .get(session)
+            .is_some_and(|conversation| conversation.has_confirmed_user_message(&message_id))
+        {
+            return;
+        }
+        self.draft_actions.retain(|action| {
+            !matches!(action,
+            DraftAction::Restore { session: id, pending }
+                if id == session && pending.message_id == message_id)
+        });
+        if let Some(failed) = self.failed_prompt_drafts.remove(session) {
+            self.draft_actions.push(DraftAction::ClearConfirmed {
+                session: session.to_owned(),
+                failed,
+            });
+        } else {
+            // The failure's Restore action was cancelled before it painted;
+            // the upload worker has finished and no draft owns its temp file.
+            self.prune_owned_pastes();
+        }
+    }
+
     fn act_on_tray(&mut self, inbox_id: String, request: InboxRequest, cx: &mut Context<Self>) {
         if self.tray_in_flight.contains(&inbox_id) {
             return;
@@ -3916,13 +3981,35 @@ impl Client {
         {
             return;
         }
-        let Some(api) = &self.api else {
+        let Some(api) = self.api.clone() else {
             return;
         };
         if let Err(error) = opencode_gpui::api::check_attachments(&self.attachments_draft) {
             self.connection_status = format!("Cannot send attachment: {error}");
             cx.notify();
             return;
+        }
+        if let Some(failed) = self.failed_prompt_drafts.get(&self.active)
+            && (text != failed.text || self.attachments_draft != failed.attachments)
+            && (has_restored_prompt_prefix(&text, &failed.text)
+                || (failed.text.is_empty()
+                    && !failed.attachments.is_empty()
+                    && self.attachments_draft.starts_with(&failed.attachments)))
+        {
+            self.connection_status = "Previous send may have succeeded; retry it unchanged or remove it from this draft before sending new text".into();
+            cx.notify();
+            return;
+        }
+        if let Some(confirmed) = self.confirmed_prompt_residue.get(&self.active) {
+            if has_restored_prompt_prefix(&text, &confirmed.text)
+                || (!confirmed.attachments.is_empty()
+                    && self.attachments_draft.starts_with(&confirmed.attachments))
+            {
+                self.connection_status = "The earlier prompt was delivered; remove its text or files from this edited draft before sending".into();
+                cx.notify();
+                return;
+            }
+            self.confirmed_prompt_residue.remove(&self.active);
         }
         self.next_prompt_request_id += 1;
         let request_id = self.next_prompt_request_id;
@@ -3953,6 +4040,20 @@ impl Client {
             .iter()
             .filter_map(|path| self.owned_pastes.get(path).cloned())
             .collect();
+        let session = self.active.clone();
+        if self
+            .conversations
+            .entry(session.clone())
+            .or_default()
+            .add_local_prompt(
+                &pending.message_id,
+                &pending.text,
+                &pending.attachments,
+                delivery,
+            )
+        {
+            self.update_transcript(&session);
+        }
         api.send(Command::SendPrompt {
             request_id,
             message_id,
@@ -3988,6 +4089,11 @@ impl Client {
             && self.api.is_some()
             && has_input
             && !self.pending_prompts.contains_key(&self.active)
+            && !self.deferred_abort.contains(&self.active)
+            && !self.draft_actions.iter().any(|action| {
+                matches!(action,
+                DraftAction::ClearConfirmed { session, .. } if session == &self.active)
+            })
             && self.visible_permission().is_none()
             && model.is_some_and(|option| {
                 self.attachments_draft.is_empty() || option.supports_attachments
@@ -4522,6 +4628,13 @@ impl Client {
                     if self.open_tabs.contains(&session_id) {
                         match result {
                             Ok(page) => {
+                                let protected = if cursor.is_none() {
+                                    self.skip_prune_for_load
+                                        .remove(&session_id)
+                                        .unwrap_or_default()
+                                } else {
+                                    HashSet::new()
+                                };
                                 if cursor.is_some() && self.active == session_id {
                                     self.preserve_scroll = self.transcript_anchor();
                                     self.follow_bottom = None;
@@ -4534,6 +4647,14 @@ impl Client {
                                     conversation.replace_from_api(&page.messages, page.next_cursor);
                                     if let Some(queued) = page.queued {
                                         conversation.sync_queued(&queued);
+                                        let mut in_flight: HashSet<String> = self
+                                            .pending_prompts
+                                            .get(&session_id)
+                                            .map(|pending| pending.message_id.clone())
+                                            .into_iter()
+                                            .collect();
+                                        in_flight.extend(protected);
+                                        conversation.prune_unlisted_local_prompts(&in_flight);
                                     }
                                 }
                                 if cursor.is_none() {
@@ -4550,11 +4671,15 @@ impl Client {
                                 }
                                 self.update_transcript(&session_id);
                                 self.maybe_dispatch_deferred_abort(&session_id);
+                                self.resolve_late_prompt_confirmation(&session_id);
                             }
                             Err(MessageLoadError::SessionNotFound) => {
                                 self.close_tab(&session_id, cx);
                             }
                             Err(error) => {
+                                if cursor.is_none() {
+                                    self.skip_prune_for_load.remove(&session_id);
+                                }
                                 self.connection_status =
                                     format!("History failed ({session_id}): {error}");
                                 if !reload {
@@ -4696,6 +4821,17 @@ impl Client {
                             for path in &pending.attachments {
                                 self.cleanup_owned_paste(path);
                             }
+                            if self
+                                .loading_messages
+                                .get(&session_id)
+                                .is_some_and(Option::is_none)
+                            {
+                                self.skip_prune_for_load
+                                    .entry(session_id.clone())
+                                    .or_default()
+                                    .insert(pending.message_id.clone());
+                                self.request_newest(&session_id);
+                            }
                             if self.deferred_abort.contains(&session_id) {
                                 // Inbox acceptance is not evidence that the
                                 // run has started. Abort only after a Busy
@@ -4704,20 +4840,53 @@ impl Client {
                             }
                         }
                         Err(error) => {
-                            if pending.delivery.is_none()
-                                && self.local_run_message_ids.get(&session_id)
-                                    == Some(&pending.message_id)
+                            if self
+                                .conversations
+                                .get(&session_id)
+                                .is_some_and(|conversation| {
+                                    conversation.has_confirmed_user_message(&pending.message_id)
+                                })
                             {
-                                self.local_busy.remove(&session_id);
-                                self.local_run_message_ids.remove(&session_id);
-                                self.deferred_abort.remove(&session_id);
-                                self.abort_timeout_tokens.remove(&session_id);
+                                self.connection_status = format!(
+                                    "Send response failed, but server received prompt: {error}"
+                                );
+                                for path in &pending.attachments {
+                                    self.cleanup_owned_paste(path);
+                                }
+                                if self.deferred_abort.contains(&session_id) {
+                                    self.request_bootstrap();
+                                }
+                            } else {
+                                if self.conversations.get_mut(&session_id).is_some_and(
+                                    |conversation| {
+                                        conversation
+                                            .remove_unconfirmed_local_prompt(&pending.message_id)
+                                    },
+                                ) {
+                                    self.update_transcript(&session_id);
+                                }
+                                if pending.delivery.is_none()
+                                    && self.local_run_message_ids.get(&session_id)
+                                        == Some(&pending.message_id)
+                                {
+                                    if self.deferred_abort.contains(&session_id) {
+                                        // A failed HTTP response may have been
+                                        // lost after server acceptance. Keep
+                                        // the user's Stop request until SSE or
+                                        // a bounded refresh proves ownership.
+                                        self.request_bootstrap();
+                                    } else {
+                                        self.local_busy.remove(&session_id);
+                                        self.local_run_message_ids.remove(&session_id);
+                                        self.abort_timeout_tokens.remove(&session_id);
+                                    }
+                                }
+                                self.connection_status = format!("Send failed: {error}");
+                                self.draft_actions.push(DraftAction::Restore {
+                                    session: session_id,
+                                    pending,
+                                });
                             }
-                            self.connection_status = format!("Send failed: {error}");
-                            self.draft_actions.push(DraftAction::Restore {
-                                session: session_id,
-                                pending,
-                            });
                         }
                     }
                 }
@@ -4839,16 +5008,19 @@ impl Client {
                                 self.pending_jump = None;
                             }
                             self.composers.remove(&id);
+                            self.skip_prune_for_load.remove(&id);
                             self.attachment_drafts.remove(&id);
                             self.pending_prompts.remove(&id);
                             self.failed_prompt_drafts.remove(&id);
+                            self.confirmed_prompt_residue.remove(&id);
                             self.local_busy.remove(&id);
                             self.local_run_message_ids.remove(&id);
                             self.deferred_abort.remove(&id);
                             self.abort_timeout_tokens.remove(&id);
                             self.draft_actions.retain(|action| match action {
                                 DraftAction::Clear { session, .. }
-                                | DraftAction::Restore { session, .. } => session != &id,
+                                | DraftAction::Restore { session, .. }
+                                | DraftAction::ClearConfirmed { session, .. } => session != &id,
                             });
                             self.composer_edit_generation.remove(&id);
                             self.unread.remove(&id);
@@ -4872,6 +5044,28 @@ impl Client {
                     {
                         self.update_transcript(id);
                         self.maybe_dispatch_deferred_abort(id);
+                    }
+                    if matches!(
+                        kind,
+                        protocol::EventKind::InboxEnqueued(_)
+                            | protocol::EventKind::InboxDelivered(_)
+                    ) && let Some(id) = kind.session_id()
+                    {
+                        self.resolve_late_prompt_confirmation(id);
+                    }
+                    if let protocol::EventKind::InboxDelivered(data) = &kind
+                        && self.open_tabs.contains(&data.session_id)
+                        && self
+                            .conversations
+                            .get(&data.session_id)
+                            .is_none_or(|conversation| {
+                                !conversation.has_user_message(&data.inbox_id)
+                                    || conversation.needs_canonical_user_message(&data.inbox_id)
+                            })
+                    {
+                        // Delivery may outlive a missed enqueue event. History
+                        // reconciles the user row and any ambiguous retry.
+                        self.request_newest(&data.session_id);
                     }
                     if let Some(job_event) =
                         jobs::job_event(&event, &kind, envelope.directory.as_deref())
@@ -5057,6 +5251,7 @@ impl Client {
             server_version: None,
             conversations,
             loading_messages: HashMap::new(),
+            skip_prune_for_load: HashMap::new(),
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
             preserve_scroll: None,
@@ -5133,6 +5328,7 @@ impl Client {
             model_switches: HashMap::new(),
             pending_prompts: HashMap::new(),
             failed_prompt_drafts: HashMap::new(),
+            confirmed_prompt_residue: HashMap::new(),
             tray_in_flight: HashSet::new(),
             draft_actions: Vec::new(),
             composer_edit_generation: HashMap::new(),
@@ -8624,6 +8820,54 @@ impl Render for Client {
             let (session, pending, restore) = match action {
                 DraftAction::Clear { session, pending } => (session, pending, false),
                 DraftAction::Restore { session, pending } => (session, pending, true),
+                DraftAction::ClearConfirmed { session, failed } => {
+                    let composer = if session == self.active {
+                        Some(self.composer.clone())
+                    } else {
+                        self.composers.get(&session).cloned()
+                    };
+                    if let Some(composer) = composer {
+                        let current = composer.read(cx).value().to_string();
+                        let unchanged = should_clear_submitted(
+                            &current,
+                            &failed.restored_text,
+                            self.composer_edit_generation
+                                .get(&session)
+                                .copied()
+                                .unwrap_or_default(),
+                            failed.edit_generation,
+                        );
+                        let attachments = if session == self.active {
+                            &mut self.attachments_draft
+                        } else {
+                            self.attachment_drafts.entry(session.clone()).or_default()
+                        };
+                        if unchanged && attachments.starts_with(&failed.attachments) {
+                            let remaining = if failed.text.is_empty() {
+                                current.clone()
+                            } else {
+                                let suffix = current.strip_prefix(&failed.text).unwrap_or(&current);
+                                suffix.strip_prefix('\n').unwrap_or(suffix).to_owned()
+                            };
+                            attachments.drain(..failed.attachments.len());
+                            if remaining != current {
+                                composer
+                                    .update(cx, |input, cx| input.set_value(remaining, window, cx));
+                            }
+                            for path in failed.attachments {
+                                self.cleanup_owned_paste(&path);
+                            }
+                        } else if has_restored_prompt_prefix(&current, &failed.text)
+                            || (!failed.attachments.is_empty()
+                                && attachments.starts_with(&failed.attachments))
+                        {
+                            self.confirmed_prompt_residue.insert(session, failed);
+                            self.connection_status =
+                                "Earlier prompt delivered; review edited draft to avoid resending it".into();
+                        }
+                    }
+                    continue;
+                }
             };
             let composer = if session == self.active {
                 Some(self.composer.clone())
@@ -8647,7 +8891,16 @@ impl Render for Client {
                 // Submitted files moved out of the session draft at enqueue.
                 continue;
             }
-            let restored = restored_failed_text(&current, &pending.text);
+            let original_unchanged = should_clear_submitted(
+                &current,
+                &pending.text,
+                self.composer_edit_generation
+                    .get(&session)
+                    .copied()
+                    .unwrap_or_default(),
+                pending.edit_generation,
+            );
+            let restored = restored_failed_text(&current, &pending.text, original_unchanged);
             if restored != current {
                 composer.update(cx, |input, cx| {
                     input.set_value(restored.clone(), window, cx);
@@ -8661,18 +8914,20 @@ impl Render for Client {
             let mut restored_files = pending.attachments.clone();
             restored_files.append(attachments);
             *attachments = restored_files;
-            if restored == pending.text && *attachments == pending.attachments {
-                self.failed_prompt_drafts.insert(
-                    session.clone(),
-                    FailedPromptDraft {
-                        message_id: pending.message_id,
-                        text: pending.text,
-                        attachments: pending.attachments,
-                    },
-                );
-            } else {
-                self.failed_prompt_drafts.remove(&session);
-            }
+            self.failed_prompt_drafts.insert(
+                session.clone(),
+                FailedPromptDraft {
+                    message_id: pending.message_id,
+                    text: pending.text,
+                    restored_text: restored,
+                    attachments: pending.attachments,
+                    edit_generation: self
+                        .composer_edit_generation
+                        .get(&session)
+                        .copied()
+                        .unwrap_or_default(),
+                },
+            );
         }
         self.guard_unmeasured_scroll(window);
         if self.preserve_scroll.is_none()
@@ -8863,6 +9118,19 @@ mod tests {
     use opencode_gpui::persist::PersistedState;
     use opencode_gpui::protocol;
     use serde_json::json;
+
+    fn inbox_enqueued(session: &str, id: &str, text: &str) -> UiEvent {
+        UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+            directory: Some("/repo".into()),
+            payload: json!({
+                "id": format!("evt_{id}"), "created": 1234,
+                "type": "session.inbox.enqueued",
+                "data": { "sessionID": session, "inboxID": id,
+                    "item": { "type": "user", "payload": { "text": text },
+                        "delivery": "steer" } }
+            }),
+        })
+    }
 
     fn snapshot(conversation: &mut model::Conversation, values: Vec<serde_json::Value>) {
         conversation.replace_from_api(
@@ -11316,6 +11584,52 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn late_confirmed_paste_before_restore_render_releases_ui_file_owner(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        let clipboard = ClipboardItem::new_image(&Image::from_bytes(
+            ImageFormat::Png,
+            vec![137, 80, 78, 71, 13, 10, 26, 10],
+        ));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                let session = client.active.clone();
+                assert!(client.paste_attachments(&session, &clipboard, cx));
+                let path = client.attachments_draft[0].clone();
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Err("response lost".into()),
+                    },
+                    cx,
+                );
+                client.handle_live_event(inbox_enqueued(&session, &pending.message_id, ""), cx);
+                assert!(!client.owned_pastes.contains_key(&path));
+                assert!(
+                    !client
+                        .draft_actions
+                        .iter()
+                        .any(|action| matches!(action, super::DraftAction::Restore { .. }))
+                );
+            });
+            window.render_frame(cx);
+            assert!(client.read(cx).attachments_draft.is_empty());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn pending_failed_paste_restoration_survives_other_tab_cleanup(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
@@ -12938,6 +13252,381 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn late_confirmation_before_failed_draft_render_cancels_restoration(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("sent", window, cx));
+                let session = client.active.clone();
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Err("response lost".into()),
+                    },
+                    cx,
+                );
+                assert!(
+                    client
+                        .draft_actions
+                        .iter()
+                        .any(|action| matches!(action, super::DraftAction::Restore { .. }))
+                );
+                client.handle_live_event(inbox_enqueued(&session, &pending.message_id, "sent"), cx);
+                assert!(
+                    !client
+                        .draft_actions
+                        .iter()
+                        .any(|action| matches!(action, super::DraftAction::Restore { .. }))
+                );
+            });
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).composer.read(cx).value().as_ref(), "");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn stale_history_before_post_acceptance_cannot_prune_local_prompt(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                let session = client.active.clone();
+                client.loading_messages.insert(session.clone(), None);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("sent", window, cx));
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Ok(()),
+                    },
+                    cx,
+                );
+                assert!(client.skip_prune_for_load[&session].contains(&pending.message_id));
+                let empty_page = || opencode_gpui::api::MessagePage {
+                    messages: vec![],
+                    next_cursor: None,
+                    queued: Some(vec![]),
+                };
+                client.handle_live_event(
+                    UiEvent::MessagesLoaded {
+                        session_id: session.clone(),
+                        cursor: None,
+                        result: Ok(empty_page()),
+                    },
+                    cx,
+                );
+                assert!(client.conversations[&session].has_user_message(&pending.message_id));
+                assert!(
+                    client.loading_messages.contains_key(&session),
+                    "acceptance schedules a fresh post-send history load"
+                );
+                client.handle_live_event(
+                    UiEvent::MessagesLoaded {
+                        session_id: session.clone(),
+                        cursor: None,
+                        result: Ok(empty_page()),
+                    },
+                    cx,
+                );
+                assert!(
+                    !client.conversations[&session].has_user_message(&pending.message_id),
+                    "a fresh authoritative empty snapshot removes a canceled ghost"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn late_confirmation_never_strips_a_new_draft_sharing_the_old_prefix(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("hi", window, cx));
+                client.send_prompt(false, cx);
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                let pending = client.pending_prompts[&session].clone();
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("high priority", window, cx));
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Err("response lost".into()),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                client.read(cx).composer.read(cx).value().as_ref(),
+                "hi\nhigh priority"
+            );
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                let id = client.failed_prompt_drafts[&session].message_id.clone();
+                client.handle_live_event(inbox_enqueued(&session, &id, "hi"), cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                client.read(cx).composer.read(cx).value().as_ref(),
+                "high priority"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn merged_failed_draft_waits_for_confirmation_then_keeps_new_text(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("A", window, cx));
+                client.send_prompt(false, cx);
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                let pending = client.pending_prompts[&session].clone();
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("B", window, cx));
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session,
+                        result: Err("ambiguous failure".into()),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).composer.read(cx).value().as_ref(), "A\nB");
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                let failed_id = client.failed_prompt_drafts[&session].message_id.clone();
+                client.send_prompt(false, cx);
+                assert!(
+                    !client.pending_prompts.contains_key(&session),
+                    "must not send A twice"
+                );
+                client.handle_live_event(inbox_enqueued(&session, &failed_id, "A"), cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).composer.read(cx).value().as_ref(), "B");
+            client.update(cx, |client, cx| {
+                client.send_prompt(false, cx);
+                assert!(client.pending_prompts.contains_key(&client.active));
+                assert_eq!(client.pending_prompts[&client.active].text, "B");
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn late_confirmation_preserves_an_edited_restored_draft(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("sent", window, cx));
+                let session = client.active.clone();
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session,
+                        result: Err("response lost".into()),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).composer.read(cx).value().as_ref(), "sent");
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                let id = client.failed_prompt_drafts[&session].message_id.clone();
+                client.composer.update(cx, |input, cx| {
+                    input.set_value("sentry priority", window, cx)
+                });
+                client.handle_live_event(inbox_enqueued(&session, &id, "sent"), cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                client.read(cx).composer.read(cx).value().as_ref(),
+                "sentry priority"
+            );
+            client.update(cx, |client, cx| {
+                client.send_prompt(false, cx);
+                assert_eq!(
+                    client.pending_prompts[&client.active].text,
+                    "sentry priority"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn optimistic_prompt_reconciles_with_sse_without_premature_stop(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client.composer.update(cx, |input, cx| {
+                    input.set_value("Immediate feedback", window, cx);
+                });
+                let session = client.active.clone();
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                assert_eq!(
+                    client.transcript[&session]
+                        .iter()
+                        .filter(|row| row.key.message_id == pending.message_id)
+                        .count(),
+                    1
+                );
+                assert!(
+                    !client.conversations[&session].has_delivered_user_message(&pending.message_id)
+                );
+                client.stop_active(cx);
+                client.update_tab_status(session.clone(), RunStatus::Busy);
+                assert!(client.deferred_abort.contains(&session));
+
+                let event = |kind: &str, data: serde_json::Value| {
+                    UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                        directory: Some("/repo".into()),
+                        payload: json!({"id": format!("evt_{kind}"), "created": 1234,
+                            "type": kind, "data": data}),
+                    })
+                };
+                client.handle_live_event(
+                    event(
+                        "session.inbox.enqueued",
+                        json!({
+                            "sessionID": session, "inboxID": pending.message_id,
+                            "item": {"type": "user", "payload": {"text": "Immediate feedback"},
+                                "delivery": "steer"}
+                        }),
+                    ),
+                    cx,
+                );
+                assert_eq!(
+                    client.transcript[&session]
+                        .iter()
+                        .filter(|row| row.key.message_id == pending.message_id)
+                        .count(),
+                    0
+                );
+                assert!(client.deferred_abort.contains(&session));
+                client.handle_live_event(
+                    event(
+                        "session.inbox.delivered",
+                        json!({
+                            "sessionID": session, "inboxID": pending.message_id,
+                        }),
+                    ),
+                    cx,
+                );
+                assert!(
+                    client.conversations[&session].has_delivered_user_message(&pending.message_id)
+                );
+                assert!(!client.deferred_abort.contains(&session));
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Err("lost HTTP response".into()),
+                    },
+                    cx,
+                );
+                assert!(!client.draft_actions.iter().any(|action| matches!(action,
+                    super::DraftAction::Restore { session: id, .. } if id == &session)));
+                assert_eq!(
+                    client.transcript[&session]
+                        .iter()
+                        .filter(|row| row.key.message_id == pending.message_id)
+                        .count(),
+                    1
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn replacing_the_composer_before_send_clear_never_discards_new_text(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
@@ -12964,6 +13653,120 @@ mod tests {
                 client.read(cx).composer.read(cx).value().as_ref(),
                 "high priority"
             );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn ambiguous_send_failure_keeps_earlier_stop_until_own_delivery(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("slow", window, cx));
+                let session = client.active.clone();
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                client.stop_active(cx);
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Err("timeout".into()),
+                    },
+                    cx,
+                );
+                assert!(client.deferred_abort.contains(&session));
+                assert!(client.local_busy.contains(&session));
+                assert!(!client.can_send(cx));
+                let UiEvent::ServerEvent(enqueued) =
+                    inbox_enqueued(&session, &pending.message_id, "slow")
+                else {
+                    unreachable!();
+                };
+                assert!(
+                    client
+                        .conversations
+                        .get_mut(&session)
+                        .unwrap()
+                        .apply_event(&enqueued.payload)
+                );
+                client
+                    .conversations
+                    .get_mut(&session)
+                    .unwrap()
+                    .apply_event(&json!({
+                        "id": "evt_delivered_late", "created": 2000,
+                        "type": "session.inbox.delivered",
+                        "data": {"sessionID": session, "inboxID": pending.message_id}
+                    }));
+                assert!(
+                    client.conversations[&session].has_delivered_user_message(&pending.message_id)
+                );
+                client.update_tab_status(session.clone(), RunStatus::Busy);
+                assert!(!client.deferred_abort.contains(&session));
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn failed_follow_up_does_not_retire_first_runs_local_busy(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("First", window, cx));
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&client.active].clone();
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: client.active.clone(),
+                        result: Ok(()),
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("Follow-up", window, cx));
+                client.send_prompt(true, cx);
+                let pending = client.pending_prompts[&client.active].clone();
+                assert_eq!(pending.delivery, Some(protocol::Delivery::Queue));
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: client.active.clone(),
+                        result: Err("queue failed".into()),
+                    },
+                    cx,
+                );
+                assert!(client.local_busy.contains(&client.active));
+                assert!(client.is_running(&client.active));
+            });
         })
         .unwrap();
     }
@@ -13011,22 +13814,7 @@ mod tests {
                     "stale Idle must not hide local Busy"
                 );
                 assert!(client.deferred_abort.contains(&client.active));
-                client.composer.update(cx, |input, cx| {
-                    input.set_value("Follow-up", window, cx);
-                });
-                client.send_prompt(true, cx);
-                let follow_up = client.pending_prompts[&client.active].clone();
-                assert_eq!(follow_up.delivery, Some(protocol::Delivery::Queue));
-                client.handle_live_event(
-                    super::UiEvent::PromptAccepted {
-                        request_id: follow_up.request_id,
-                        session_id: client.active.clone(),
-                        result: Err("queue failed".into()),
-                    },
-                    cx,
-                );
                 assert!(client.local_busy.contains(&client.active));
-                assert!(client.deferred_abort.contains(&client.active));
                 client.update_tab_status(client.active.clone(), RunStatus::Busy);
                 assert!(
                     client.deferred_abort.contains(&client.active),
@@ -13073,9 +13861,6 @@ mod tests {
                 assert!(client.pending_prompts.contains_key(&client.active));
                 assert_eq!(client.composer.read(cx).value().as_ref(), "First draft");
             });
-            let first_id = client.read(cx).pending_prompts[&client.read(cx).active]
-                .message_id
-                .clone();
             window.render_frame(cx);
             assert_eq!(client.read(cx).composer.read(cx).value().as_ref(), "");
             client.update(cx, |client, cx| {
@@ -13119,9 +13904,9 @@ mod tests {
                     client.composer.read(cx).value().as_ref(),
                     "First draft\nNew draft"
                 );
-                assert!(!client.failed_prompt_drafts.contains_key(&client.active));
+                assert!(client.failed_prompt_drafts.contains_key(&client.active));
                 client.send_prompt(false, cx);
-                assert_ne!(client.pending_prompts[&client.active].message_id, first_id);
+                assert!(!client.pending_prompts.contains_key(&client.active));
             });
         })
         .unwrap();
@@ -13129,14 +13914,20 @@ mod tests {
 
     #[test]
     fn draft_text_transitions_preserve_new_input() {
+        assert!(!super::has_restored_prompt_prefix("high priority", "hi"));
+        assert!(super::has_restored_prompt_prefix("hi\nnext", "hi"));
         assert!(!super::should_clear_submitted("high priority", "hi", 1, 1));
         assert!(!super::should_clear_submitted("hi", "hi", 2, 1));
         assert!(super::should_clear_submitted("hi", "hi", 1, 1));
-        assert_eq!(super::restored_failed_text("new", "sent"), "sent\nnew");
         assert_eq!(
-            super::restored_failed_text("sent again", "sent"),
-            "sent again"
+            super::restored_failed_text("new", "sent", false),
+            "sent\nnew"
         );
+        assert_eq!(
+            super::restored_failed_text("sent again", "sent", false),
+            "sent\nsent again"
+        );
+        assert_eq!(super::restored_failed_text("sent", "sent", true), "sent");
     }
 
     #[gpui_kit::test]

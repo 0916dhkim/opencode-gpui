@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -368,9 +370,16 @@ pub struct ChatMessage {
     context_tokens: Option<u64>,
     /// An inbox item the server has not delivered yet. Queued messages stay
     /// after every delivered one, the way the server appends the entry only
-    /// on delivery. Undelivered user prompts show in the tray
-    /// ([`Conversation::tray_items`]), not as transcript rows.
+    /// on delivery. Confirmed undelivered user prompts show in the tray
+    /// ([`Conversation::tray_items`]); only local optimistic sends briefly
+    /// appear as transcript rows before the inbox acknowledges them.
     queued: bool,
+    /// A locally submitted prompt is painted immediately, even while the
+    /// server has not yet delivered its inbox entry to the transcript.
+    optimistic: bool,
+    /// Delivery without the preceding enqueue carries no canonical file
+    /// bytes; fetch history before treating the optimistic image as final.
+    needs_canonical_history: bool,
     /// A waiting item's delivery mode (steer or queue).
     delivery: Option<protocol::Delivery>,
     note: Option<NoteSource>,
@@ -450,6 +459,8 @@ impl ChatMessage {
             error: None,
             context_tokens: None,
             queued: false,
+            optimistic: false,
+            needs_canonical_history: false,
             delivery: None,
             note: None,
         }
@@ -457,7 +468,7 @@ impl ChatMessage {
 
     /// An undelivered user prompt: a tray item, not a transcript row.
     pub fn in_tray(&self) -> bool {
-        self.queued && self.role == Role::User
+        self.queued && !self.optimistic && self.role == Role::User
     }
 
     pub fn render_revision(&self) -> u64 {
@@ -715,6 +726,65 @@ impl Conversation {
         self.cache_epoch
     }
 
+    /// Paint a submitted prompt before the POST or SSE round trip completes.
+    /// Its ID is also the eventual inbox and delivered user-message ID.
+    pub fn add_local_prompt(
+        &mut self,
+        id: &str,
+        text: &str,
+        attachments: &[PathBuf],
+        delivery: Option<protocol::Delivery>,
+    ) -> bool {
+        if self.contains(id) {
+            return false;
+        }
+        let files: Vec<_> = attachments
+            .iter()
+            .map(|path| protocol::StoredFile {
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+                mime: mime_guess::from_path(path)
+                    .first_or_octet_stream()
+                    .essence_str()
+                    .into(),
+                ..Default::default()
+            })
+            .collect();
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut message = user_chat_message(id, created, text, &files);
+        message.queued = true;
+        message.optimistic = true;
+        message.needs_canonical_history = true;
+        message.delivery = delivery;
+        self.insert_message(message);
+        true
+    }
+
+    /// A failed POST can be retried using the same ID, unless the server has
+    /// already confirmed that ID through inbox events or history.
+    pub fn remove_unconfirmed_local_prompt(&mut self, id: &str) -> bool {
+        let before = self.messages.len();
+        self.messages
+            .retain(|message| !(message.id == id && message.optimistic));
+        self.messages.len() != before
+    }
+
+    pub fn has_confirmed_user_message(&self, id: &str) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.id == id && message.role == Role::User && !message.optimistic)
+    }
+
+    pub fn needs_canonical_user_message(&self, id: &str) -> bool {
+        self.messages.iter().any(|message| {
+            message.id == id && message.role == Role::User && message.needs_canonical_history
+        })
+    }
+
     /// `entries` is one history page in chronological order (oldest first).
     /// Queued (undelivered) rows are not history, so they are kept after it
     /// until [`Conversation::sync_queued`] or live inbox events settle them.
@@ -767,8 +837,9 @@ impl Conversation {
     /// listed delivery; items no longer listed go away.
     pub fn sync_queued(&mut self, entries: &[protocol::InboxEntry]) {
         let ids: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
-        self.messages
-            .retain(|message| !message.queued || ids.contains(message.id.as_str()));
+        self.messages.retain(|message| {
+            !message.queued || message.optimistic || ids.contains(message.id.as_str())
+        });
         for entry in entries {
             if !self.enqueue(&entry.id, &entry.item, millis(entry.time.created))
                 && let Some(delivery) = item_delivery(&entry.item)
@@ -776,6 +847,16 @@ impl Conversation {
                 self.change_delivery(&entry.id, delivery);
             }
         }
+    }
+
+    /// Only after both newest history and the inbox were fetched successfully:
+    /// a local row absent from both is no longer pending on this server.
+    /// A still in-flight POST remains provisional until its reply arrives.
+    pub fn prune_unlisted_local_prompts(&mut self, in_flight: &HashSet<String>) -> bool {
+        let before = self.messages.len();
+        self.messages
+            .retain(|message| !message.optimistic || in_flight.contains(&message.id));
+        self.messages.len() != before
     }
 
     /// Undelivered user prompts of this session, oldest first: the tray.
@@ -835,9 +916,9 @@ impl Conversation {
 
     /// The prompt with this `id` was delivered (it is a transcript row).
     pub fn has_delivered_user_message(&self, id: &str) -> bool {
-        self.messages
-            .iter()
-            .any(|message| message.role == Role::User && !message.queued && message.id == id)
+        self.messages.iter().any(|message| {
+            message.role == Role::User && !message.queued && !message.optimistic && message.id == id
+        })
     }
 
     pub fn context_tokens(&self) -> Option<u64> {
@@ -1232,7 +1313,26 @@ impl Conversation {
     /// `session.inbox.enqueued`, or a row of the inbox list. The row takes
     /// the history projection of the entry the server writes on delivery.
     fn enqueue(&mut self, id: &str, item: &protocol::InboxItem, created: u64) -> bool {
-        if self.contains(id) {
+        if let Some(index) = self.messages.iter().position(|message| message.id == id) {
+            if self.messages[index].optimistic
+                && self.messages[index].queued
+                && let protocol::InboxItem::User { payload, .. } = item
+            {
+                let mut canonical = user_chat_message(id, created, &payload.text, &payload.files);
+                canonical.queued = true;
+                // Once the server confirms an inbox item, use the normal
+                // waiting tray. Keeping it in the transcript would hide the
+                // tray's switch/cancel controls for this prompt.
+                canonical.optimistic = false;
+                canonical.needs_canonical_history = false;
+                canonical.delivery = item_delivery(item);
+                let previous = &self.messages[index];
+                let changed = !previous.same_rendered_content(&canonical);
+                let was_optimistic = previous.optimistic;
+                canonical.render_revision = previous.render_revision + u64::from(changed);
+                self.messages[index] = canonical;
+                return changed || was_optimistic;
+            }
             return false;
         }
         let message = match item {
@@ -1284,6 +1384,7 @@ impl Conversation {
         };
         let mut message = self.messages.remove(index);
         message.queued = false;
+        message.optimistic = false;
         let old_created = message.created;
         if created > 0 {
             message.created = created;
@@ -3749,6 +3850,132 @@ mod tests {
             "session.message.content.updated",
             json!({ "messageID": "msg_unknown", "content": [] }),
         )));
+    }
+
+    #[test]
+    fn local_prompt_is_one_visible_row_through_enqueue_and_delivery() {
+        let mut conversation = Conversation::default();
+        let file = PathBuf::from("/work/image.png");
+        assert!(conversation.add_local_prompt(
+            "msg_local",
+            "Describe this",
+            &[file],
+            Some(protocol::Delivery::Queue),
+        ));
+        assert!(!conversation.add_local_prompt("msg_local", "duplicate", &[], None));
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(
+            row_values(&conversation)
+                .iter()
+                .any(|row| row["body"] == "Describe this\n\nAttached: image.png (image/png)")
+        );
+        assert!(conversation.tray_items().is_empty());
+        assert!(!conversation.has_delivered_user_message("msg_local"));
+        assert!(!conversation.has_confirmed_user_message("msg_local"));
+        conversation.sync_queued(&[]);
+        assert_eq!(
+            conversation.messages.len(),
+            1,
+            "stale inbox snapshot must retain local send"
+        );
+
+        let enqueued = live(
+            "session.inbox.enqueued",
+            json!({
+                "inboxID": "msg_local", "item": { "type": "user",
+                    "payload": { "text": "Describe this", "files": [
+                        { "name": "image.png", "mime": "image/png", "data": "" }
+                    ] }, "delivery": "queue" }
+            }),
+        );
+        conversation.apply_event(&enqueued);
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(conversation.has_confirmed_user_message("msg_local"));
+        assert!(!conversation.has_delivered_user_message("msg_local"));
+        assert!(!conversation.remove_unconfirmed_local_prompt("msg_local"));
+        assert_eq!(conversation.tray_items().len(), 1);
+        assert!(row_values(&conversation).is_empty());
+        let delivered = live("session.inbox.delivered", json!({"inboxID": "msg_local"}));
+        assert!(conversation.apply_event(&delivered));
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(conversation.has_delivered_user_message("msg_local"));
+        assert_eq!(
+            conversation.messages[0].created,
+            delivered["created"].as_u64().unwrap()
+        );
+        assert!(conversation.tray_items().is_empty());
+    }
+
+    #[test]
+    fn complete_history_and_inbox_drop_a_canceled_optimistic_ghost() {
+        let mut conversation = Conversation::default();
+        conversation.add_local_prompt("msg_ghost", "possibly canceled", &[], None);
+        conversation.replace_from_api(&[], None);
+        conversation.sync_queued(&[]);
+        assert!(conversation.prune_unlisted_local_prompts(&HashSet::new()));
+        assert!(!conversation.has_user_message("msg_ghost"));
+
+        conversation.add_local_prompt("msg_uploading", "still posting", &[], None);
+        conversation.replace_from_api(&[], None);
+        conversation.sync_queued(&[]);
+        assert!(
+            !conversation
+                .prune_unlisted_local_prompts(&HashSet::from(["msg_uploading".to_owned()]))
+        );
+        assert!(conversation.has_user_message("msg_uploading"));
+    }
+
+    #[test]
+    fn local_image_delivered_without_enqueue_requires_canonical_history() {
+        let mut conversation = Conversation::default();
+        conversation.add_local_prompt("msg_image", "", &[PathBuf::from("/work/image.png")], None);
+        assert!(conversation.apply_event(&live(
+            "session.inbox.delivered",
+            json!({
+                "inboxID": "msg_image"
+            })
+        )));
+        assert!(conversation.has_delivered_user_message("msg_image"));
+        assert!(conversation.needs_canonical_user_message("msg_image"));
+        assert!(conversation.messages[0].rows()[0].images.is_empty());
+        let canonical = protocol::SessionMessage::from_value(json!({
+            "id": "msg_image", "type": "user", "time": { "created": 3000 },
+            "text": "", "files": [
+                { "name": "image.png", "mime": "image/png", "data": "aGk=" }
+            ]
+        }));
+        conversation.replace_from_api(&[canonical], None);
+        assert!(!conversation.needs_canonical_user_message("msg_image"));
+        assert_eq!(conversation.messages[0].rows()[0].images.len(), 1);
+    }
+
+    #[test]
+    fn local_prompt_survives_old_history_but_reconciles_with_canonical_id() {
+        let mut conversation = Conversation::default();
+        assert!(conversation.add_local_prompt("msg_retry", "sent", &[], None));
+        let older = protocol::SessionMessage::from_value(json!({
+            "id": "msg_old", "type": "user", "time": { "created": 1000 },
+            "text": "earlier", "files": []
+        }));
+        conversation.replace_from_api(&[older], None);
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.id == "msg_retry")
+        );
+        let canonical = protocol::SessionMessage::from_value(json!({
+            "id": "msg_retry", "type": "user", "time": { "created": 2000 },
+            "text": "sent", "files": []
+        }));
+        conversation.replace_from_api(&[canonical], None);
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(conversation.has_delivered_user_message("msg_retry"));
+        assert!(!conversation.remove_unconfirmed_local_prompt("msg_retry"));
+
+        assert!(conversation.add_local_prompt("msg_failed", "retry me", &[], None));
+        assert!(conversation.remove_unconfirmed_local_prompt("msg_failed"));
+        assert!(!conversation.has_user_message("msg_failed"));
     }
 
     #[test]
