@@ -7490,15 +7490,20 @@ impl Client {
                                 .focus_visible(|style| {
                                     style.border_color(self.tone(0x2356a8, 0x78baff))
                                 })
-                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                        this.stop_active(cx);
-                                        cx.stop_propagation();
-                                    }
-                                }))
+                                .on_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, window, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            this.stop_active(cx);
+                                            this.composer.focus_handle(cx).focus(window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
                                 .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     this.stop_active(cx);
+                                    this.composer.focus_handle(cx).focus(window, cx);
                                 }))
                                 .w(px(32.))
                                 .h(px(32.))
@@ -14127,6 +14132,37 @@ mod tests {
                 assert!(client.local_busy.contains(&client.active));
                 assert!(client.is_running(&client.active));
             });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn stop_button_returns_focus_to_composer_and_keeps_shortcuts_live(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("Slow run", window, cx));
+                client.send_prompt(false, cx);
+            });
+            window.render_frame(cx);
+            window.click("stop-run", cx);
+            assert!(
+                client.read(cx).composer.focus_handle(cx).is_focused(window),
+                "a dismissed Stop control must not strand keyboard focus"
+            );
+            window.press("ctrl-t", cx);
+            assert!(matches!(client.read(cx).modal, Some(Modal::NewSession)));
         })
         .unwrap();
     }

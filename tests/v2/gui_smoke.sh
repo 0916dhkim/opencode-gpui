@@ -149,6 +149,95 @@ if [[ -n "${shots}" ]]; then
   fi
 fi
 
+if [[ "${GUI_SLOW_FLOW:-0}" == 1 ]]; then
+  # A real v2 server with a deliberately slow provider, not a fabricated UI
+  # event. Capture the optimistic/streaming phases for native visual review.
+  gpui_click 410 680
+  gpui_type "Slow GUI turn [[scenario:slow]]"
+  gpui_key Return
+  if [[ -n "${shots}" ]]; then
+    import -window "${window}" "${shots}/e2e-gui-slow-submitted.png" 2>/dev/null \
+      && pass "slow.submitted-frame" || fail "slow.submitted-frame" "capture failed"
+  fi
+  slow_piece() {
+    api GET "/api/session/${session}/message?limit=20" | python3 -c '
+import json,sys
+entries=json.load(sys.stdin)["data"]
+sys.exit(0 if any(e["type"]=="assistant" and any("slow-0" in c.get("text","")
+  for c in e.get("content",[]) if c.get("type")=="text") for e in entries) else 1)'
+  }
+  slow_complete() {
+    api GET "/api/session/${session}/message?limit=20" | python3 -c '
+import json,sys
+entries=json.load(sys.stdin)["data"]
+users=[e for e in entries if e["type"]=="user" and "Slow GUI turn" in e.get("text","")]
+done=any(e["type"]=="assistant" and any("slow-19" in c.get("text","")
+  for c in e.get("content",[]) if c.get("type")=="text") for e in entries)
+sys.exit(0 if len(users)==1 and done else 1)'
+  }
+  streaming=''
+  for _ in $(seq 1 40); do
+    if slow_piece; then streaming=1; break; fi
+    sleep 0.25
+  done
+  if [[ -n "${streaming}" ]]; then
+    pass "slow.streaming-on-real-server"
+    if [[ -n "${shots}" ]]; then
+      import -window "${window}" "${shots}/e2e-gui-slow-streaming.png" 2>/dev/null \
+        && pass "slow.streaming-frame" || fail "slow.streaming-frame" "capture failed"
+    fi
+  else
+    fail "slow.streaming-on-real-server" "no first slow text delta within 10s"
+  fi
+  complete=''
+  for _ in $(seq 1 60); do
+    if slow_complete; then complete=1; break; fi
+    sleep 0.5
+  done
+  if [[ -n "${complete}" ]]; then
+    pass "slow.one-user-and-complete-reply"
+  else
+    fail "slow.one-user-and-complete-reply" "no single delivered user and final reply within 30s"
+  fi
+  is_active() {
+    api GET /api/session/active | python3 -c '
+import json,sys
+sys.exit(0 if sys.argv[1] in json.load(sys.stdin).get("data",{}) else 1)' "${session}"
+  }
+  for _ in $(seq 1 30); do
+    if ! is_active; then break; fi
+    sleep 0.2
+  done
+  gpui_click 410 680
+  gpui_type "GUI Stop turn [[scenario:slow]]"
+  gpui_key Return
+  running=''
+  for _ in $(seq 1 30); do
+    if is_active; then running=1; break; fi
+    sleep 0.2
+  done
+  if [[ -n "${running}" ]]; then
+    pass "stop.real-run-became-active"
+    gpui_click 681 750
+    stopped=''
+    for _ in $(seq 1 25); do
+      if ! is_active; then stopped=1; break; fi
+      sleep 0.2
+    done
+    if [[ -n "${stopped}" ]]; then
+      pass "stop.gui-interrupted-before-slow-run-finished"
+    else
+      fail "stop.gui-interrupted-before-slow-run-finished" "session stayed active after Stop"
+    fi
+    if [[ -n "${shots}" ]]; then
+      import -window "${window}" "${shots}/e2e-gui-slow-stopped.png" 2>/dev/null \
+        && pass "stop.stopped-frame" || fail "stop.stopped-frame" "capture failed"
+    fi
+  else
+    fail "stop.real-run-became-active" "slow follow-up never became active"
+  fi
+fi
+
 # Exercise a second real-server GUI path, not just an API-created tab: create
 # through the project picker and verify the server and persisted active tab.
 state_file="${temporary}/config/opencode-gpui/state.json"
@@ -178,6 +267,7 @@ if [[ -n "${new_session}" ]] && api GET "/api/session/${new_session}" |
   pass "new-session.gui-created-and-persisted"
 else
   fail "new-session.gui-created-and-persisted" "no new server session became the active tab"
+  exit 1
 fi
 sleep 1
 gpui_key ctrl+1
