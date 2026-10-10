@@ -106,6 +106,9 @@ pub enum Command {
         session_id: String,
         text: String,
         attachments: Vec<PathBuf>,
+        /// Keep clipboard-owned temporary files alive until the request has
+        /// read them, even if the UI window or originating tab closes.
+        paste_lifetime: Vec<Arc<tempfile::NamedTempFile>>,
         delivery: Option<protocol::Delivery>,
     },
     /// Stop: `POST /interrupt` without `resume`, which parks every waiting
@@ -1196,12 +1199,14 @@ fn spawn_command_worker(api: Api, commands: Receiver<Command>, ui: Sender<UiEven
                     session_id,
                     text,
                     attachments,
+                    paste_lifetime,
                     delivery,
                 } => {
                     let result = api
                         .send_prompt(&session_id, message_id, text, &attachments, delivery)
                         .map(|_| ())
                         .map_err(format_error);
+                    drop(paste_lifetime);
                     UiEvent::PromptAccepted {
                         request_id,
                         session_id,

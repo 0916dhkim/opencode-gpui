@@ -1,6 +1,7 @@
 //! GPUI Kit shell backed by the v2 transport, or its deterministic preview fixture.
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
@@ -456,6 +457,7 @@ struct Client {
     composers: HashMap<String, Entity<TextareaState>>,
     attachments_draft: Vec<PathBuf>,
     attachment_drafts: HashMap<String, Vec<PathBuf>>,
+    owned_pastes: HashMap<PathBuf, Arc<tempfile::NamedTempFile>>,
     overlay: Option<String>,
     scroll: VirtualListScrollHandle,
     safe_scroll: HashMap<String, (RowLayoutStamp, Point<Pixels>)>,
@@ -2110,6 +2112,7 @@ impl Client {
             composers: HashMap::new(),
             attachments_draft: Vec::new(),
             attachment_drafts: HashMap::new(),
+            owned_pastes: HashMap::new(),
             overlay: None,
             scroll,
             safe_scroll: HashMap::new(),
@@ -2569,6 +2572,7 @@ impl Client {
             }
         });
         self.composer_edit_generation.remove(id);
+        self.prune_owned_pastes();
         self.persist_tabs();
         cx.notify();
     }
@@ -2914,6 +2918,7 @@ impl Client {
         self.attachments_draft.clear();
         self.attachment_drafts.clear();
         self.pending_prompts.clear();
+        self.prune_owned_pastes();
         self.model_switches.clear();
         self.failed_prompt_drafts.clear();
         self.draft_actions.clear();
@@ -3762,6 +3767,127 @@ impl Client {
         .detach();
     }
 
+    fn paste_attachments(
+        &mut self,
+        session: &str,
+        clipboard: &ClipboardItem,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let images: Vec<_> = clipboard
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image),
+                _ => None,
+            })
+            .collect();
+        let paths: Vec<PathBuf> = if images.is_empty() {
+            clipboard
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    ClipboardEntry::ExternalPaths(files) => Some(files.0.iter()),
+                    _ => None,
+                })
+                .flatten()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if images.is_empty() && paths.is_empty() {
+            return false;
+        }
+        // A paste callback can outlive its displayed tab. Never put an image
+        // on the session selected after the paste originated.
+        if self.active != session || self.composer_session != session {
+            return true;
+        }
+        if self
+            .selected_model()
+            .as_ref()
+            .and_then(|selection| self.catalog.find(selection))
+            .is_some_and(|model| !model.supports_attachments)
+        {
+            self.connection_status = "Selected model does not accept attachments".into();
+            cx.notify();
+            return true;
+        }
+
+        let mut staged: Vec<(PathBuf, Arc<tempfile::NamedTempFile>)> = Vec::new();
+        let result = (|| -> Result<Vec<PathBuf>, String> {
+            for image in images {
+                if image.bytes().len() > protocol::MAX_ATTACHMENT_BYTES {
+                    return Err("Pasted image exceeds the 20 MiB attachment limit".into());
+                }
+                let mut file = tempfile::Builder::new()
+                    .prefix("opencode-gpui-paste-")
+                    .suffix(&format!(".{}", image.format().extension()))
+                    .tempfile()
+                    .map_err(|error| format!("Cannot save pasted image: {error}"))?;
+                file.write_all(image.bytes())
+                    .map_err(|error| format!("Cannot save pasted image: {error}"))?;
+                staged.push((file.path().to_path_buf(), Arc::new(file)));
+            }
+            let mut combined = self.attachments_draft.clone();
+            combined.extend(paths.iter().cloned());
+            combined.extend(staged.iter().map(|(path, _)| path.clone()));
+            opencode_gpui::api::check_attachments(&combined)
+                .map_err(|error| format!("Cannot attach pasted file: {error}"))?;
+            Ok(combined)
+        })();
+        match result {
+            Ok(combined) => {
+                self.owned_pastes.extend(staged);
+                self.attachments_draft = combined;
+            }
+            Err(error) => {
+                // Dropping the staged NamedTempFiles removes every partial file.
+                self.connection_status = error;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn cleanup_owned_paste(&mut self, path: &PathBuf) {
+        if self.attachments_draft.contains(path)
+            || self
+                .attachment_drafts
+                .values()
+                .any(|draft| draft.contains(path))
+            || self
+                .pending_prompts
+                .values()
+                .any(|pending| pending.attachments.contains(path))
+            || self.draft_actions.iter().any(|action| {
+                matches!(action,
+                DraftAction::Restore { pending, .. } if pending.attachments.contains(path))
+            })
+        {
+            return;
+        }
+        self.owned_pastes.remove(path);
+    }
+
+    fn prune_owned_pastes(&mut self) {
+        self.owned_pastes.retain(|path, _| {
+            self.attachments_draft.contains(path)
+                || self
+                    .attachment_drafts
+                    .values()
+                    .any(|draft| draft.contains(path))
+                || self
+                    .pending_prompts
+                    .values()
+                    .any(|pending| pending.attachments.contains(path))
+                || self.draft_actions.iter().any(|action| {
+                    matches!(action,
+                    DraftAction::Restore { pending, .. } if pending.attachments.contains(path))
+                })
+        });
+    }
+
     fn act_on_tray(&mut self, inbox_id: String, request: InboxRequest, cx: &mut Context<Self>) {
         if self.tray_in_flight.contains(&inbox_id) {
             return;
@@ -3823,12 +3949,17 @@ impl Client {
                 .copied()
                 .unwrap_or_default(),
         };
+        let paste_lifetime = attachments
+            .iter()
+            .filter_map(|path| self.owned_pastes.get(path).cloned())
+            .collect();
         api.send(Command::SendPrompt {
             request_id,
             message_id,
             session_id: self.active.clone(),
             text,
             attachments,
+            paste_lifetime,
             delivery,
         });
         self.pending_prompts
@@ -4562,6 +4693,9 @@ impl Client {
                 {
                     match result {
                         Ok(()) => {
+                            for path in &pending.attachments {
+                                self.cleanup_owned_paste(path);
+                            }
                             if self.deferred_abort.contains(&session_id) {
                                 // Inbox acceptance is not evidence that the
                                 // run has started. Abort only after a Busy
@@ -4718,6 +4852,7 @@ impl Client {
                             });
                             self.composer_edit_generation.remove(&id);
                             self.unread.remove(&id);
+                            self.prune_owned_pastes();
                         }
                     }
                     if let Some(id) = kind.session_id()
@@ -4960,6 +5095,7 @@ impl Client {
             composers: HashMap::new(),
             attachments_draft: Vec::new(),
             attachment_drafts: HashMap::new(),
+            owned_pastes: HashMap::new(),
             overlay: if modal.is_none() && !complex_markdown {
                 overlay
             } else {
@@ -6936,6 +7072,7 @@ impl Client {
                                 });
                                 if let Some(index) = index {
                                     this.attachments_draft.remove(index);
+                                    this.cleanup_owned_paste(&target);
                                     cx.notify();
                                 }
                             }))
@@ -6943,6 +7080,8 @@ impl Client {
                     ),
             );
         }
+        let paste_owner = cx.entity();
+        let paste_session = self.active.clone();
         div()
             .mx(px(16.))
             .mb(px(17.))
@@ -6953,6 +7092,11 @@ impl Client {
             .child(
                 Textarea::new(&self.composer)
                     .aria_label("Ask OpenCode anything…")
+                    .on_paste(move |item, _, app| {
+                        paste_owner.update(app, |this, cx| {
+                            this.paste_attachments(&paste_session, item, cx)
+                        })
+                    })
                     .bordered(false)
                     .h(px(89.)),
             )
@@ -8701,8 +8845,9 @@ mod tests {
     use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc};
 
     use super::{
-        COMPLEX_MARKDOWN_PREVIEW, Client, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp,
-        SESSION_PICKER_LIMIT, TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode,
+        ApiHandle, COMPLEX_MARKDOWN_PREVIEW, Client, ClipboardItem, Image, ImageFormat,
+        MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
+        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, UiEvent,
         VirtualListScrollHandle, filter_all_sessions, filter_levels, filter_models,
         filter_new_session_projects, filter_tab_sessions, fuzzy_score, markdown_blocks, model,
         needs_new_connection, new_session_choice, picker_list_height, reorder_tab_ids,
@@ -11094,6 +11239,166 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cx.opened_url().as_deref(), Some("http://127.0.0.1:4096/"));
+    }
+
+    #[gpui_kit::test]
+    fn clipboard_image_keyboard_paste_uses_composer_attachment_hook(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = client.read(cx).composer.focus_handle(cx);
+            focus.focus(window, cx);
+            cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+                ImageFormat::Png,
+                vec![137, 80, 78, 71, 13, 10, 26, 10],
+            )));
+            window.press("ctrl-v", cx);
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).attachments_draft.len(), 1);
+            assert_eq!(client.read(cx).composer.read(cx).value().as_ref(), "");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn clipboard_image_is_session_owned_and_lives_through_upload(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        let bytes = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let image = Image::from_bytes(ImageFormat::Png, bytes.clone());
+        let clipboard = ClipboardItem::new_image(&image);
+        let (api, receiver, _) = ApiHandle::preview();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                client.api = Some(api);
+                assert!(!client.paste_attachments(
+                    &client.active.clone(),
+                    &ClipboardItem::new_string("plain text".into()),
+                    cx,
+                ));
+                assert!(client.paste_attachments("another-session", &clipboard, cx));
+                assert!(client.attachments_draft.is_empty());
+                let session = client.active.clone();
+                assert!(client.paste_attachments(&session, &clipboard, cx));
+                let path = client.attachments_draft[0].clone();
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert!(client.owned_pastes.contains_key(&path));
+                client.send_prompt(false, cx);
+                assert!(
+                    path.exists(),
+                    "file must survive until the worker encodes it"
+                );
+                let accepted = (0..8)
+                    .map(|_| receiver.recv_blocking().expect("preview worker response"))
+                    .find(|event| matches!(event, UiEvent::PromptAccepted { .. }))
+                    .expect("prompt acceptance");
+                client.handle_live_event(accepted, cx);
+                assert!(
+                    !path.exists(),
+                    "accepted upload releases the private paste file"
+                );
+                assert!(!client.owned_pastes.contains_key(&path));
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pending_failed_paste_restoration_survives_other_tab_cleanup(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        let clipboard = ClipboardItem::new_image(&Image::from_bytes(
+            ImageFormat::Png,
+            vec![137, 80, 78, 71, 13, 10, 26, 10],
+        ));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client.preview_api = true;
+                let session = client.active.clone();
+                assert!(client.paste_attachments(&session, &clipboard, cx));
+                let path = client.attachments_draft[0].clone();
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Err("transient failure".into()),
+                    },
+                    cx,
+                );
+                client.open_tabs.push("ses_unrelated".into());
+                client.close_tab("ses_unrelated", cx);
+                assert!(
+                    path.exists(),
+                    "queued restoration still owns the paste file"
+                );
+            });
+            window.render_frame(cx);
+            client.update(cx, |client, _| {
+                let path = client.attachments_draft[0].clone();
+                assert!(path.exists());
+                assert!(opencode_gpui::api::check_attachments(&[path]).is_ok());
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn closing_a_tab_keeps_upload_bytes_until_the_worker_finishes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        let clipboard = ClipboardItem::new_image(&Image::from_bytes(
+            ImageFormat::Png,
+            vec![137, 80, 78, 71, 13, 10, 26, 10],
+        ));
+        let (api, receiver, _) = ApiHandle::preview();
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.api = Some(api);
+                client.preview_api = true;
+                let session = client.active.clone();
+                assert!(client.paste_attachments(&session, &clipboard, cx));
+                let path = client.attachments_draft[0].clone();
+                let guard = client.owned_pastes[&path].clone();
+                client.send_prompt(false, cx);
+                client.close_tab(&session, cx);
+                assert!(!client.owned_pastes.contains_key(&path));
+                assert!(path.exists());
+                let accepted = (0..8)
+                    .map(|_| receiver.recv_blocking().expect("preview worker response"))
+                    .find(|event| matches!(event, UiEvent::PromptAccepted { .. }))
+                    .expect("prompt acceptance after tab close");
+                client.handle_live_event(accepted, cx);
+                drop(guard);
+                assert!(!path.exists(), "worker releases detached file after upload");
+            });
+        });
     }
 
     #[gpui_kit::test]

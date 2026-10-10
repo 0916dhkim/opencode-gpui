@@ -1175,6 +1175,7 @@ mod tests {
             session_id: ACTIVE_ID.into(),
             text: "Ship it".into(),
             attachments: Vec::new(),
+            paste_lifetime: Vec::new(),
             delivery: None,
         });
         assert!(matches!(
@@ -1272,6 +1273,7 @@ mod tests {
             session_id: RUNNING_ID.into(),
             text: "one more thing".into(),
             attachments: Vec::new(),
+            paste_lifetime: Vec::new(),
             delivery: Some(protocol::Delivery::Queue),
         });
         assert_eq!(replay(&mut state, &mut live), ["session.inbox.enqueued"]);
