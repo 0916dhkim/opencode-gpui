@@ -436,6 +436,7 @@ struct Client {
     refresh_open_tabs: bool,
     settings: SettingsFields,
     saved_active: Option<String>,
+    restored_server_state: bool,
     connection_status: String,
     disconnected: bool,
     sse_connected_once: bool,
@@ -2233,6 +2234,7 @@ impl Client {
             refresh_open_tabs: false,
             settings: SettingsFields::new(window, cx, state.clone(), config.clone()),
             saved_active: None,
+            restored_server_state: false,
             connection_status: "Connecting".into(),
             disconnected: false,
             sse_connected_once: false,
@@ -2396,6 +2398,7 @@ impl Client {
         match ApiHandle::start(config) {
             Ok((api, receiver, key)) => {
                 let saved = state.servers.get(&key);
+                client.restored_server_state = saved.is_some();
                 client.saved_active = saved.and_then(|saved| saved.active.clone());
                 client.open_tabs = saved
                     .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
@@ -2564,6 +2567,7 @@ impl Client {
             &key,
         );
         let server = self.settings.persisted.servers.entry(key).or_default();
+        self.restored_server_state = true;
         let previous_tabs = std::mem::take(&mut server.tabs);
         server.tabs = self
             .open_tabs
@@ -3203,6 +3207,7 @@ impl Client {
         self.jobs.clear();
         self.running_jobs = Jobs::default();
         let saved = persisted.servers.get(&key);
+        self.restored_server_state = saved.is_some();
         self.saved_active = saved.and_then(|saved| saved.active.clone());
         self.bootstrap_directories = saved
             .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
@@ -4813,22 +4818,40 @@ impl Client {
                         session_ids: wanted,
                     });
                 }
-                let desired = self
+                let saved_found = self
                     .saved_active
-                    .take()
-                    .filter(|id| self.sessions.iter().any(|session| &session.id == id))
-                    .or_else(|| {
-                        self.sessions
-                            .iter()
-                            .find(|session| session.id == self.active)
-                            .map(|session| session.id.clone())
-                    })
-                    .or_else(|| {
-                        self.sessions
-                            .iter()
-                            .find(|session| session.parent_id.is_none())
-                            .map(|session| session.id.clone())
-                    });
+                    .as_ref()
+                    .is_some_and(|id| self.sessions.iter().any(|session| &session.id == id));
+                // A partial snapshot may not contain the restored tab yet.
+                // Do not consume its ID, select an unrelated root, or persist
+                // that fallback before the next bootstrap completes.
+                let desired = if saved_found {
+                    self.saved_active.take()
+                } else if self.saved_active.is_some() && !data.sessions_complete {
+                    None
+                } else {
+                    self.saved_active = None;
+                    self.sessions
+                        .iter()
+                        .find(|session| session.id == self.active)
+                        .map(|session| session.id.clone())
+                        .or_else(|| {
+                            self.open_tabs
+                                .iter()
+                                .find(|id| self.sessions.iter().any(|session| &session.id == *id))
+                                .cloned()
+                        })
+                        .or_else(|| {
+                            (!self.restored_server_state && data.sessions_complete)
+                                .then(|| {
+                                    self.sessions
+                                        .iter()
+                                        .find(|session| session.parent_id.is_none())
+                                        .map(|session| session.id.clone())
+                                })
+                                .flatten()
+                        })
+                };
                 let refresh_tabs = std::mem::take(&mut self.refresh_open_tabs);
                 if refresh_tabs {
                     for id in &self.open_tabs {
@@ -4839,6 +4862,7 @@ impl Client {
                     self.catalogs.clear();
                 }
                 let first_bootstrap = !self.bootstrapped;
+                let first_selection = self.active.is_empty();
                 if let Some(id) = desired {
                     self.select_session(id);
                 } else {
@@ -4846,7 +4870,7 @@ impl Client {
                     self.catalog = ModelCatalog::default();
                 }
                 self.bootstrapped = true;
-                if first_bootstrap && !self.active.is_empty() {
+                if (first_bootstrap || first_selection) && !self.active.is_empty() {
                     // Restored tabs have no focused input yet. Once bootstrap
                     // selects the saved tab, focus its actual composer rather
                     // than leaving keyboard shortcuts on an unmounted root.
@@ -4867,7 +4891,7 @@ impl Client {
                     &mut self.unread,
                     statuses_complete,
                 );
-                if statuses_complete && self.api.is_some() {
+                if statuses_complete && data.sessions_complete && self.api.is_some() {
                     self.persist_tabs();
                 }
                 if retry_needed {
@@ -5521,6 +5545,7 @@ impl Client {
                 },
             ),
             saved_active: None,
+            restored_server_state: false,
             connection_status: "Connected · preview".into(),
             disconnected: false,
             sse_connected_once: false,
@@ -14689,6 +14714,110 @@ mod tests {
                 client.open_tabs.clear();
                 client.persist_tabs();
                 assert!(client.settings.persisted.servers[&key].tabs.is_empty());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn partial_bootstrap_waits_for_saved_active_instead_of_selecting_another_tab(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let mut fixture = super::preview::State::new();
+                let UiEvent::Bootstrap(Ok(mut partial)) =
+                    fixture.handle(opencode_gpui::api::Command::Bootstrap {
+                        sessions: vec![],
+                        directories: vec![],
+                    })
+                else {
+                    unreachable!();
+                };
+                let mut restored = partial.sessions[0].clone();
+                restored.id = "ses_restored_after_retry".into();
+                client.active.clear();
+                client.open_tabs = vec![restored.id.clone()];
+                client.saved_active = Some(restored.id.clone());
+                client.restored_server_state = true;
+                let key =
+                    opencode_gpui::api::server_key(&client.settings.current.base_url).unwrap();
+                let server = client
+                    .settings
+                    .persisted
+                    .servers
+                    .entry(key.clone())
+                    .or_default();
+                server.active = Some(restored.id.clone());
+                server.tabs = vec![opencode_gpui::persist::PersistedTab {
+                    id: restored.id.clone(),
+                    title: restored.title.clone(),
+                    directory: restored.directory.clone(),
+                }];
+                partial.sessions_complete = false;
+                partial.statuses_complete = true;
+                client.handle_live_event(UiEvent::Bootstrap(Ok(partial)), cx);
+                assert_eq!(client.saved_active.as_deref(), Some(restored.id.as_str()));
+                assert!(client.active.is_empty());
+                assert_eq!(client.open_tabs, vec![restored.id.clone()]);
+                assert_eq!(
+                    client.settings.persisted.servers[&key].active,
+                    Some(restored.id.clone())
+                );
+
+                let UiEvent::Bootstrap(Ok(mut complete)) =
+                    fixture.handle(opencode_gpui::api::Command::Bootstrap {
+                        sessions: vec![],
+                        directories: vec![],
+                    })
+                else {
+                    unreachable!();
+                };
+                complete.sessions.push(restored.clone());
+                complete.sessions_complete = true;
+                client.handle_live_event(UiEvent::Bootstrap(Ok(complete)), cx);
+                assert_eq!(client.active, restored.id);
+                assert!(client.saved_active.is_none());
+                assert!(client.focus_composer_pending);
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_last_tab_stays_closed_after_a_complete_bootstrap(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                while let Some(id) = client.open_tabs.first().cloned() {
+                    client.close_tab(&id, cx);
+                }
+                assert!(client.active.is_empty());
+                assert!(client.open_tabs.is_empty());
+                assert!(client.restored_server_state);
+                let mut fixture = super::preview::State::new();
+                let UiEvent::Bootstrap(Ok(complete)) =
+                    fixture.handle(opencode_gpui::api::Command::Bootstrap {
+                        sessions: vec![],
+                        directories: vec![],
+                    })
+                else {
+                    unreachable!();
+                };
+                client.handle_live_event(UiEvent::Bootstrap(Ok(complete)), cx);
+                assert!(client.active.is_empty());
+                assert!(client.open_tabs.is_empty());
             });
         });
     }
