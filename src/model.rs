@@ -1304,6 +1304,11 @@ impl Conversation {
     }
 
     fn ensure_message(&mut self, id: &str, role: Role) -> usize {
+        // The active assistant is normally the last message. Avoid a full
+        // history scan for every streamed text/reasoning token.
+        if self.messages.last().is_some_and(|message| message.id == id) {
+            return self.messages.len() - 1;
+        }
         if let Some(index) = self.messages.iter().position(|message| message.id == id) {
             return index;
         }

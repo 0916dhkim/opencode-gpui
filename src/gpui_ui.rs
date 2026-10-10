@@ -716,11 +716,18 @@ struct MessageSpan {
 
 impl MessageSpan {
     fn matches(&self, message: &model::ChatMessage, epoch: u64) -> bool {
+        #[cfg(test)]
+        SPAN_MATCHES.with(|count| count.set(count.get() + 1));
         self.id == message.id
             && self.revision == message.render_revision()
             && self.in_tray == message.in_tray()
             && self.epoch == epoch
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SPAN_MATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct ProjectionChange {
@@ -737,23 +744,54 @@ fn splice_transcript(
     rows: &mut Vec<TranscriptRow>,
     spans: &mut Vec<MessageSpan>,
 ) -> Option<ProjectionChange> {
+    splice_transcript_with_tail_hint(conversation, rows, spans, None)
+}
+
+fn splice_transcript_with_tail_hint(
+    conversation: &Conversation,
+    rows: &mut Vec<TranscriptRow>,
+    spans: &mut Vec<MessageSpan>,
+    tail_delta: Option<&str>,
+) -> Option<ProjectionChange> {
     let messages = &conversation.messages;
     let epoch = conversation.cache_epoch();
-    let prefix = spans
-        .iter()
-        .zip(messages)
-        .take_while(|(span, message)| span.matches(message, epoch))
-        .count();
-    let suffix = spans[prefix..]
-        .iter()
-        .rev()
-        .zip(messages[prefix..].iter().rev())
-        .take_while(|(span, message)| span.matches(message, epoch))
-        .count();
+    // Text/reasoning deltas only mutate their named assistant message. When
+    // that message is still the tail, the preceding spans were already
+    // projected and need not be compared again for every streamed token.
+    let tail_only = tail_delta.is_some_and(|id| {
+        spans.len() == messages.len()
+            && spans
+                .last()
+                .is_some_and(|span| span.id == id && span.epoch == epoch)
+            && messages.last().is_some_and(|message| message.id == id)
+    });
+    let prefix = if tail_only {
+        spans.len() - 1
+    } else {
+        spans
+            .iter()
+            .zip(messages)
+            .take_while(|(span, message)| span.matches(message, epoch))
+            .count()
+    };
+    let suffix = if tail_only {
+        0
+    } else {
+        spans[prefix..]
+            .iter()
+            .rev()
+            .zip(messages[prefix..].iter().rev())
+            .take_while(|(span, message)| span.matches(message, epoch))
+            .count()
+    };
     if prefix == spans.len() && prefix == messages.len() {
         return None;
     }
-    let start: usize = spans[..prefix].iter().map(|span| span.row_count).sum();
+    let start: usize = if tail_only {
+        rows.len() - spans.last().unwrap().row_count
+    } else {
+        spans[..prefix].iter().map(|span| span.row_count).sum()
+    };
     let end = rows.len()
         - spans[spans.len() - suffix..]
             .iter()
@@ -893,6 +931,7 @@ fn update_session_projection(
     rows: &mut Vec<TranscriptRow>,
     spans: &mut Vec<MessageSpan>,
     images: &mut ImageCache,
+    tail_delta: Option<&str>,
 ) -> Option<ProjectionChange> {
     if spans
         .first()
@@ -900,7 +939,12 @@ fn update_session_projection(
     {
         images.remove_session(session);
     }
-    splice_transcript(conversation, rows, spans).map(|mut change| {
+    let change = if tail_delta.is_some() {
+        splice_transcript_with_tail_hint(conversation, rows, spans, tail_delta)
+    } else {
+        splice_transcript(conversation, rows, spans)
+    };
+    change.map(|mut change| {
         for row in &change.old_rows {
             for index in 0..row.images.len() {
                 if let Some(image) = images.peek(session, row, index) {
@@ -4106,6 +4150,10 @@ impl Client {
     }
 
     fn update_transcript(&mut self, session_id: &str) {
+        self.update_transcript_with_tail_hint(session_id, None);
+    }
+
+    fn update_transcript_with_tail_hint(&mut self, session_id: &str, tail_delta: Option<&str>) {
         self.prepare_follow_bottom(session_id);
         let Some(conversation) = self.conversations.get(session_id) else {
             return;
@@ -4115,9 +4163,14 @@ impl Client {
             .entry(session_id.to_owned())
             .or_default();
         let rows = self.transcript.entry(session_id.to_owned()).or_default();
-        if let Some(change) =
-            update_session_projection(session_id, conversation, rows, spans, &mut self.attachments)
-            && let Some(cache) = self.row_heights.get(session_id)
+        if let Some(change) = update_session_projection(
+            session_id,
+            conversation,
+            rows,
+            spans,
+            &mut self.attachments,
+            tail_delta,
+        ) && let Some(cache) = self.row_heights.get(session_id)
         {
             let mut cache = cache.borrow_mut();
             if cache
@@ -5047,7 +5100,14 @@ impl Client {
                             .or_default()
                             .apply(&event, &kind)
                     {
-                        self.update_transcript(id);
+                        let tail_delta = match &kind {
+                            protocol::EventKind::TextDelta(data)
+                            | protocol::EventKind::ReasoningDelta(data) => {
+                                Some(data.assistant_message_id.as_str())
+                            }
+                            _ => None,
+                        };
+                        self.update_transcript_with_tail_hint(id, tail_delta);
                         self.maybe_dispatch_deferred_abort(id);
                     }
                     if matches!(
@@ -5199,6 +5259,7 @@ impl Client {
                     &mut rows,
                     &mut spans,
                     &mut attachments,
+                    None,
                 );
                 transcript.insert(session.id.clone(), rows);
                 transcript_spans.insert(session.id.clone(), spans);
@@ -6733,7 +6794,6 @@ impl Client {
                                 .map(|old| (index, old.clone()))
                         })
                         .collect::<HashMap<_, _>>();
-                    let missing = ready.iter().filter(|ready| !**ready).count();
                     let viewport_height = if self.scroll.bounds().size.height > px(0.) {
                         self.scroll.bounds().size.height
                     } else {
@@ -6770,10 +6830,11 @@ impl Client {
                             },
                         )
                         && safe_partial;
-                    if transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
-                        && ((anchor_unmeasured && !parked_at_safe_viewport)
-                            || (missing > 4 && !safe_partial))
-                    {
+                    // A single newly appended visible row has no stale
+                    // snapshot. Do not paint an empty provisional virtual
+                    // slot for one frame; use the bounded natural slice until
+                    // its exact height is available.
+                    if (anchor_unmeasured && !parked_at_safe_viewport) || !safe_partial {
                         return None;
                     }
                     let sizes = if ready.iter().all(|ready| *ready) {
@@ -9157,6 +9218,125 @@ mod tests {
     }
 
     #[test]
+    fn streaming_tail_splice_skips_ten_thousand_unchanged_message_spans() {
+        let mut conversation = model::Conversation::default();
+        snapshot(
+            &mut conversation,
+            (0..10_000)
+                .map(|index| {
+                    json!({
+                        "id": format!("history_{index}"), "type": "user",
+                        "time": { "created": index + 1 }, "text": "Earlier turn"
+                    })
+                })
+                .collect(),
+        );
+        let mut rows = Vec::new();
+        let mut spans = Vec::new();
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        let delta = |id: &str, text: &str| {
+            json!({
+                "id": id, "created": 20000, "type": "session.text.delta",
+                "data": { "sessionID": "ses_a", "assistantMessageID": "stream_tail",
+                    "ordinal": 0, "delta": text }
+            })
+        };
+        assert!(conversation.apply_event(&delta("evt_00000000000000000000000001", "First")));
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        super::SPAN_MATCHES.with(|count| count.set(0));
+        assert!(conversation.apply_event(&delta("evt_00000000000000000000000002", " second")));
+        let change = super::splice_transcript_with_tail_hint(
+            &conversation,
+            &mut rows,
+            &mut spans,
+            Some("stream_tail"),
+        )
+        .unwrap();
+        assert_eq!(change.range, 10_000..10_001);
+        assert_eq!(
+            super::SPAN_MATCHES.with(|count| count.get()),
+            0,
+            "streamed tail tokens must not rescan the history prefix"
+        );
+        assert_eq!(rows, full_rows(&conversation));
+
+        // A later queued item makes the assistant no longer the tail; fall
+        // back to the generic splice rather than silently reusing bad indices.
+        assert!(conversation.apply_event(&json!({
+            "id": "evt_00000000000000000000000003", "created": 20001,
+            "type": "session.inbox.enqueued",
+            "data": { "sessionID": "ses_a", "inboxID": "queued",
+                "item": { "type": "user", "payload": { "text": "later" },
+                    "delivery": "queue" } }
+        })));
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        assert!(conversation.apply_event(&delta("evt_00000000000000000000000004", " third")));
+        assert!(
+            super::splice_transcript_with_tail_hint(
+                &conversation,
+                &mut rows,
+                &mut spans,
+                Some("stream_tail"),
+            )
+            .is_some()
+        );
+        assert_eq!(rows, full_rows(&conversation));
+    }
+
+    #[gpui_kit::test]
+    fn client_stream_event_uses_tail_projection_hint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                snapshot(
+                    client.conversations.get_mut(&session).unwrap(),
+                    (0..1_000)
+                        .map(|index| {
+                            json!({
+                                "id": format!("old_{index}"), "type": "user",
+                                "time": { "created": index + 1 }, "text": "Older"
+                            })
+                        })
+                        .collect(),
+                );
+                client.update_transcript(&session);
+                let delta = |ordinal: u8, text: &str| {
+                    UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                        directory: Some("/repo".into()),
+                        payload: json!({
+                            "id": format!("evt_{ordinal:026}"), "created": 2000,
+                            "type": "session.text.delta", "data": {
+                                "sessionID": session, "assistantMessageID": "stream_tail",
+                                "ordinal": 0, "delta": text
+                            }
+                        }),
+                    })
+                };
+                client.handle_live_event(delta(1, "First"), cx);
+                super::SPAN_MATCHES.with(|count| count.set(0));
+                client.handle_live_event(delta(2, " second"), cx);
+                assert_eq!(super::SPAN_MATCHES.with(|count| count.get()), 0);
+                assert!(
+                    client.transcript[&session]
+                        .last()
+                        .unwrap()
+                        .body
+                        .contains("First second")
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn spliced_projection_matches_full_rows_for_prepend_stream_snapshot_and_queue() {
         let mut conversation = model::Conversation::default();
         let entry = |id: &str, text: &str| {
@@ -9468,13 +9648,25 @@ mod tests {
         let mut rows = Vec::new();
         let mut spans = Vec::new();
         let mut images = super::ImageCache::default();
-        let _ =
-            update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
+        let _ = update_session_projection(
+            "ses_a",
+            &conversation,
+            &mut rows,
+            &mut spans,
+            &mut images,
+            None,
+        );
         assert_eq!(rows, full_rows(&conversation));
         let before = images.get("ses_a", &rows[0], 0).unwrap().clone();
         snapshot(&mut conversation, vec![entry(encoded)]);
-        let _ =
-            update_session_projection("ses_a", &conversation, &mut rows, &mut spans, &mut images);
+        let _ = update_session_projection(
+            "ses_a",
+            &conversation,
+            &mut rows,
+            &mut spans,
+            &mut images,
+            None,
+        );
         assert_eq!(rows, full_rows(&conversation));
         assert!(!std::sync::Arc::ptr_eq(
             &before,
@@ -10015,6 +10207,85 @@ mod tests {
         assert_eq!(new_offset - old_offset, px(-55.));
         assert_eq!(new_top + new_offset, old_top + old_offset);
         assert_eq!(cache.provisional_positions(&new, true)[index], new_top);
+    }
+
+    #[gpui_kit::test]
+    fn appended_visible_row_paints_on_first_frame_without_mounting_history(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let id = client.active.clone();
+                let messages = (0..300)
+                    .map(|index| {
+                        protocol::SessionMessage::from_value(json!({
+                            "id": format!("stream_{index}"), "type": "assistant",
+                            "time": { "created": 1 },
+                            "content": [{ "type": "text", "text": "Short answer." }]
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                client
+                    .conversations
+                    .get_mut(&id)
+                    .unwrap()
+                    .replace_from_api(&messages, None);
+                client.update_transcript(&id);
+                cx.notify();
+            })
+        });
+        let render = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+        render(cx);
+        render(cx);
+        cx.update(|cx| client.read(cx).scroll.base_handle().scroll_to_bottom());
+        render(cx);
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let id = client.active.clone();
+                let event = json!({
+                    "id": "evt_00000000000000000000000005", "created": 2000,
+                    "type": "session.text.delta", "data": {
+                    "sessionID": id, "assistantMessageID": "stream_300",
+                        "ordinal": 0, "delta": "Newly streamed paragraph"
+                    }
+                });
+                assert!(
+                    client
+                        .conversations
+                        .get_mut(&id)
+                        .unwrap()
+                        .apply_event(&event)
+                );
+                client.update_transcript(&id);
+                client.rendered_rows.borrow_mut().clear();
+                cx.notify();
+            })
+        });
+        render(cx);
+        cx.update_window(handle, |_, window, cx| {
+            let client = client.read(cx);
+            let rendered = client.rendered_rows.borrow();
+            assert!(
+                rendered.contains(&300),
+                "appended row was blank on first frame"
+            );
+            assert!(
+                rendered.len() < 70,
+                "mounted offscreen history: {rendered:?}"
+            );
+            let _mounted = window.find(("message", 300usize));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
