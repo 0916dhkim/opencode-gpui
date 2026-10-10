@@ -18,6 +18,7 @@ env_logger = "0.11"
 jiff = "0.2"
 keyring = { version = "3.6", features = ["crypto-rust", "sync-secret-service"] }
 gpui-kit = "0.7.1"
+imagesize = "0.14"
 log = "0.4"
 mime_guess = "2.0"
 pulldown-cmark = { version = "0.13", default-features = false }

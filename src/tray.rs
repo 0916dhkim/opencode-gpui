@@ -278,8 +278,8 @@ pub fn tray_rows(
             id: item.id.clone(),
             delivery: item.delivery,
             summary: summary(&item.text, item.attachments),
-            sending: false,
-            in_flight: in_flight.contains(&item.id),
+            sending: item.optimistic,
+            in_flight: item.optimistic || in_flight.contains(&item.id),
         })
         .collect();
     if let Some(pending) = pending
@@ -355,6 +355,7 @@ mod tests {
             delivery,
             text: text.into(),
             attachments,
+            optimistic: false,
         }
     }
 
@@ -663,5 +664,21 @@ mod tests {
         };
         let rows = tray_rows(&[], None, Some(&accepted), &HashSet::new());
         assert!(!rows[0].sending && rows[0].in_flight);
+    }
+
+    #[test]
+    fn optimistic_tray_row_cannot_act_until_the_server_confirms_it() {
+        let mut item = item("msg_new", Delivery::Queue, "later", 0);
+        item.optimistic = true;
+        let rows = tray_rows(&[item.clone()], None, None, &HashSet::new());
+        assert!(rows[0].sending && rows[0].in_flight);
+        assert_eq!(row_request(&rows[0], RowAction::Cancel, false), None);
+        item.optimistic = false;
+        let rows = tray_rows(&[item], None, None, &HashSet::new());
+        assert!(!rows[0].sending && !rows[0].in_flight);
+        assert_eq!(
+            row_request(&rows[0], RowAction::Cancel, false),
+            Some(InboxRequest::Cancel)
+        );
     }
 }

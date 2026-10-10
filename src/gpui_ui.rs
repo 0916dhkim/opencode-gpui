@@ -78,6 +78,24 @@ fn unread_on_server_switch(
         .unwrap_or_default()
 }
 
+fn apply_missed_idle(
+    offline_busy: &mut HashSet<String>,
+    statuses: &HashMap<String, RunStatus>,
+    open_tabs: &[String],
+    unread: &mut HashSet<String>,
+    complete: bool,
+) {
+    for id in std::mem::take(offline_busy) {
+        if statuses.get(&id).is_some_and(RunStatus::is_busy)
+            || (!complete && !statuses.contains_key(&id))
+        {
+            offline_busy.insert(id);
+        } else if open_tabs.contains(&id) {
+            unread.insert(id);
+        }
+    }
+}
+
 fn model_button_presentation(
     catalog: &ModelCatalog,
     selected: Option<&ModelSelection>,
@@ -424,6 +442,7 @@ struct Client {
     server_version: Option<String>,
     conversations: HashMap<String, Conversation>,
     loading_messages: HashMap<String, Option<String>>,
+    message_load_errors: HashMap<String, Option<String>>,
     /// Locally accepted IDs while an older newest-history request was in
     /// flight. Its stale response cannot prove those sends are absent.
     skip_prune_for_load: HashMap<String, HashSet<String>>,
@@ -463,15 +482,20 @@ struct Client {
     owned_pastes: HashMap<PathBuf, Arc<tempfile::NamedTempFile>>,
     overlay: Option<String>,
     scroll: VirtualListScrollHandle,
+    transcript_content_width: Pixels,
     safe_scroll: HashMap<String, (RowLayoutStamp, Point<Pixels>)>,
     safe_anchors: HashMap<String, (RowLayoutStamp, TranscriptAnchor)>,
     pending_jump: Option<PendingTranscriptJump>,
     history_focus: FocusHandle,
+    retry_history_focus: FocusHandle,
     sessions_picker_scroll: ScrollHandle,
     picker_list_scroll: ScrollHandle,
     projects_picker_scroll: ScrollHandle,
     picker_choice_focus: HashMap<String, FocusHandle>,
     unread: HashSet<String>,
+    /// Busy tabs remembered while offline, until a complete status snapshot
+    /// can distinguish a still-running turn from a missed completion.
+    offline_busy: HashSet<String>,
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
     forms: Forms,
@@ -1461,15 +1485,58 @@ impl Element for TranscriptMeasurementProbe {
     }
 }
 
-fn timestamp(time: u64) -> String {
-    jiff::Timestamp::from_millisecond(time as i64)
+fn image_display_size(width: usize, height: usize, available_width: f32) -> (f32, f32) {
+    let (width, height) = if width == 0 || height == 0 {
+        (200, 120)
+    } else {
+        (width, height)
+    };
+    // GTK displays images at their aspect ratio, up to 640px wide and 720px
+    // high, subject to the row's actual available width.
+    let scale = (available_width.clamp(1., 640.) / width as f32)
+        .min(720. / height as f32)
+        .min(1.);
+    (width as f32 * scale, height as f32 * scale)
+}
+
+fn timestamp_in_zone(time: u64, zone: jiff::tz::TimeZone) -> String {
+    // The v2 API normally uses milliseconds, but older records may contain
+    // seconds. Match GTK's unset-time guard rather than showing the epoch.
+    let seconds = if time >= 1_000_000_000_000 {
+        time / 1000
+    } else {
+        time
+    };
+    if seconds < 1_000_000_000 {
+        return String::new();
+    }
+    jiff::Timestamp::from_second(seconds as i64)
         .map(|timestamp| {
             timestamp
-                .to_zoned(jiff::tz::TimeZone::UTC)
+                .to_zoned(zone)
                 .strftime("%Y-%m-%d %H:%M")
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+fn timestamp(time: u64) -> String {
+    timestamp_in_zone(time, jiff::tz::TimeZone::system())
+}
+
+fn connected_status(version: Option<&str>, partial: bool, settings_warning: bool) -> String {
+    let mut text = "Connected".to_owned();
+    if settings_warning {
+        text.push_str(" · Settings warning");
+    }
+    if let Some(version) = version {
+        text.push_str(" · ");
+        text.push_str(version);
+    }
+    if partial {
+        text.push_str(" · Partial refresh");
+    }
+    text
 }
 
 fn sticky_user_index(
@@ -1758,7 +1825,7 @@ fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock>
                 &mut marker,
                 lists.len(),
                 quote_depth,
-                if checked { "☑ " } else { "☐ " },
+                if checked { "[x] " } else { "[ ] " },
             ),
             Event::Rule => {
                 flush_inline(&mut blocks, &mut current);
@@ -1854,13 +1921,17 @@ fn inline_image(url: &str) -> Option<Arc<Image>> {
         "image/gif;base64" => ImageFormat::Gif,
         _ => return None,
     };
-    // Avoid decoding an unbounded server-supplied data URL on the UI thread.
-    if encoded.len() > 14_000_000 {
+    // Avoid unbounded server-supplied data without rejecting images accepted
+    // by the server's 20 MiB decoded-attachment limit.
+    if encoded.len() > opencode_gpui::protocol::MAX_ATTACHMENT_BYTES.div_ceil(3) * 4 {
         return None;
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .ok()?;
+    if bytes.len() > opencode_gpui::protocol::MAX_ATTACHMENT_BYTES {
+        return None;
+    }
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
@@ -1980,7 +2051,9 @@ impl Client {
                         block = block
                             .border_l_1()
                             .border_color(self.tone(0xb7b3ac, 0x50565b))
-                            .pl(px(10. + 12. * (quote_depth - 1) as f32))
+                            .py(px(7.))
+                            .pr(px(12.))
+                            .pl(px(12. + 14. * (quote_depth - 1) as f32))
                             .text_color(self.tone(0x555b5c, 0xb5b9bb));
                     }
                     block.child(line).into_any_element()
@@ -2052,7 +2125,9 @@ impl Client {
                         wrapper = wrapper
                             .border_l_1()
                             .border_color(self.tone(0xb7b3ac, 0x50565b))
-                            .pl(px(10. + 12. * (quote_depth - 1) as f32));
+                            .py(px(7.))
+                            .pr(px(12.))
+                            .pl(px(12. + 14. * (quote_depth - 1) as f32));
                     }
                     wrapper
                         .child(self.markdown_code_block(
@@ -2086,19 +2161,33 @@ impl Client {
             .username
             .clone()
             .unwrap_or(state.connection.username.clone());
+        let persisted_password_identity = credentials::same_password_identity(
+            &server,
+            &username,
+            &state.connection.server,
+            &state.connection.username,
+        );
         let password = credentials::initial_password(
             &SystemKeyring,
             &server,
             &username,
             args.password.clone(),
             state.connection.basic_auth_in_keyring,
-            state.connection.basic_auth_in_keyring,
+            state.connection.basic_auth_in_keyring && persisted_password_identity,
         );
+        let persisted_cloudflare_identity = opencode_gpui::api::server_key(&server)
+            .ok()
+            .zip(opencode_gpui::api::server_key(&state.connection.server).ok())
+            .is_some_and(|(current, saved)| current == saved);
+        let expect_cloudflare = state.connection.cloudflare_access
+            && persisted_cloudflare_identity
+            && args.cf_access_client_id.is_none()
+            && args.cf_access_client_secret.is_none();
         let cloudflare_access = match (&args.cf_access_client_id, &args.cf_access_client_secret) {
             (Some(id), Some(secret)) => {
                 CloudflareAccessCredentials::new(id.clone(), secret.clone()).map(Some)
             }
-            (None, None) if state.connection.cloudflare_access => credentials::load(&server),
+            (None, None) if expect_cloudflare => credentials::load(&server),
             (None, None) => Ok(None),
             _ => Err(anyhow::anyhow!(
                 "Cloudflare Access requires both client ID and secret"
@@ -2109,7 +2198,13 @@ impl Client {
             .flatten()
             .collect();
         let cloudflare_access = match cloudflare_access {
-            Ok(credentials) => credentials,
+            Ok(Some(credentials)) => Some(credentials),
+            Ok(None) => {
+                if expect_cloudflare {
+                    warnings.push("The saved Cloudflare Access token was not found in the system keyring; enter it in Settings".into());
+                }
+                None
+            }
             Err(error) => {
                 warnings.push(error.to_string());
                 None
@@ -2142,6 +2237,7 @@ impl Client {
             server_version: None,
             conversations: HashMap::new(),
             loading_messages: HashMap::new(),
+            message_load_errors: HashMap::new(),
             skip_prune_for_load: HashMap::new(),
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
@@ -2184,15 +2280,18 @@ impl Client {
             owned_pastes: HashMap::new(),
             overlay: None,
             scroll,
+            transcript_content_width: px(420.),
             safe_scroll: HashMap::new(),
             safe_anchors: HashMap::new(),
             pending_jump: None,
             history_focus: cx.focus_handle().tab_stop(true),
+            retry_history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
             projects_picker_scroll: ScrollHandle::new(),
             picker_choice_focus: HashMap::new(),
             unread: HashSet::new(),
+            offline_busy: HashSet::new(),
             statuses: HashMap::new(),
             jobs: Vec::new(),
             forms: Forms::default(),
@@ -2301,6 +2400,7 @@ impl Client {
                     .map(|saved| saved.tabs.iter().map(|tab| tab.directory.clone()).collect())
                     .unwrap_or_default();
                 client.unread = saved.map(|saved| saved.unread.clone()).unwrap_or_default();
+                client.offline_busy = saved.map(|saved| saved.busy.clone()).unwrap_or_default();
                 client.api = Some(api);
                 client.request_bootstrap();
                 cx.spawn(async move |this, cx| {
@@ -2437,18 +2537,33 @@ impl Client {
             &key,
         );
         let server = self.settings.persisted.servers.entry(key).or_default();
+        let previous_tabs = std::mem::take(&mut server.tabs);
         server.tabs = self
             .open_tabs
             .iter()
-            .filter_map(|id| self.sessions.iter().find(|session| &session.id == id))
-            .map(|session| PersistedTab {
-                id: session.id.clone(),
-                title: session.title.clone(),
-                directory: session.directory.clone(),
+            .filter_map(|id| {
+                self.sessions
+                    .iter()
+                    .find(|session| &session.id == id)
+                    .map(|session| PersistedTab {
+                        id: session.id.clone(),
+                        title: session.title.clone(),
+                        directory: session.directory.clone(),
+                    })
+                    // A partial session snapshot must not erase restored tabs
+                    // whose metadata has not been fetched yet.
+                    .or_else(|| previous_tabs.iter().find(|tab| &tab.id == id).cloned())
             })
             .collect();
         server.active = (!self.active.is_empty()).then(|| self.active.clone());
         server.unread = self.unread.clone();
+        server.busy = self
+            .statuses
+            .iter()
+            .filter(|(_, status)| status.is_busy())
+            .map(|(id, _)| id.clone())
+            .chain(self.offline_busy.iter().cloned())
+            .collect();
         if self.api.is_none() || self.preview_api {
             return;
         }
@@ -2473,24 +2588,32 @@ impl Client {
 
     fn update_tab_status(&mut self, id: String, status: RunStatus) {
         let was_busy = self.statuses.get(&id).is_some_and(RunStatus::is_busy);
-        if was_busy
-            && !status.is_busy()
-            && self.open_tabs.contains(&id)
-            && self.unread.insert(id.clone())
-        {
-            self.persist_tabs();
+        let changed_busy = was_busy != status.is_busy();
+        if was_busy && !status.is_busy() && self.open_tabs.contains(&id) {
+            self.unread.insert(id.clone());
         }
         if status.is_busy() {
             if self.local_prompt_delivered(&id) {
                 self.local_busy.remove(&id);
             }
-        } else if !self.local_busy.contains(&id) && !self.pending_prompts.contains_key(&id) {
-            self.deferred_abort.remove(&id);
-            self.abort_timeout_tokens.remove(&id);
-            self.local_run_message_ids.remove(&id);
+        } else {
+            // A reconnect can miss the entire Busy phase. Once the server has
+            // confirmed our user message and reports Idle, its status owns the
+            // run; the optimistic Busy marker must not survive indefinitely.
+            if !self.pending_prompts.contains_key(&id) && self.local_prompt_delivered(&id) {
+                self.local_busy.remove(&id);
+            }
+            if !self.local_busy.contains(&id) && !self.pending_prompts.contains_key(&id) {
+                self.deferred_abort.remove(&id);
+                self.abort_timeout_tokens.remove(&id);
+                self.local_run_message_ids.remove(&id);
+            }
         }
         self.statuses.insert(id.clone(), status);
         self.maybe_dispatch_deferred_abort(&id);
+        if changed_busy && self.open_tabs.contains(&id) {
+            self.persist_tabs();
+        }
     }
 
     fn local_prompt_delivered(&self, session: &str) -> bool {
@@ -2606,6 +2729,7 @@ impl Client {
         self.tab_focus.remove(id);
         self.conversations.remove(id);
         self.loading_messages.remove(id);
+        self.message_load_errors.remove(id);
         self.skip_prune_for_load.remove(id);
         self.message_events_during_load.remove(id);
         self.reload_after_load.remove(id);
@@ -2934,6 +3058,19 @@ impl Client {
         let previous_key = opencode_gpui::api::server_key(&old.base_url)
             .unwrap_or_else(|_| old.base_url.trim_end_matches('/').to_owned());
         ensure_canonical_server_state(&mut persisted, &old.base_url, &previous_key);
+        if next_connection.is_some() && self.api.is_some() {
+            persisted
+                .servers
+                .entry(previous_key.clone())
+                .or_default()
+                .busy = self
+                .statuses
+                .iter()
+                .filter(|(_, status)| status.is_busy())
+                .map(|(id, _)| id.clone())
+                .chain(self.offline_busy.iter().cloned())
+                .collect();
+        }
         let next_unread = next_connection.as_ref().map(|(_, _, key)| {
             ensure_canonical_server_state(&mut persisted, &server, key);
             unread_on_server_switch(
@@ -2943,6 +3080,13 @@ impl Client {
                     .map(|_| (previous_key.as_str(), &self.unread)),
                 key,
             )
+        });
+        let next_busy = next_connection.as_ref().map(|(_, _, key)| {
+            persisted
+                .servers
+                .get(key)
+                .map(|saved| saved.busy.clone())
+                .unwrap_or_default()
         });
         persisted.connection = ConnectionSettings {
             server: server.clone(),
@@ -2971,6 +3115,7 @@ impl Client {
         self.sse_connected_once = false;
         self.sessions.clear();
         self.unread = next_unread.expect("new connection has restored unread state");
+        self.offline_busy = next_busy.expect("new connection has restored busy state");
         self.open_tabs = persisted
             .servers
             .get(&key)
@@ -3012,6 +3157,7 @@ impl Client {
         self.pending_jump = None;
         self.conversations.clear();
         self.loading_messages.clear();
+        self.message_load_errors.clear();
         self.skip_prune_for_load.clear();
         self.message_events_during_load.clear();
         self.reload_after_load.clear();
@@ -4505,11 +4651,11 @@ impl Client {
             UiEvent::Connection {
                 connected: true, ..
             } => {
-                self.connection_status = self
-                    .server_version
-                    .as_ref()
-                    .map(|version| format!("Connected · {version}"))
-                    .unwrap_or_else(|| "Connected".into());
+                self.connection_status = connected_status(
+                    self.server_version.as_deref(),
+                    false,
+                    self.settings.warning.is_some(),
+                );
                 // Snapshot and SSE subscribe are independent workers. Even on
                 // the first connection, take a second snapshot after the
                 // stream is live: otherwise a change between the initial
@@ -4534,16 +4680,17 @@ impl Client {
             }
             UiEvent::Bootstrap(Ok(data)) => {
                 let retry_needed = data.retry_needed;
+                let statuses_complete = data.statuses_complete;
                 self.server_version = Some(data.version.clone());
                 if data.projects_complete {
                     self.projects = data.projects;
                 }
                 if !self.disconnected {
-                    self.connection_status = if data.warnings.is_empty() {
-                        format!("Connected · {}", data.version)
-                    } else {
-                        format!("Connected · {} · Partial refresh", data.version)
-                    };
+                    self.connection_status = connected_status(
+                        Some(&data.version),
+                        !data.warnings.is_empty(),
+                        self.settings.warning.is_some(),
+                    );
                 }
                 if data.sessions_complete {
                     self.sessions = data.sessions;
@@ -4574,12 +4721,18 @@ impl Client {
                         if self.local_prompt_delivered(id) {
                             self.local_busy.remove(id);
                         }
-                    } else if !self.pending_prompts.contains_key(id)
-                        && !self.local_busy.contains(id)
-                    {
-                        self.deferred_abort.remove(id);
-                        self.abort_timeout_tokens.remove(id);
-                        self.local_run_message_ids.remove(id);
+                    } else {
+                        if data.statuses_complete
+                            && !self.pending_prompts.contains_key(id)
+                            && self.local_prompt_delivered(id)
+                        {
+                            self.local_busy.remove(id);
+                        }
+                        if !self.pending_prompts.contains_key(id) && !self.local_busy.contains(id) {
+                            self.deferred_abort.remove(id);
+                            self.abort_timeout_tokens.remove(id);
+                            self.local_run_message_ids.remove(id);
+                        }
                     }
                 }
                 if data.statuses_complete {
@@ -4663,6 +4816,16 @@ impl Client {
                     }
                 }
                 self.replay_bootstrap_events(cx);
+                apply_missed_idle(
+                    &mut self.offline_busy,
+                    &self.statuses,
+                    &self.open_tabs,
+                    &mut self.unread,
+                    statuses_complete,
+                );
+                if statuses_complete && self.api.is_some() {
+                    self.persist_tabs();
+                }
                 if retry_needed {
                     self.schedule_bootstrap_retry(cx);
                 } else {
@@ -4686,6 +4849,7 @@ impl Client {
                     if self.open_tabs.contains(&session_id) {
                         match result {
                             Ok(page) => {
+                                self.message_load_errors.remove(&session_id);
                                 let protected = if cursor.is_none() {
                                     self.skip_prune_for_load
                                         .remove(&session_id)
@@ -4735,6 +4899,8 @@ impl Client {
                                 self.close_tab(&session_id, cx);
                             }
                             Err(error) => {
+                                self.message_load_errors
+                                    .insert(session_id.clone(), cursor.clone());
                                 if cursor.is_none() {
                                     self.skip_prune_for_load.remove(&session_id);
                                 }
@@ -5317,6 +5483,7 @@ impl Client {
             server_version: None,
             conversations,
             loading_messages: HashMap::new(),
+            message_load_errors: HashMap::new(),
             skip_prune_for_load: HashMap::new(),
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
@@ -5363,15 +5530,18 @@ impl Client {
                 None
             },
             scroll,
+            transcript_content_width: px(420.),
             safe_scroll: HashMap::new(),
             safe_anchors: HashMap::new(),
             pending_jump: None,
             history_focus: cx.focus_handle().tab_stop(true),
+            retry_history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
             picker_list_scroll: ScrollHandle::new(),
             projects_picker_scroll: ScrollHandle::new(),
             picker_choice_focus: HashMap::new(),
             unread: server.unread,
+            offline_busy: HashSet::new(),
             statuses: bootstrap.statuses,
             jobs,
             forms,
@@ -6067,9 +6237,21 @@ impl Client {
             } else {
                 self.attachments.get(&self.active, row, image_index)
             };
+            let (width, height) = source
+                .and_then(|source| imagesize::blob_size(source.bytes()).ok())
+                .map_or_else(
+                    || image_display_size(200, 120, self.transcript_content_width.as_f32()),
+                    |size| {
+                        image_display_size(
+                            size.width,
+                            size.height,
+                            self.transcript_content_width.as_f32(),
+                        )
+                    },
+                );
             let thumbnail = div()
-                .h(px(120.))
-                .w(px(200.))
+                .h(px(height))
+                .w(px(width))
                 .rounded(px(5.))
                 .border_1()
                 .border_color(self.tone(0xd8d1c6, 0x343a40))
@@ -6106,6 +6288,9 @@ impl Client {
             .pt(px(18.))
             .pb(px(20.))
             .bg(shade)
+            .when(row.kind == TranscriptRowKind::Reasoning, |view| {
+                view.opacity(0.42)
+            })
             .border_b_1()
             .border_color(self.tone(0xc8c3ba, 0x24282c))
             .child(
@@ -6667,29 +6852,106 @@ impl Client {
         Some(card.child(actions).into_any_element())
     }
 
-    fn working_pill(&self) -> Option<AnyElement> {
-        self.statuses
+    fn transcript_indicator(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let conversation = self.conversations.get(&self.active);
+        let has_rows = self
+            .transcript
             .get(&self.active)
-            .is_some_and(RunStatus::is_busy)
-            .then(|| {
+            .is_some_and(|rows| !rows.is_empty());
+        let loading = self.loading_messages.get(&self.active);
+        let failure = self.message_load_errors.get(&self.active);
+        let label = if let Some(RunStatus::Retry { message, .. }) = self.statuses.get(&self.active)
+        {
+            message.clone()
+        } else if let Some(cursor) = loading {
+            if cursor.is_some() {
+                "Loading earlier messages".into()
+            } else if conversation.is_some_and(|conversation| conversation.loaded) {
+                "Refreshing conversation".into()
+            } else {
+                "Loading conversation".into()
+            }
+        } else if let Some(cursor) = failure {
+            if cursor.is_some() {
+                "Could not load earlier messages".into()
+            } else if has_rows {
+                "Could not refresh conversation".into()
+            } else {
+                "Could not load conversation".into()
+            }
+        } else if self.active.is_empty() {
+            "Open a session to begin".into()
+        } else if self.is_running(&self.active) {
+            "OpenCode is working".into()
+        } else if !conversation.is_some_and(|conversation| conversation.loaded) {
+            "Loading conversation".into()
+        } else if !has_rows {
+            "No messages yet".into()
+        } else {
+            return None;
+        };
+        let mut pill = div()
+            .id("transcript-status")
+            .test_support()
+            .mx_auto()
+            .mb(px(10.))
+            .px(px(12.))
+            .min_h(px(29.))
+            .max_w(px(510.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded_full()
+            .border_1()
+            .border_color(self.tone(0xc8c3ba, 0x34393e))
+            .bg(self.tone(0xfffdfa, 0x171a1d))
+            .text_size(px(12.))
+            .text_color(self.tone(0x555b5c, 0xc4c8ca))
+            .child(
                 div()
-                    .mx_auto()
-                    .mb(px(10.))
-                    .px(px(12.))
-                    .h(px(29.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(self.tone(0xc8c3ba, 0x34393e))
-                    .bg(self.tone(0xfffdfa, 0x171a1d))
-                    .text_size(px(12.))
-                    .text_color(self.tone(0x555b5c, 0xc4c8ca))
-                    .child("◌")
-                    .child("OpenCode is working")
-                    .into_any_element()
-            })
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(label),
+            );
+        if let Some(cursor) = failure {
+            let session = self.active.clone();
+            let retry_cursor = cursor.clone();
+            let key_session = session.clone();
+            let key_cursor = retry_cursor.clone();
+            pill = pill.child(
+                div()
+                    .id("retry-history")
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label("Retry conversation load")
+                    .track_focus(&self.retry_history_focus)
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .cursor_pointer()
+                    .text_color(self.tone(0x8d5918, 0xf1bb72))
+                    .child("Retry history")
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            if let Some(cursor) = &key_cursor {
+                                this.load_earlier(&key_session, cursor, cx);
+                            } else {
+                                this.request_newest(&key_session);
+                            }
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(cursor) = &retry_cursor {
+                            this.load_earlier(&session, cursor, cx);
+                        } else {
+                            this.request_newest(&session);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(pill.into_any_element())
     }
 
     fn chat(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
@@ -8779,6 +9041,9 @@ impl Client {
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
+        self.transcript_content_width = (window.viewport_size().width
+            - px(SIDEBAR_WIDTH + TRANSCRIPT_SCROLLBAR_GUTTER + 56.))
+        .max(px(1.));
         self.sync_composer(window, cx);
         if self.focus_composer_pending
             && self.modal.is_none()
@@ -9114,7 +9379,7 @@ impl Render for Client {
                             .when_some(self.overlay.as_ref(), |view, overlay| {
                                 view.child(overlay.clone())
                             })
-                            .when_some(self.working_pill(), |view, pill| view.child(pill))
+                            .when_some(self.transcript_indicator(cx), |view, pill| view.child(pill))
                             .when_some(self.form_notice(cx), |view, notice| view.child(notice))
                             .when_some(self.tray_view(cx), |view, tray| view.child(tray))
                             .when_some(self.resume_warning(cx), |view, warning| {
@@ -14088,6 +14353,175 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn delivered_run_recovers_idle_after_missing_busy_status(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("Reconnect me", window, cx));
+                let session = client.active.clone();
+                client.send_prompt(false, cx);
+                let pending = client.pending_prompts[&session].clone();
+                client.handle_live_event(
+                    UiEvent::PromptAccepted {
+                        request_id: pending.request_id,
+                        session_id: session.clone(),
+                        result: Ok(()),
+                    },
+                    cx,
+                );
+                // An earlier Idle snapshot cannot retire a prompt that has
+                // not yet been confirmed by the server.
+                client.update_tab_status(session.clone(), RunStatus::Idle);
+                assert!(client.local_busy.contains(&session));
+                let UiEvent::ServerEvent(enqueued) =
+                    inbox_enqueued(&session, &pending.message_id, "Reconnect me")
+                else {
+                    unreachable!();
+                };
+                client
+                    .conversations
+                    .get_mut(&session)
+                    .unwrap()
+                    .apply_event(&enqueued.payload);
+                client
+                    .conversations
+                    .get_mut(&session)
+                    .unwrap()
+                    .apply_event(&json!({
+                        "id": "evt_delivered_idle", "created": 2000,
+                        "type": "session.inbox.delivered",
+                        "data": {"sessionID": session, "inboxID": pending.message_id}
+                    }));
+                client.update_tab_status(session.clone(), RunStatus::Idle);
+                assert!(!client.local_busy.contains(&session));
+                assert!(!client.is_running(&session));
+                assert!(!client.local_run_message_ids.contains_key(&session));
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn bootstrap_marks_a_completed_offline_tab_unread(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let id = client.active.clone();
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client.preview_api = true;
+                client.offline_busy.insert(id.clone());
+                let mut fixture = super::preview::State::new();
+                let UiEvent::Bootstrap(Ok(mut data)) =
+                    fixture.handle(opencode_gpui::api::Command::Bootstrap {
+                        sessions: vec![],
+                        directories: vec![],
+                    })
+                else {
+                    unreachable!();
+                };
+                data.statuses.insert(id.clone(), RunStatus::Idle);
+                data.statuses_complete = true;
+                client.handle_live_event(UiEvent::Bootstrap(Ok(data)), cx);
+                assert!(client.unread.contains(&id));
+                assert!(!client.offline_busy.contains(&id));
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn partial_session_snapshot_does_not_erase_restored_tab_metadata(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, _| {
+                let key =
+                    opencode_gpui::api::server_key(&client.settings.current.base_url).unwrap();
+                let missing = opencode_gpui::persist::PersistedTab {
+                    id: "ses_not_in_partial_snapshot".into(),
+                    title: "Still restored".into(),
+                    directory: "/repo".into(),
+                };
+                client
+                    .settings
+                    .persisted
+                    .servers
+                    .entry(key.clone())
+                    .or_default()
+                    .tabs = vec![missing.clone()];
+                client.open_tabs = vec![missing.id.clone()];
+                client.persist_tabs();
+                assert_eq!(
+                    client.settings.persisted.servers[&key].tabs[0].title,
+                    missing.title
+                );
+                client.open_tabs.clear();
+                client.persist_tabs();
+                assert!(client.settings.persisted.servers[&key].tabs.is_empty());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn failed_history_shows_a_keyboard_retry_in_the_transcript(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client.preview_api = true;
+                client
+                    .message_load_errors
+                    .insert(client.active.clone(), None);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let retry = window.find("retry-history");
+            assert_eq!(retry.role(), Some(Role::Button));
+            assert_eq!(retry.label(), Some("Retry conversation load"));
+            window.click("retry-history", cx);
+            assert_eq!(
+                client
+                    .read(cx)
+                    .loading_messages
+                    .get(&client.read(cx).active),
+                Some(&None)
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn failed_follow_up_does_not_retire_first_runs_local_busy(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
@@ -14762,7 +15196,7 @@ mod tests {
         assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, marker: Some(marker), list_depth: 2, .. } if content == "Nested item" && marker == "•")));
         assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Table { header, rows } if header == &["Name", "Value"] && rows == &[vec!["clip", "22px"]])));
         assert!(blocks.contains(&MarkdownBlock::Code("rust".into(), "let x = 22;".into())));
-        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "☑ done")));
+        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "[x] done")));
         assert!(markdown_blocks(COMPLEX_MARKDOWN_PREVIEW)
             .iter()
             .any(|block| matches!(block, MarkdownBlock::Code(language, code) if language == "rust" && code.contains("paperclip_icon"))));
@@ -14778,6 +15212,70 @@ mod tests {
         );
         assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::NestedCode { language, content, quote_depth: 1, .. } if language == "rust" && content == "let x = 22;")));
         assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "Image: clip")));
+    }
+
+    #[test]
+    fn message_timestamps_use_local_zone_and_hide_unset_values() {
+        let eastern = jiff::tz::TimeZone::fixed(jiff::tz::offset(-5));
+        assert_eq!(super::timestamp_in_zone(0, eastern.clone()), "");
+        assert_eq!(super::timestamp_in_zone(500, eastern.clone()), "");
+        assert_eq!(
+            super::timestamp_in_zone(1_704_067_200, eastern.clone()),
+            "2023-12-31 19:00"
+        );
+        assert_eq!(
+            super::timestamp_in_zone(1_704_067_200_000, eastern),
+            "2023-12-31 19:00"
+        );
+    }
+
+    #[test]
+    fn offline_busy_reconciles_only_against_known_or_complete_statuses() {
+        let mut offline_busy = HashSet::from([
+            "still-running".into(),
+            "completed".into(),
+            "not-covered".into(),
+        ]);
+        let statuses = std::collections::HashMap::from([
+            ("still-running".into(), RunStatus::Busy),
+            ("completed".into(), RunStatus::Idle),
+        ]);
+        let tabs = vec![
+            "still-running".into(),
+            "completed".into(),
+            "not-covered".into(),
+        ];
+        let mut unread = HashSet::new();
+        super::apply_missed_idle(&mut offline_busy, &statuses, &tabs, &mut unread, false);
+        assert_eq!(unread, HashSet::from(["completed".into()]));
+        assert_eq!(
+            offline_busy,
+            HashSet::from(["still-running".into(), "not-covered".into()])
+        );
+        super::apply_missed_idle(&mut offline_busy, &statuses, &tabs, &mut unread, true);
+        assert_eq!(
+            unread,
+            HashSet::from(["completed".into(), "not-covered".into()])
+        );
+        assert_eq!(offline_busy, HashSet::from(["still-running".into()]));
+    }
+
+    #[test]
+    fn inline_image_limit_covers_the_full_server_attachment_limit() {
+        let maximum = opencode_gpui::protocol::MAX_ATTACHMENT_BYTES;
+        let encoded_limit = maximum.div_ceil(3) * 4;
+        assert!(encoded_limit > 14_000_000);
+        assert_eq!(encoded_limit, 27_962_028);
+    }
+
+    #[test]
+    fn transcript_images_preserve_aspect_ratio_without_exceeding_viewport() {
+        assert_eq!(super::image_display_size(200, 120, 420.), (200., 120.));
+        assert_eq!(super::image_display_size(4_000, 2_000, 420.), (420., 210.));
+        assert_eq!(super::image_display_size(2_000, 4_000, 420.), (360., 720.));
+        assert_eq!(super::image_display_size(4_000, 2_000, 640.), (640., 320.));
+        assert_eq!(super::image_display_size(4_000, 2_000, 180.), (180., 90.));
+        assert_eq!(super::image_display_size(0, 0, 420.), (200., 120.));
     }
 
     #[gpui_kit::test]

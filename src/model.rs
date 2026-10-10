@@ -466,9 +466,11 @@ impl ChatMessage {
         }
     }
 
-    /// An undelivered user prompt: a tray item, not a transcript row.
+    /// An undelivered user prompt: a tray item, not a transcript row. An
+    /// optimistic idle send has no delivery mode and remains a transcript
+    /// row; optimistic steer/queue sends belong in the tray immediately.
     pub fn in_tray(&self) -> bool {
-        self.queued && !self.optimistic && self.role == Role::User
+        self.queued && self.role == Role::User && (!self.optimistic || self.delivery.is_some())
     }
 
     pub fn render_revision(&self) -> u64 {
@@ -699,6 +701,8 @@ pub struct TrayItem {
     pub delivery: protocol::Delivery,
     pub text: String,
     pub attachments: usize,
+    /// Local send not yet confirmed by inbox SSE or a server snapshot.
+    pub optimistic: bool,
 }
 
 fn item_delivery(item: &protocol::InboxItem) -> Option<protocol::Delivery> {
@@ -881,6 +885,7 @@ impl Conversation {
                     .iter()
                     .filter(|segment| segment.kind == SegmentKind::File)
                     .count(),
+                optimistic: message.optimistic,
             })
             .collect()
     }
@@ -3858,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn local_prompt_is_one_visible_row_through_enqueue_and_delivery() {
+    fn local_queued_prompt_is_in_the_tray_until_delivery() {
         let mut conversation = Conversation::default();
         let file = PathBuf::from("/work/image.png");
         assert!(conversation.add_local_prompt(
@@ -3869,12 +3874,9 @@ mod tests {
         ));
         assert!(!conversation.add_local_prompt("msg_local", "duplicate", &[], None));
         assert_eq!(conversation.messages.len(), 1);
-        assert!(
-            row_values(&conversation)
-                .iter()
-                .any(|row| row["body"] == "Describe this\n\nAttached: image.png (image/png)")
-        );
-        assert!(conversation.tray_items().is_empty());
+        assert!(row_values(&conversation).is_empty());
+        assert_eq!(conversation.tray_items().len(), 1);
+        assert!(conversation.tray_items()[0].optimistic);
         assert!(!conversation.has_delivered_user_message("msg_local"));
         assert!(!conversation.has_confirmed_user_message("msg_local"));
         conversation.sync_queued(&[]);
@@ -3899,6 +3901,7 @@ mod tests {
         assert!(!conversation.has_delivered_user_message("msg_local"));
         assert!(!conversation.remove_unconfirmed_local_prompt("msg_local"));
         assert_eq!(conversation.tray_items().len(), 1);
+        assert!(!conversation.tray_items()[0].optimistic);
         assert!(row_values(&conversation).is_empty());
         let delivered = live("session.inbox.delivered", json!({"inboxID": "msg_local"}));
         assert!(conversation.apply_event(&delivered));
@@ -3909,6 +3912,23 @@ mod tests {
             delivered["created"].as_u64().unwrap()
         );
         assert!(conversation.tray_items().is_empty());
+        assert!(
+            row_values(&conversation)
+                .iter()
+                .any(|row| { row["body"] == "Describe this\n\nAttached: image.png (image/png)" })
+        );
+    }
+
+    #[test]
+    fn local_idle_prompt_appears_in_transcript_before_server_confirmation() {
+        let mut conversation = Conversation::default();
+        assert!(conversation.add_local_prompt("msg_idle", "Hello", &[], None));
+        assert!(conversation.tray_items().is_empty());
+        assert!(
+            row_values(&conversation)
+                .iter()
+                .any(|row| row["body"] == "Hello")
+        );
     }
 
     #[test]
@@ -4108,12 +4128,14 @@ mod tests {
                     delivery: protocol::Delivery::Steer,
                     text: "and keep the 30 s cap\non the backoff".into(),
                     attachments: 0,
+                    optimistic: false,
                 },
                 TrayItem {
                     id: "msg_q".into(),
                     delivery: protocol::Delivery::Queue,
                     text: "then update the changelog".into(),
                     attachments: 2,
+                    optimistic: false,
                 },
             ],
             "oldest first; synthetic items are not in the tray"
@@ -4199,6 +4221,7 @@ mod tests {
                 delivery: protocol::Delivery::Steer,
                 text: "Follow-up sent while busy. [[scenario:text]]".into(),
                 attachments: 0,
+                optimistic: false,
             }]
         );
         assert!(conversation.has_user_message(&parked));
