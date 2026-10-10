@@ -10765,6 +10765,90 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    #[ignore = "manual headless CPU profile; compare 1k and 10k before setting a release budget"]
+    fn profile_large_streaming_transcript_frames(cx: &mut TestAppContext) {
+        use std::time::Instant;
+
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        let count: usize = std::env::var("TRANSCRIPT_PROFILE_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_000);
+        let complex = std::env::var_os("TRANSCRIPT_PROFILE_COMPLEX").is_some();
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                let messages = (0..count)
+                    .map(|index| {
+                        let entry = if complex && index % 13 == 0 {
+                            json!({
+                                "id": format!("history_{index}"), "type": "assistant",
+                                "time": { "created": index + 1 },
+                                "content": [{ "type": "text", "text":
+                                    "# Step\n\n- First **bold** line\n- Second `code` line\n\n```rust\nfn main() {}\n```"
+                                }]
+                            })
+                        } else {
+                            json!({
+                            "id": format!("history_{index}"), "type": "user",
+                            "time": { "created": index + 1 }, "text": "Earlier conversation"
+                            })
+                        };
+                        protocol::SessionMessage::from_value(entry)
+                    })
+                    .collect::<Vec<_>>();
+                client
+                    .conversations
+                    .get_mut(&session)
+                    .unwrap()
+                    .replace_from_api(&messages, None);
+                client.update_transcript(&session);
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| client.read(cx).scroll.base_handle().scroll_to_bottom());
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        let mut samples = Vec::new();
+        for index in 0..50 {
+            let start = Instant::now();
+            cx.update(|cx| {
+                client.update(cx, |client, cx| {
+                let event = UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                    directory: Some("/repo".into()),
+                    payload: json!({
+                        "id": format!("evt_{index:026}"), "created": 20000 + index,
+                        "type": "session.text.delta", "data": {
+                            "sessionID": client.active.clone(), "assistantMessageID": "stream_tail",
+                            "ordinal": 0, "delta": " one more token"
+                        }
+                    }),
+                });
+                client.handle_live_event(event, cx);
+            })
+            });
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            samples.push(start.elapsed());
+        }
+        samples.sort_unstable();
+        println!(
+            "rows={count} complex={complex} 50 streamed updates+headless frames: median={:?} p95={:?} max={:?}",
+            samples[25], samples[47], samples[49]
+        );
+    }
+
+    #[gpui_kit::test]
     fn cold_ten_thousand_row_transcript_measures_a_bounded_tail_first(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
