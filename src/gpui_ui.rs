@@ -515,6 +515,7 @@ struct Client {
     permission_focus: [FocusHandle; 3],
     permission_presented: Option<String>,
     settings_tab_focus: [FocusHandle; 2],
+    settings_action_focus: [FocusHandle; 2],
     settings_session_focus: HashMap<String, FocusHandle>,
     settings_sessions_scroll: ScrollHandle,
     settings_highlight: Option<usize>,
@@ -537,6 +538,7 @@ struct Client {
     next_abort_timeout_token: u64,
     modal: Option<Modal>,
     rename_target: Option<String>,
+    rename_action_focus: [FocusHandle; 3],
     rename_pending: Option<u64>,
     rename_error: Option<String>,
     picker_highlight: Option<usize>,
@@ -2314,6 +2316,7 @@ impl Client {
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: None,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            settings_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             settings_session_focus: HashMap::new(),
             settings_sessions_scroll: ScrollHandle::new(),
             settings_highlight: None,
@@ -2336,6 +2339,7 @@ impl Client {
             next_abort_timeout_token: 0,
             modal: None,
             rename_target: None,
+            rename_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             rename_pending: None,
             rename_error: None,
             picker_highlight: None,
@@ -2932,6 +2936,23 @@ impl Client {
         cx.notify();
     }
 
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.rename_pending.is_none() {
+            self.modal = None;
+            self.rename_target = None;
+            self.rename_error = None;
+            self.focus_composer_pending = true;
+            cx.notify();
+        }
+    }
+
+    fn cancel_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.reset_draft(window, cx);
+        self.modal = None;
+        self.focus_composer_pending = true;
+        cx.notify();
+    }
+
     fn rename_session(&mut self, cx: &mut Context<Self>) {
         if self.modal != Some(Modal::Rename) || self.rename_pending.is_some() {
             return;
@@ -2955,6 +2976,7 @@ impl Client {
             self.rename_target = None;
             self.rename_error = None;
             self.modal = None;
+            self.focus_composer_pending = true;
             cx.notify();
             return;
         }
@@ -2971,6 +2993,7 @@ impl Client {
             session.title = title;
             self.rename_target = None;
             self.modal = None;
+            self.focus_composer_pending = true;
         }
         cx.notify();
     }
@@ -2979,6 +3002,7 @@ impl Client {
         if self.preview_api {
             self.settings.reset_draft(window, cx);
             self.modal = None;
+            self.focus_composer_pending = true;
             cx.notify();
             return;
         }
@@ -2986,6 +3010,7 @@ impl Client {
             Ok(()) => {
                 self.settings.reset_draft(window, cx);
                 self.modal = None;
+                self.focus_composer_pending = true;
             }
             Err(error) => self.settings.error = Some(error.to_string()),
         }
@@ -5067,6 +5092,7 @@ impl Client {
                         self.rename_error = None;
                         if self.modal == Some(Modal::Rename) {
                             self.modal = None;
+                            self.focus_composer_pending = true;
                         }
                     }
                 }
@@ -5633,6 +5659,7 @@ impl Client {
             permission_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             permission_presented: None,
             settings_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            settings_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             settings_session_focus: HashMap::new(),
             settings_sessions_scroll: ScrollHandle::new(),
             settings_highlight: None,
@@ -5655,6 +5682,7 @@ impl Client {
             next_abort_timeout_token: 0,
             modal,
             rename_target: None,
+            rename_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             rename_pending: None,
             rename_error: None,
             picker_highlight: None,
@@ -8177,6 +8205,7 @@ impl Client {
             .rename_target
             .clone()
             .unwrap_or_else(|| self.active.clone());
+        let rename_key_id = rename_id.clone();
         let panel: AnyElement = match modal {
             Modal::Sessions | Modal::NewSession => {
                 let sessions = modal == Modal::Sessions;
@@ -8471,7 +8500,20 @@ impl Client {
                         .child(
                             div()
                                 .id("rename-copy-id")
+                                .role(Role::Button)
+                                .aria_label("Copy session ID")
+                                .test_support()
+                                .track_focus(&self.rename_action_focus[0])
+                                .focus_visible(|style| style.bg(self.tone(0xe3e0da, 0x303a44)))
                                 .cursor_pointer()
+                                .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            rename_key_id.clone(),
+                                        ));
+                                        cx.stop_propagation();
+                                    }
+                                }))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
                                         rename_id.clone(),
@@ -8489,15 +8531,21 @@ impl Client {
                         .child(
                             div()
                                 .id("rename-cancel")
+                                .role(Role::Button)
+                                .aria_label("Cancel rename")
+                                .test_support()
+                                .track_focus(&self.rename_action_focus[1])
+                                .focus_visible(|style| {
+                                    style.border_color(self.tone(0x2356a8, 0x78baff))
+                                })
                                 .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.rename_pending.is_none() {
-                                        this.modal = None;
-                                        this.rename_target = None;
-                                        this.rename_error = None;
-                                        cx.notify();
+                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                        this.cancel_rename(cx);
+                                        cx.stop_propagation();
                                     }
                                 }))
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_rename(cx)))
                                 .px(px(14.))
                                 .py(px(7.))
                                 .border_1()
@@ -8508,7 +8556,20 @@ impl Client {
                         .child(
                             div()
                                 .id("rename-save")
+                                .role(Role::Button)
+                                .aria_label("Save session title")
+                                .test_support()
+                                .track_focus(&self.rename_action_focus[2])
+                                .focus_visible(|style| {
+                                    style.border_color(self.tone(0x2356a8, 0x78baff))
+                                })
                                 .cursor_pointer()
+                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                        this.rename_session(cx);
+                                        cx.stop_propagation();
+                                    }
+                                }))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.rename_session(cx);
                                 }))
@@ -8890,11 +8951,33 @@ impl Client {
                                 .child(
                                     div()
                                         .id("settings-cancel")
+                                        .role(Role::Button)
+                                        .aria_label(
+                                            if self.settings.tab == SettingsTab::Connection {
+                                                "Cancel settings"
+                                            } else {
+                                                "Close settings"
+                                            },
+                                        )
+                                        .test_support()
+                                        .track_focus(&self.settings_action_focus[0])
+                                        .focus_visible(|style| {
+                                            style.border_color(self.tone(0x2356a8, 0x78baff))
+                                        })
                                         .cursor_pointer()
+                                        .on_key_down(cx.listener(
+                                            |this, event: &KeyDownEvent, window, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.cancel_settings(window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
                                         .on_click(cx.listener(|this, _, window, cx| {
-                                            this.settings.reset_draft(window, cx);
-                                            this.modal = None;
-                                            cx.notify();
+                                            this.cancel_settings(window, cx);
                                         }))
                                         .px(px(14.))
                                         .py(px(7.))
@@ -8914,7 +8997,25 @@ impl Client {
                                     footer.child(
                                         div()
                                             .id("settings-apply")
+                                            .role(Role::Button)
+                                            .aria_label("Apply settings")
+                                            .test_support()
+                                            .track_focus(&self.settings_action_focus[1])
+                                            .focus_visible(|style| {
+                                                style.border_color(self.tone(0x2356a8, 0x78baff))
+                                            })
                                             .cursor_pointer()
+                                            .on_key_down(cx.listener(
+                                                |this, event: &KeyDownEvent, window, cx| {
+                                                    if matches!(
+                                                        event.keystroke.key.as_str(),
+                                                        "enter" | "space"
+                                                    ) {
+                                                        this.apply_settings(window, cx);
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.apply_settings(window, cx);
                                             }))
@@ -12970,6 +13071,69 @@ mod tests {
             assert_eq!(client.read(cx).transcript_width(window), initial_width);
             assert!(window.try_find("new-session").is_some());
             assert!(window.try_find("session-header").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn rename_and_settings_actions_are_named_keyboard_buttons(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless preview window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::Rename, window, cx)
+            });
+            window.render_frame(cx);
+            for (id, label) in [
+                ("rename-copy-id", "Copy session ID"),
+                ("rename-cancel", "Cancel rename"),
+                ("rename-save", "Save session title"),
+            ] {
+                let button = window.find(id);
+                assert_eq!(button.role(), Some(Role::Button));
+                assert_eq!(button.label(), Some(label));
+            }
+            let copy_focus = client.read(cx).rename_action_focus[0].clone();
+            copy_focus.focus(window, cx);
+            window.press("space", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(client.read(cx).active.clone())
+            );
+            let cancel_focus = client.read(cx).rename_action_focus[1].clone();
+            cancel_focus.focus(window, cx);
+            window.press("enter", cx);
+            assert!(client.read(cx).modal.is_none());
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
+
+            client.update(cx, |client, cx| {
+                client.show_modal(Modal::Settings, window, cx)
+            });
+            window.render_frame(cx);
+            for (id, label) in [
+                ("settings-cancel", "Cancel settings"),
+                ("settings-apply", "Apply settings"),
+            ] {
+                let button = window.find(id);
+                assert_eq!(button.role(), Some(Role::Button));
+                assert_eq!(button.label(), Some(label));
+            }
+            let cancel_focus = client.read(cx).settings_action_focus[0].clone();
+            cancel_focus.focus(window, cx);
+            window.press("space", cx);
+            assert!(client.read(cx).modal.is_none());
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            assert!(client.read(cx).composer.focus_handle(cx).is_focused(window));
         })
         .unwrap();
     }
