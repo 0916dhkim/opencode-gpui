@@ -168,9 +168,10 @@ if [[ -n "$new_session" ]]; then
   # Press Space only after that state has had a frame to settle.
   sleep 0.5
   mark_now
-  # The same named switch control remains focused after the delivery flips;
-  # Space must dispatch the reverse action through its semantic button.
-  gpui_key space
+  # GPUI Kit buttons intentionally do not steal composer focus on mouse-down.
+  # Click the reverse action here; the headless button test covers Space from
+  # an explicitly focused switch control.
+  gpui_click 680 607
   expect tray.queue "http and route == 'session.inbox.update' and b.get('delivery') == 'queue' and r['status'] == 204"
   # GPUI's stop button is in the footer; the server must see an interrupt.
   mark_now

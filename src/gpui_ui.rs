@@ -1597,26 +1597,28 @@ fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut list_depth = 0;
-    let complex = source
-        .lines()
-        .any(|line| line.trim_start().starts_with("~~~"))
-        || Parser::new_ext(source, options).any(|event| match event {
-            Event::Start(Tag::List(start)) => {
-                list_depth += 1;
-                start.is_some() || list_depth > 1
-            }
-            Event::End(TagEnd::List(_)) => {
-                list_depth -= 1;
-                false
-            }
-            Event::Start(Tag::BlockQuote(_) | Tag::Table(_))
-            | Event::Start(Tag::Image { .. })
-            | Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))
-            | Event::TaskListMarker(_)
-            | Event::Rule => true,
-            Event::Start(Tag::CodeBlock(_)) if list_depth > 0 => true,
-            _ => false,
-        });
+    let complex = source.lines().any(|line| {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        line.trim_start().starts_with("~~~")
+            || (indent > 0 && indent <= 3 && trimmed.starts_with("```"))
+    }) || Parser::new_ext(source, options).any(|event| match event {
+        Event::Start(Tag::List(start)) => {
+            list_depth += 1;
+            start.is_some() || list_depth > 1
+        }
+        Event::End(TagEnd::List(_)) => {
+            list_depth -= 1;
+            false
+        }
+        Event::Start(Tag::BlockQuote(_) | Tag::Table(_))
+        | Event::Start(Tag::Image { .. })
+        | Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))
+        | Event::TaskListMarker(_)
+        | Event::Rule => true,
+        Event::Start(Tag::CodeBlock(_)) if list_depth > 0 => true,
+        _ => false,
+    });
     if complex {
         return complex_markdown_blocks(source, options);
     }
@@ -1818,7 +1820,16 @@ fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock>
                     "Image: ",
                 );
             }
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+            Event::Text(text) => {
+                append_inline(
+                    &mut current,
+                    &mut marker,
+                    lists.len(),
+                    quote_depth,
+                    &escape_markdown_literal(&text),
+                );
+            }
+            Event::Html(text) | Event::InlineHtml(text) => {
                 append_inline(&mut current, &mut marker, lists.len(), quote_depth, &text);
             }
             Event::Code(text) => {
@@ -1866,6 +1877,41 @@ fn append_inline(
         heading: None,
     });
     block.content.push_str(text);
+}
+
+/// Text events are already decoded by pulldown-cmark. Escape literal Markdown
+/// punctuation before handing the reconstructed fragment to GPUI Kit's
+/// renderer; otherwise an escaped `\*literal\*` becomes new emphasis.
+fn escape_markdown_literal(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '&' {
+            escaped.push_str("&amp;");
+            continue;
+        }
+        if matches!(
+            character,
+            '\\' | '*' | '_' | '`' | '[' | ']' | '~' | '<' | '>' | '#' | '!' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn heading_is_block_marker(title: &str) -> bool {
+    let title = title.trim_start();
+    title.starts_with("- ")
+        || title.starts_with("* ")
+        || title.starts_with("+ ")
+        || title.starts_with("> ")
+        || title.starts_with("# ")
+        || title.starts_with("```")
+        || title.starts_with("~~~")
+        || title
+            .split_once('.')
+            .is_some_and(|(number, rest)| number.parse::<u64>().is_ok() && rest.starts_with(' '))
 }
 
 fn simple_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
@@ -2015,15 +2061,20 @@ impl Client {
         let mut content = div().w_full().flex().flex_col().gap(px(10.));
         for (block_index, block) in markdown_blocks(source).into_iter().enumerate() {
             let element: AnyElement = match block {
-                MarkdownBlock::Heading(level, title) => div()
-                    .text_size(px(match level {
-                        1 => 18.,
-                        2 => 16.,
-                        _ => 14.,
-                    }))
-                    .font_weight(FontWeight::BOLD)
-                    .child(title)
-                    .into_any_element(),
+                MarkdownBlock::Heading(level, title) => {
+                    let heading = div()
+                        .text_size(px(match level {
+                            1 => 18.,
+                            2 => 16.,
+                            _ => 14.,
+                        }))
+                        .font_weight(FontWeight::BOLD);
+                    if heading_is_block_marker(&title) || !title.contains(['*', '_', '`', '[']) {
+                        heading.child(title).into_any_element()
+                    } else {
+                        heading.child(markdown(title)).into_any_element()
+                    }
+                }
                 MarkdownBlock::Paragraph(text) => div()
                     .line_height(px(22.))
                     .child(markdown(text))
@@ -12709,8 +12760,27 @@ mod tests {
             let cancel = window.find(format!("cancel-waiting-{id}"));
             assert_eq!(cancel.role(), Some(Role::Button));
             assert!(cancel.label().unwrap().starts_with("Cancel waiting prompt"));
-            window.click(format!("switch-waiting-{id}"), cx);
+            let (api, _receiver, _) = ApiHandle::preview();
+            client.update(cx, |client, cx| {
+                client.api = Some(api);
+                client.preview_api = true;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let composer_focus = client.read(cx).composer.focus_handle(cx);
+            composer_focus.focus(window, cx);
+            let mut focused = false;
+            for _ in 0..100 {
+                window.press("tab", cx);
+                window.render_frame(cx);
+                if window.find(format!("switch-waiting-{id}")).focused() == Some(true) {
+                    focused = true;
+                    break;
+                }
+            }
+            assert!(focused, "Tab never reached the waiting-tray switch");
             window.press("space", cx);
+            assert!(client.read(cx).tray_in_flight.contains(&id));
         })
         .unwrap();
     }
@@ -15800,6 +15870,10 @@ mod tests {
             .iter()
             .any(|block| matches!(block, MarkdownBlock::Code(language, code) if language == "rust" && code.contains("paperclip_icon"))));
         assert!(
+            markdown_blocks("   ```rust\nlet x = 22;\n   ```")
+                .contains(&MarkdownBlock::Code("rust".into(), "let x = 22;".into()))
+        );
+        assert!(
             markdown_blocks("~~~sh\necho ok\n~~~")
                 .contains(&MarkdownBlock::Code("sh".into(), "echo ok".into()))
         );
@@ -15811,6 +15885,22 @@ mod tests {
         );
         assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::NestedCode { language, content, quote_depth: 1, .. } if language == "rust" && content == "let x = 22;")));
         assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "Image: clip")));
+        assert!(markdown_blocks("> \\*literal\\* and **strong**")
+            .iter()
+            .any(|block| matches!(block, MarkdownBlock::Structured { content, quote_depth: 1, .. } if content == "\\*literal\\* and **strong**")));
+        assert!(markdown_blocks("> &amp;copy;").iter().any(
+            |block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "&amp;copy;")
+        ));
+        assert!(markdown_blocks("> <b>bold</b>").iter().any(
+            |block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "<b>bold</b>")
+        ));
+        assert_eq!(
+            super::escape_markdown_literal("*literal* [bracket]"),
+            "\\*literal\\* \\[bracket\\]"
+        );
+        assert!(super::heading_is_block_marker("- item"));
+        assert!(super::heading_is_block_marker("# Heading"));
+        assert!(!super::heading_is_block_marker("**Important**"));
     }
 
     #[test]
