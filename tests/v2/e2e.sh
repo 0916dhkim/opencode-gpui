@@ -110,6 +110,7 @@ if [ -z "$skip_gui" ]; then
     -e GUI_BINARY="$gui_binary" \
     -e GUI_CONFIG_SUFFIX="${E2E_GUI_CONFIG_SUFFIX:-}" \
     -e GUI_SLOW_FLOW="${E2E_GUI_SLOW_FLOW:-0}" \
+    -e GUI_SETTINGS_SWITCH="${E2E_GUI_SETTINGS_SWITCH:-0}" \
     -e GUI_SHOTS=/shots \
     -e GUI_UPSTREAM_HOST="$UPSTREAM" \
     "$UI_IMAGE" bash tests/v2/gui_smoke.sh; then

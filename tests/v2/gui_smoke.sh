@@ -238,6 +238,62 @@ sys.exit(0 if sys.argv[1] in json.load(sys.stdin).get("data",{}) else 1)' "${ses
   fi
 fi
 
+if [[ "${GUI_SETTINGS_SWITCH:-0}" == 1 ]]; then
+  # Apply the same live server through its alternate /api URL. This exercises
+  # the Settings UI, reconnect behavior, canonical server identity and an
+  # actual prompt after the transition without using developer credentials.
+  if [[ "${configured}" == "${base}/api" ]]; then next_url="${base}"; else next_url="${base}/api"; fi
+  gpui_click 410 680
+  gpui_key ctrl+comma
+  sleep 0.5
+  gpui_click 430 219
+  gpui_key ctrl+a
+  gpui_type "${next_url}"
+  gpui_click 758 726
+  persisted=''
+  for _ in $(seq 1 50); do
+    if python3 - "${temporary}/config/opencode-gpui/state.json" "${next_url}" <<'PY'
+import json,sys
+try:
+    state=json.load(open(sys.argv[1]))
+    assert state["connection"]["server"] == sys.argv[2]
+except (OSError, ValueError, KeyError, AssertionError):
+    sys.exit(1)
+PY
+    then persisted=1; break; fi
+    sleep 0.2
+  done
+  if [[ -n "${persisted}" ]]; then
+    pass "settings.server-url-persisted"
+  else
+    fail "settings.server-url-persisted" "Apply did not save ${next_url}"
+  fi
+  sleep 1
+  gpui_click 410 680
+  gpui_type "After settings reconnect [[scenario:text]]"
+  gpui_key Return
+  check_after_settings() {
+    api GET "/api/session/${session}/message?limit=20" | python3 -c '
+import json,sys
+entries=json.load(sys.stdin)["data"]
+users=[e for e in entries if e["type"]=="user" and "After settings reconnect" in e.get("text","")]
+last=max((e.get("time",{}).get("created",0) for e in users),default=0)
+reply=any(e["type"]=="assistant" and e.get("time",{}).get("created",0)>=last
+  and any(c.get("type")=="text" and c.get("text") for c in e.get("content",[])) for e in entries)
+sys.exit(0 if len(users)==1 and reply else 1)'
+  }
+  reconnected=''
+  for _ in $(seq 1 60); do
+    if check_after_settings; then reconnected=1; break; fi
+    sleep 0.5
+  done
+  if [[ -n "${reconnected}" ]]; then
+    pass "settings.gui-prompt-after-url-switch"
+  else
+    fail "settings.gui-prompt-after-url-switch" "no reply after applying alternate URL"
+  fi
+fi
+
 # Exercise a second real-server GUI path, not just an API-created tab: create
 # through the project picker and verify the server and persisted active tab.
 state_file="${temporary}/config/opencode-gpui/state.json"
