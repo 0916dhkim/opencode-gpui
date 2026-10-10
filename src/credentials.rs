@@ -7,8 +7,13 @@ use url::Url;
 
 const KEYRING_SERVICE: &str = "ai.opencode.Gpui.cloudflare-access";
 const PASSWORD_KEYRING_SERVICE: &str = "ai.opencode.Gpui.basic-auth";
-const LEGACY_KEYRING_SERVICE: &str = "ai.opencode.Cosmic.cloudflare-access";
-const LEGACY_PASSWORD_KEYRING_SERVICE: &str = "ai.opencode.Cosmic.basic-auth";
+const GTK_KEYRING_SERVICE: &str = "ai.opencode.Gtk.cloudflare-access";
+const COSMIC_KEYRING_SERVICE: &str = "ai.opencode.Cosmic.cloudflare-access";
+const GTK_PASSWORD_KEYRING_SERVICE: &str = "ai.opencode.Gtk.basic-auth";
+const COSMIC_PASSWORD_KEYRING_SERVICE: &str = "ai.opencode.Cosmic.basic-auth";
+// A secret-free marker prevents an explicitly forgotten GPUI credential from
+// being imported again from an older client. Their entries stay untouched.
+const REMOVED_SECRET_MARKER: &str = "{\"version\":1,\"removed\":true}";
 const STORED_VERSION: u8 = 1;
 
 /// Where secrets live. The app uses [`SystemKeyring`]; tests inject an
@@ -82,23 +87,33 @@ fn load_from(
 ) -> Result<Option<CloudflareAccessCredentials>> {
     let account = server_account(server)?;
     let stored = match store.get(KEYRING_SERVICE, &account) {
+        Ok(stored) if stored == REMOVED_SECRET_MARKER => return Ok(None),
         Ok(stored) => stored,
-        Err(KeyringError::NoEntry) => match store.get(LEGACY_KEYRING_SERVICE, &account) {
-            Ok(stored) => {
-                // Copy, never move: an installed older client can still read its entry.
-                // Validate before writing: a corrupt old entry must not shadow
-                // a later repair under the new service name.
-                decode(&stored)?;
-                store
-                    .set(KEYRING_SERVICE, &account, &stored)
-                    .context("failed to migrate Cloudflare Access credentials")?;
-                stored
+        Err(KeyringError::NoEntry) => {
+            let mut legacy = None;
+            for service in [GTK_KEYRING_SERVICE, COSMIC_KEYRING_SERVICE] {
+                match store.get(service, &account) {
+                    Ok(stored) => {
+                        legacy = Some(stored);
+                        break;
+                    }
+                    Err(KeyringError::NoEntry) => {}
+                    Err(error) => {
+                        return Err(error)
+                            .context("failed to read legacy Cloudflare Access credentials");
+                    }
+                }
             }
-            Err(KeyringError::NoEntry) => return Ok(None),
-            Err(error) => {
-                return Err(error).context("failed to read legacy Cloudflare Access credentials");
-            }
-        },
+            let Some(stored) = legacy else {
+                return Ok(None);
+            };
+            // Copy, never move: an installed older client can still read its entry.
+            decode(&stored)?;
+            store
+                .set(KEYRING_SERVICE, &account, &stored)
+                .context("failed to migrate Cloudflare Access credentials")?;
+            stored
+        }
         Err(error) => return Err(error).context("failed to read Cloudflare Access credentials"),
     };
     decode(&stored).map(Some)
@@ -116,16 +131,38 @@ pub fn save(server: &str, credentials: &CloudflareAccessCredentials) -> Result<(
 }
 
 pub fn remove(server: &str) -> Result<()> {
+    remove_from(&SystemKeyring, server)
+}
+
+fn remove_from(store: &impl SecretStore, server: &str) -> Result<()> {
     let account = server_account(server)?;
-    for service in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
-        match SystemKeyring.delete(service, &account) {
-            Ok(()) | Err(KeyringError::NoEntry) => {}
-            Err(error) => {
-                return Err(error).context("failed to remove Cloudflare Access credentials");
-            }
+    if has_legacy(
+        store,
+        &account,
+        &[GTK_KEYRING_SERVICE, COSMIC_KEYRING_SERVICE],
+    )
+    .context("failed to check legacy Cloudflare Access credentials")?
+    {
+        store
+            .set(KEYRING_SERVICE, &account, REMOVED_SECRET_MARKER)
+            .context("failed to forget Cloudflare Access credentials")
+    } else {
+        match store.delete(KEYRING_SERVICE, &account) {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("failed to remove Cloudflare Access credentials"),
         }
     }
-    Ok(())
+}
+
+fn has_legacy(store: &impl SecretStore, account: &str, services: &[&str]) -> keyring::Result<bool> {
+    for service in services {
+        match store.get(service, account) {
+            Ok(_) => return Ok(true),
+            Err(KeyringError::NoEntry) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 fn server_account(server: &str) -> Result<String> {
@@ -205,20 +242,36 @@ pub fn load_password(
 ) -> Result<Option<String>> {
     let account = password_account(server, username)?;
     let stored = match store.get(PASSWORD_KEYRING_SERVICE, &account) {
+        Ok(stored) if stored == REMOVED_SECRET_MARKER => return Ok(None),
         Ok(stored) => stored,
-        Err(KeyringError::NoEntry) => match store.get(LEGACY_PASSWORD_KEYRING_SERVICE, &account) {
-            Ok(stored) => {
-                decode_password(&stored)?;
-                store
-                    .set(PASSWORD_KEYRING_SERVICE, &account, &stored)
-                    .map_err(|error| {
-                        anyhow!("could not migrate the stored OpenCode password: {error}")
-                    })?;
-                stored
+        Err(KeyringError::NoEntry) => {
+            let mut legacy = None;
+            for service in [
+                GTK_PASSWORD_KEYRING_SERVICE,
+                COSMIC_PASSWORD_KEYRING_SERVICE,
+            ] {
+                match store.get(service, &account) {
+                    Ok(stored) => {
+                        legacy = Some(stored);
+                        break;
+                    }
+                    Err(KeyringError::NoEntry) => {}
+                    Err(error) => {
+                        return Err(anyhow!("could not read the legacy system keyring: {error}"));
+                    }
+                }
             }
-            Err(KeyringError::NoEntry) => return Ok(None),
-            Err(error) => return Err(anyhow!("could not read the legacy system keyring: {error}")),
-        },
+            let Some(stored) = legacy else {
+                return Ok(None);
+            };
+            decode_password(&stored)?;
+            store
+                .set(PASSWORD_KEYRING_SERVICE, &account, &stored)
+                .map_err(|error| {
+                    anyhow!("could not migrate the stored OpenCode password: {error}")
+                })?;
+            stored
+        }
         Err(error) => return Err(anyhow!("could not read the system keyring: {error}")),
     };
     decode_password(&stored).map(Some)
@@ -256,13 +309,25 @@ pub fn save_password(
 
 pub fn remove_password(store: &impl SecretStore, server: &str, username: &str) -> Result<()> {
     let account = password_account(server, username)?;
-    for service in [PASSWORD_KEYRING_SERVICE, LEGACY_PASSWORD_KEYRING_SERVICE] {
-        match store.delete(service, &account) {
-            Ok(()) | Err(KeyringError::NoEntry) => {}
-            Err(error) => return Err(anyhow!("could not update the system keyring: {error}")),
+    if has_legacy(
+        store,
+        &account,
+        &[
+            GTK_PASSWORD_KEYRING_SERVICE,
+            COSMIC_PASSWORD_KEYRING_SERVICE,
+        ],
+    )
+    .map_err(|error| anyhow!("could not check the legacy system keyring: {error}"))?
+    {
+        store
+            .set(PASSWORD_KEYRING_SERVICE, &account, REMOVED_SECRET_MARKER)
+            .map_err(|error| anyhow!("could not update the system keyring: {error}"))
+    } else {
+        match store.delete(PASSWORD_KEYRING_SERVICE, &account) {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(error) => Err(anyhow!("could not update the system keyring: {error}")),
         }
     }
-    Ok(())
 }
 
 /// The Basic password to start with and whether it came from the keyring.
@@ -578,13 +643,50 @@ mod tests {
         })
         .unwrap();
         store
-            .set(LEGACY_KEYRING_SERVICE, &account, &encoded)
+            .set(COSMIC_KEYRING_SERVICE, &account, &encoded)
             .unwrap();
         assert_eq!(load_from(&store, SERVER).unwrap(), Some(credentials));
         assert_eq!(store.get(KEYRING_SERVICE, &account).unwrap(), encoded);
         assert_eq!(
-            store.get(LEGACY_KEYRING_SERVICE, &account).unwrap(),
+            store.get(COSMIC_KEYRING_SERVICE, &account).unwrap(),
             encoded
+        );
+    }
+
+    #[test]
+    fn gtk_cloudflare_credentials_take_precedence_and_survive_gpui_forget() {
+        let store = MemoryStore::default();
+        let account = server_account(SERVER).unwrap();
+        let gtk =
+            CloudflareAccessCredentials::new("gtk-client".into(), "gtk-secret".into()).unwrap();
+        for (service, client_id) in [
+            (GTK_KEYRING_SERVICE, "gtk-client"),
+            (COSMIC_KEYRING_SERVICE, "cosmic-client"),
+        ] {
+            store
+                .set(
+                    service,
+                    &account,
+                    &serde_json::to_string(&StoredCredentials {
+                        version: STORED_VERSION,
+                        credentials: CloudflareAccessCredentials::new(
+                            client_id.into(),
+                            "gtk-secret".into(),
+                        )
+                        .unwrap(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(load_from(&store, SERVER).unwrap(), Some(gtk));
+        remove_from(&store, SERVER).unwrap();
+        assert_eq!(load_from(&store, SERVER).unwrap(), None);
+        assert!(store.get(GTK_KEYRING_SERVICE, &account).is_ok());
+        assert!(store.get(COSMIC_KEYRING_SERVICE, &account).is_ok());
+        assert_eq!(
+            store.get(KEYRING_SERVICE, &account).unwrap(),
+            REMOVED_SECRET_MARKER
         );
     }
 
@@ -593,7 +695,7 @@ mod tests {
         let store = MemoryStore::default();
         let account = server_account(SERVER).unwrap();
         store
-            .set(LEGACY_KEYRING_SERVICE, &account, "invalid")
+            .set(COSMIC_KEYRING_SERVICE, &account, "invalid")
             .unwrap();
         assert!(load_from(&store, SERVER).is_err());
         assert!(matches!(
@@ -699,12 +801,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cosmic_password_is_copied_then_removed_with_new_entry() {
+    fn legacy_cosmic_password_is_copied_and_survives_gpui_forget() {
         let store = MemoryStore::default();
         let account = password_account(SERVER, "opencode").unwrap();
         store
             .set(
-                LEGACY_PASSWORD_KEYRING_SERVICE,
+                COSMIC_PASSWORD_KEYRING_SERVICE,
                 &account,
                 r#"{"version":1,"password":"existing-password"}"#,
             )
@@ -714,9 +816,52 @@ mod tests {
             Some("existing-password".into())
         );
         assert!(store.get(PASSWORD_KEYRING_SERVICE, &account).is_ok());
-        assert!(store.get(LEGACY_PASSWORD_KEYRING_SERVICE, &account).is_ok());
+        assert!(store.get(COSMIC_PASSWORD_KEYRING_SERVICE, &account).is_ok());
         remove_password(&store, SERVER, "opencode").unwrap();
         assert_eq!(load_password(&store, SERVER, "opencode").unwrap(), None);
+        assert_eq!(
+            store
+                .get(COSMIC_PASSWORD_KEYRING_SERVICE, &account)
+                .unwrap(),
+            r#"{"version":1,"password":"existing-password"}"#
+        );
+        assert_eq!(
+            store.get(PASSWORD_KEYRING_SERVICE, &account).unwrap(),
+            REMOVED_SECRET_MARKER
+        );
+    }
+
+    #[test]
+    fn gtk_password_migrates_before_cosmic_and_is_not_deleted_on_forget() {
+        let store = MemoryStore::default();
+        let account = password_account(SERVER, "opencode").unwrap();
+        store
+            .set(
+                GTK_PASSWORD_KEYRING_SERVICE,
+                &account,
+                r#"{"version":1,"password":"gtk-password"}"#,
+            )
+            .unwrap();
+        store
+            .set(
+                COSMIC_PASSWORD_KEYRING_SERVICE,
+                &account,
+                r#"{"version":1,"password":"cosmic-password"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            load_password(&store, SERVER, "opencode").unwrap(),
+            Some("gtk-password".into())
+        );
+        remove_password(&store, SERVER, "opencode").unwrap();
+        assert_eq!(load_password(&store, SERVER, "opencode").unwrap(), None);
+        assert!(store.get(GTK_PASSWORD_KEYRING_SERVICE, &account).is_ok());
+        assert!(store.get(COSMIC_PASSWORD_KEYRING_SERVICE, &account).is_ok());
+        save_password(&store, SERVER, "opencode", "new-password").unwrap();
+        assert_eq!(
+            load_password(&store, SERVER, "opencode").unwrap(),
+            Some("new-password".into())
+        );
     }
 
     #[test]
@@ -725,7 +870,7 @@ mod tests {
         let account = password_account(SERVER, "opencode").unwrap();
         store
             .set(
-                LEGACY_PASSWORD_KEYRING_SERVICE,
+                COSMIC_PASSWORD_KEYRING_SERVICE,
                 &account,
                 "broken legacy entry",
             )

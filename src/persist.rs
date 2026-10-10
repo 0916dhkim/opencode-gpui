@@ -167,19 +167,49 @@ pub fn load_with_legacy(path: &Path) -> Result<(PersistedState, Option<String>)>
     let Some(config) = path.parent().and_then(Path::parent) else {
         return PersistedState::load(path);
     };
-    for name in ["opencode-cosmic", "opencode-gtk"] {
-        let legacy = config.join(name).join("state.json");
-        if legacy.exists() {
-            let bytes = fs::read(&legacy)
-                .with_context(|| format!("failed to read {}", legacy.display()))?;
-            let state: PersistedState = serde_json::from_slice(&bytes)
-                .with_context(|| format!("legacy state is invalid at {}", legacy.display()))?;
-            state.save(path)?;
-            return Ok((
-                state,
-                Some(format!("Copied state from {}", legacy.display())),
-            ));
+    // The installed client may be either GTK or COSMIC. Import the most
+    // recently written *valid* state instead of preferring an obsolete one.
+    let mut candidates = ["opencode-gtk", "opencode-cosmic"]
+        .into_iter()
+        .map(|name| config.join(name).join("state.json"))
+        .filter(|candidate| candidate.exists())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| {
+        std::cmp::Reverse(
+            candidate
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH),
+        )
+    });
+    let mut errors = Vec::new();
+    for legacy in candidates {
+        match fs::read(&legacy)
+            .with_context(|| format!("failed to read {}", legacy.display()))
+            .and_then(|bytes| {
+                serde_json::from_slice::<PersistedState>(&bytes)
+                    .with_context(|| format!("legacy state is invalid at {}", legacy.display()))
+            }) {
+            Ok(state) => {
+                state.save(path)?;
+                let skipped = if errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (skipped invalid/unreadable state: {})", errors.join(", "))
+                };
+                return Ok((
+                    state,
+                    Some(format!("Copied state from {}{skipped}", legacy.display())),
+                ));
+            }
+            Err(_) => errors.push(legacy.display().to_string()),
         }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "could not read a valid legacy state at {}",
+            errors.join(", ")
+        );
     }
     PersistedState::load(path)
 }
@@ -206,6 +236,55 @@ mod tests {
         assert!(new.exists());
         let (_, warning) = load_with_legacy(&new).unwrap();
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn newest_valid_client_state_wins_without_modifying_either_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cosmic = dir.path().join("opencode-cosmic/state.json");
+        let gtk = dir.path().join("opencode-gtk/state.json");
+        let gpui = dir.path().join("opencode-gpui/state.json");
+        PersistedState {
+            zoom_level: 1.25,
+            ..PersistedState::default()
+        }
+        .save(&cosmic)
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        PersistedState {
+            zoom_level: 1.5,
+            ..PersistedState::default()
+        }
+        .save(&gtk)
+        .unwrap();
+        let cosmic_bytes = fs::read(&cosmic).unwrap();
+        let gtk_bytes = fs::read(&gtk).unwrap();
+        let (loaded, warning) = load_with_legacy(&gpui).unwrap();
+        assert_eq!(loaded.zoom_level, 1.5);
+        assert!(warning.unwrap().contains("opencode-gtk"));
+        assert_eq!(fs::read(&cosmic).unwrap(), cosmic_bytes);
+        assert_eq!(fs::read(&gtk).unwrap(), gtk_bytes);
+    }
+
+    #[test]
+    fn invalid_newer_client_state_falls_back_without_mutating_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let cosmic = dir.path().join("opencode-cosmic/state.json");
+        let gtk = dir.path().join("opencode-gtk/state.json");
+        let gpui = dir.path().join("opencode-gpui/state.json");
+        PersistedState {
+            zoom_level: 1.25,
+            ..PersistedState::default()
+        }
+        .save(&cosmic)
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        fs::create_dir_all(gtk.parent().unwrap()).unwrap();
+        fs::write(&gtk, b"invalid JSON").unwrap();
+        let (loaded, warning) = load_with_legacy(&gpui).unwrap();
+        assert_eq!(loaded.zoom_level, 1.25);
+        assert!(warning.unwrap().contains("opencode-gtk"));
+        assert_eq!(fs::read(&gtk).unwrap(), b"invalid JSON");
     }
 
     #[test]

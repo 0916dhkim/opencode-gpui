@@ -116,6 +116,10 @@ state_flag() {
   python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["connection"].get("basic_auth_in_keyring")).lower())' "${state}"
 }
 
+state_zoom() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["zoom_level"])' "${state}"
+}
+
 wait_state_flag() {
   local expected="$1" attempt
   # A fresh ApiHandle can authenticate before the synchronous Settings Apply
@@ -166,7 +170,9 @@ open_password_field() {
 }
 
 stored_entry() {
-  secret-tool lookup service ai.opencode.Gpui.basic-auth username "${account}" 2>/dev/null
+  local stored
+  stored="$(secret-tool lookup service ai.opencode.Gpui.basic-auth username "${account}" 2>/dev/null)"
+  [[ "$stored" == '{"version":1,"removed":true}' ]] || printf '%s' "$stored"
 }
 
 # ------------------------------------------------------------ environment
@@ -255,6 +261,9 @@ check "env.state-flag" '[[ "$(state_flag)" == false ]]'
 
 # ------------------------------------------------------------ 6. copy legacy state and password
 
+# This is a separate first-launch migration fixture, not a forgotten GPUI
+# credential from the preceding scenario.
+secret-tool clear service ai.opencode.Gpui.basic-auth username "${account}" >/dev/null
 legacy_state="${temporary}/config/opencode-cosmic/state.json"
 gpui_state="${state}"
 state="${legacy_state}"
@@ -271,6 +280,42 @@ check "migration.state-copied" 'wait_state_flag true'
 check "migration.new-keyring-entry" '[[ "$(stored_entry)" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
 check "migration.old-keyring-entry-retained" '[[ "$(secret-tool lookup service ai.opencode.Cosmic.basic-auth username "${account}")" == "$(stored_entry)" ]]'
 check "migration.old-state-untouched" '[[ "$(sha256sum "${legacy_state}" | cut -d" " -f1)" == "${legacy_hash}" ]]'
+open_password_field
+gpui_click 310 404
+gpui_click 760 727
+check "migration.forget-state-flag" 'wait_state_flag false'
+check "migration.forget-marker" '[[ "$(secret-tool lookup service ai.opencode.Gpui.basic-auth username "${account}")" == "{\"version\":1,\"removed\":true}" ]]'
+check "migration.forget-retains-old-entry" '[[ "$(secret-tool lookup service ai.opencode.Cosmic.basic-auth username "${account}")" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
+quit
+
+# ------------------------------------------------------------ 7. newer GTK state and keyring
+
+secret-tool clear service ai.opencode.Gpui.basic-auth username "${account}" >/dev/null
+printf '%s' '{"version":1,"password":"obsolete-cosmic-password"}' |
+  secret-tool store --label='Older Cosmic password' \
+    service ai.opencode.Cosmic.basic-auth username "${account}"
+gtk_state="${temporary}/config/opencode-gtk/state.json"
+state="${gtk_state}"
+write_state true
+python3 - "${gtk_state}" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as stream: state = json.load(stream)
+state['zoom_level'] = 1.15
+with open(path, 'w', encoding='utf-8') as stream: json.dump(state, stream)
+PY
+state="${gpui_state}"
+gtk_hash="$(sha256sum "${gtk_state}" | cut -d' ' -f1)"
+rm -f "${gpui_state}"
+printf '%s' "{\"version\":1,\"password\":\"${password}\"}" |
+  secret-tool store --label='GTK OpenCode Basic password' \
+    service ai.opencode.Gtk.basic-auth username "${account}"
+launch OPENCODE_SERVER_URL="${address}"
+expect "gtk-migration.connects-with-gtk-password" "${auth_route} and r['auth'] == 'ok'"
+check "gtk-migration.newer-state-copied" '[[ "$(state_zoom)" == 1.15 ]]'
+check "gtk-migration.gpui-keyring-entry" '[[ "$(stored_entry)" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
+check "gtk-migration.gtk-keyring-retained" '[[ "$(secret-tool lookup service ai.opencode.Gtk.basic-auth username "${account}")" == "$(stored_entry)" ]]'
+check "gtk-migration.gtk-state-untouched" '[[ "$(sha256sum "${gtk_state}" | cut -d" " -f1)" == "${gtk_hash}" ]]'
 quit
 
 # ------------------------------------------------------------ secrets stay out of files and logs
