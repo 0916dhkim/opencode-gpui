@@ -6474,6 +6474,10 @@ impl Client {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let user = row.role.label() == "YOU";
+        let last = self
+            .transcript
+            .get(&self.active)
+            .is_some_and(|transcript| index + 1 == transcript.len());
         let shade = if user {
             self.tone(0xe4ddd0, 0x1c242b)
         } else {
@@ -6581,13 +6585,17 @@ impl Client {
             .gap(px(if user { 10. } else { 6. }))
             .px(px(28.))
             .pt(px(18.))
-            .pb(px(20.))
+            // Replace the final row's 1px separator with padding so a later
+            // append does not change its cached measured height.
+            .pb(px(if last { 21. } else { 20. }))
             .bg(shade)
             .when(row.kind == TranscriptRowKind::Reasoning, |view| {
                 view.opacity(0.42)
             })
-            .border_b_1()
-            .border_color(self.tone(0xc8c3ba, 0x24282c))
+            .when(!last, |view| {
+                view.border_b_1()
+                    .border_color(self.tone(0xc8c3ba, 0x24282c))
+            })
             .child(
                 div()
                     .flex()
@@ -10679,6 +10687,60 @@ mod tests {
             assert!(state.rendered_rows.borrow().contains(&99));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn final_row_without_separator_keeps_its_height_after_an_append(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    vec![cache_row("first", "One short response.")],
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            });
+        });
+        let measure_first = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                for _ in 0..3 {
+                    window.render_frame(cx);
+                    window.simulate_next_frame(cx);
+                }
+                let client = client.read(cx);
+                let row = &client.transcript[&client.active][0];
+                client.row_heights[&client.active]
+                    .borrow()
+                    .height(row)
+                    .expect("first row measured")
+            })
+            .unwrap()
+        };
+        let final_height = measure_first(cx);
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let session = client.active.clone();
+                let first = client.transcript[&session][0].key.clone();
+                client
+                    .transcript
+                    .get_mut(&session)
+                    .unwrap()
+                    .push(cache_row("second", "A following response."));
+                client.row_heights[&session]
+                    .borrow_mut()
+                    .entries
+                    .remove(&first);
+                cx.notify();
+            });
+        });
+        assert_eq!(final_height, measure_first(cx));
     }
 
     #[gpui_kit::test]
