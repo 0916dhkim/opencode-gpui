@@ -35,10 +35,10 @@ export GSETTINGS_BACKEND=memory GDK_BACKEND=x11 GTK_A11Y=none NO_AT_BRIDGE=1
 export LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=vulkan
 if [[ "$CLIENT" == gpui ]]; then
   # Vulkan/X11 on Xvfb maps a window but does not present its pixels. Nested
-  # Weston composites the GPUI Wayland surface into its X11 kiosk output.
-  window_w=780
-  window_h=791
-  weston --backend=x11-backend.so --use-pixman --shell=kiosk-shell.so \
+  # Weston composites the GPUI Wayland surface into its X11 output.
+  window_w="${WINDOW_W:-780}"
+  window_h="${WINDOW_H:-791}"
+  weston --backend=x11-backend.so --use-pixman --shell="${WESTON_SHELL:-kiosk-shell.so}" \
     --width="$window_w" --height="$window_h" --socket=wayland-1 \
     --no-config --log="${OUTPUT}.weston.log" >/dev/null 2>&1 & compositor_pid=$!
   export WAYLAND_DISPLAY=wayland-1
@@ -129,6 +129,16 @@ if [[ "${INTERACTION:-}" == toggle-sidebar ]]; then
     sleep 0.2
   fi
   xdotool key ctrl+b
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == titlebar-maximize ]]; then
+  xdotool mousemove --window "$win" "$((window_w - 51))" 22 click 1
+  sleep 0.3
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == titlebar-drag ]]; then
+  xdotool mousemove --window "$win" "$((window_w / 2))" 22 mousedown 1
+  xdotool mousemove --window "$win" "$((window_w / 2 + 12))" 30
+  sleep 0.3
+  xdotool mouseup 1
 fi
 if [[ "$CLIENT" == gpui && "$case_name" == main && -z "${INTERACTION:-}" && "${PREVIEW_API:-0}" != 1 ]]; then
   # GTK's reference main screenshot has an empty, focused composer. Match its

@@ -15,7 +15,10 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::component::{Icon, Sizable, VirtualListScrollHandle, v_virtual_list};
+use gpui_kit::component::{
+    Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar, VirtualListScrollHandle, WindowBorder,
+    v_virtual_list, window_paddings,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use opencode_gpui::{
@@ -2560,7 +2563,19 @@ impl Client {
     }
 
     fn transcript_width(&self, window: &Window) -> Pixels {
+        let frame = match window.window_decorations() {
+            Decorations::Client { tiling } => {
+                let padding = window_paddings(window);
+                // WindowBorder adds a 1px frame on each untiled side.
+                padding.left
+                    + padding.right
+                    + px(if tiling.left { 0. } else { 1. })
+                    + px(if tiling.right { 0. } else { 1. })
+            }
+            Decorations::Server => px(0.),
+        };
         window.viewport_size().width
+            - frame
             - px(if self.sidebar_visible {
                 SIDEBAR_WIDTH
             } else {
@@ -9395,6 +9410,14 @@ impl Client {
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
+        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        let controls = window.window_controls();
+        let title_offset = if client_decorated {
+            TITLE_BAR_HEIGHT
+                * (1 + usize::from(controls.minimize) + usize::from(controls.maximize)) as f32
+        } else {
+            px(0.)
+        };
         self.transcript_content_width = (self.transcript_width(window) - px(56.)).max(px(1.));
         self.sync_composer(window, cx);
         if self.focus_composer_pending
@@ -9632,71 +9655,102 @@ impl Render for Client {
             .text_color(self.tone(0x252829, 0xe8e5df))
             .bg(self.tone(0xf4f1eb, 0x101214))
             .child(
-                div()
+                TitleBar::new()
                     .h(px(46.))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .border_b_1()
+                    .pl(px(0.))
                     .border_color(self.tone(0xc8c3ba, 0x2a2e32))
                     .bg(self.tone(0xf4f1eb, 0x14171a))
                     .child(
                         div()
-                            .w(px(if self.sidebar_visible {
-                                SIDEBAR_WIDTH
-                            } else {
-                                48.
-                            }))
-                            .pl(px(16.))
-                            .child(
-                                div()
-                                    .id("sidebar-toggle")
-                                    .role(Role::Button)
-                                    .aria_label(if self.sidebar_visible {
-                                        "Hide sidebar"
-                                    } else {
-                                        "Show sidebar"
-                                    })
-                                    .test_support()
-                                    .track_focus(&self.sidebar_toggle_focus)
-                                    .focus_visible(|style| {
-                                        style.border_color(self.tone(0x2356a8, 0x78baff))
-                                    })
-                                    .cursor_pointer()
-                                    .on_key_down(cx.listener(
-                                        |this, event: &KeyDownEvent, _, cx| {
-                                            if matches!(
-                                                event.keystroke.key.as_str(),
-                                                "enter" | "space"
-                                            ) {
-                                                this.toggle_sidebar(cx);
-                                                cx.stop_propagation();
-                                            }
-                                        },
-                                    ))
-                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-                                    .child("◫"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
+                            .w_full()
+                            .h_full()
+                            .relative()
                             .flex()
                             .items_center()
-                            .gap(px(10.))
-                            .pl(px(27.))
-                            .pr(px(16.))
-                            .child(div().font_weight(FontWeight::BOLD).child("OpenCode"))
+                            // TitleBar renders controls to the right of this content.
+                            // Offset by their width so GTK's title widget stays
+                            // centered across the whole window at any width.
+                            .child(div().w(title_offset).flex_shrink_0())
                             .child(
                                 div()
-                                    .min_w_0()
                                     .flex_1()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(11.))
-                                    .text_color(self.tone(0x77817e, 0x899097))
-                                    .child(self.connection_status.clone()),
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .when(client_decorated, |view| {
+                                                view.child(
+                                                    div()
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child("OpenCode"),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .max_w(px(360.))
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_size(px(11.))
+                                                    .text_color(self.tone(0x77817e, 0x899097))
+                                                    .child(self.connection_status.clone()),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .h_full()
+                                    .w(px(if self.sidebar_visible {
+                                        SIDEBAR_WIDTH
+                                    } else {
+                                        48.
+                                    }))
+                                    .pl(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .id("sidebar-toggle")
+                                            .role(Role::Button)
+                                            .aria_label(if self.sidebar_visible {
+                                                "Hide sidebar"
+                                            } else {
+                                                "Show sidebar"
+                                            })
+                                            .test_support()
+                                            .track_focus(&self.sidebar_toggle_focus)
+                                            .focus_visible(|style| {
+                                                style.border_color(self.tone(0x2356a8, 0x78baff))
+                                            })
+                                            .cursor_pointer()
+                                            .on_key_down(cx.listener(
+                                                |this, event: &KeyDownEvent, _, cx| {
+                                                    if matches!(
+                                                        event.keystroke.key.as_str(),
+                                                        "enter" | "space"
+                                                    ) {
+                                                        this.toggle_sidebar(cx);
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.toggle_sidebar(cx)
+                                                }),
+                                            )
+                                            .child("◫"),
+                                    ),
                             ),
                     ),
             )
@@ -9734,7 +9788,18 @@ impl Render for Client {
                     ),
             )
             .when_some(self.modal_view(window, cx), |view, modal| view.child(modal));
-        root.when_some(row_probe, |view, probe| view.child(probe))
+        WindowBorder::new().child(root.when_some(row_probe, |view, probe| view.child(probe)))
+    }
+}
+
+fn client_window_options() -> WindowOptions {
+    WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some("OpenCode".into()),
+            ..TitleBar::title_bar_options()
+        }),
+        window_decorations: Some(WindowDecorations::Client),
+        ..TitleBar::window_options()
     }
 }
 
@@ -9749,14 +9814,7 @@ pub fn run(args: Args) {
                 Ok("light") => Theme::change(ThemeMode::Light, None, cx),
                 _ => {}
             }
-            let options = WindowOptions {
-                titlebar: Some(TitlebarOptions {
-                    title: Some("OpenCode".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            gpui_kit::open_window(options, cx, |window, cx| {
+            gpui_kit::open_window(client_window_options(), cx, |window, cx| {
                 cx.new(|cx| {
                     if args.preview {
                         Client::from_preview(window, cx, args.drawer.clone())
@@ -9825,6 +9883,18 @@ mod tests {
             .filter(|message| !message.in_tray())
             .flat_map(|message| message.rows())
             .collect()
+    }
+
+    #[test]
+    fn live_window_uses_custom_client_decorations() {
+        let options = super::client_window_options();
+        assert_eq!(
+            options.window_decorations,
+            Some(gpui_kit::WindowDecorations::Client)
+        );
+        let titlebar = options.titlebar.expect("titlebar options");
+        assert_eq!(titlebar.title.as_deref(), Some("OpenCode"));
+        assert!(titlebar.appears_transparent);
     }
 
     #[test]
