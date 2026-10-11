@@ -17,7 +17,7 @@ use gpui_kit::component::text::markdown;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar, VirtualListScrollHandle, WindowBorder,
-    v_virtual_list, window_paddings,
+    v_virtual_list,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -2565,12 +2565,10 @@ impl Client {
     fn transcript_width(&self, window: &Window) -> Pixels {
         let frame = match window.window_decorations() {
             Decorations::Client { tiling } => {
-                let padding = window_paddings(window);
-                // WindowBorder adds a 1px frame on each untiled side.
-                padding.left
-                    + padding.right
-                    + px(if tiling.left { 0. } else { 1. })
-                    + px(if tiling.right { 0. } else { 1. })
+                // The client border has no shadow inset, only a 1px frame on
+                // untiled sides. Do not use window_paddings here: it assumes
+                // the default 20px shadow before the first rendered frame.
+                px(if tiling.left { 0. } else { 1. }) + px(if tiling.right { 0. } else { 1. })
             }
             Decorations::Server => px(0.),
         };
@@ -9788,7 +9786,9 @@ impl Render for Client {
                     ),
             )
             .when_some(self.modal_view(window, cx), |view, modal| view.child(modal));
-        WindowBorder::new().child(root.when_some(row_probe, |view, probe| view.child(probe)))
+        WindowBorder::new()
+            .shadow_size(px(0.))
+            .child(root.when_some(row_probe, |view, probe| view.child(probe)))
     }
 }
 
