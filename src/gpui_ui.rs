@@ -9685,6 +9685,7 @@ impl Render for Client {
                             .items_center()
                             .gap(px(10.))
                             .pl(px(27.))
+                            .pr(px(16.))
                             .child(div().font_weight(FontWeight::BOLD).child("OpenCode"))
                             .child(
                                 div()
@@ -9697,15 +9698,6 @@ impl Render for Client {
                                     .text_color(self.tone(0x77817e, 0x899097))
                                     .child(self.connection_status.clone()),
                             ),
-                    )
-                    .child(
-                        div()
-                            .pr(px(16.))
-                            .flex()
-                            .gap(px(20.))
-                            .child("−")
-                            .child("□")
-                            .child("×"),
                     ),
             )
             .child(
