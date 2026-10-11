@@ -1,6 +1,6 @@
 # OpenCode Desktop (GPUI rebuild)
 
-An in-progress native Linux desktop client for [OpenCode v2](https://opencode.ai/v2/docs/) using GPUI Kit. This `rebuild/gpui` branch replaces the old libcosmic UI while retaining the v2 transport and state model. It is **not ready to install as a replacement**; the last verified COSMIC client remains on `main` until behavior and visual parity are complete.
+An in-progress native Linux desktop client for [OpenCode v2](https://opencode.ai/v2/docs/) using GPUI Kit. This GPUI prototype is now on `main` while the last verified COSMIC client remains recoverable in Git history. It is **not ready to install as a replacement** until behavior and visual parity are accepted.
 
 The prototype currently renders a session sidebar, transcript, composer, model and effort pickers, waiting tray, and several modals. Basic v2 bootstrap, streaming events, message send, session creation/rename, model selection, editable connection settings and per-server tab persistence are wired. Queue/switch/cancel/resume and several shortcuts and picker-keyboard paths have been exercised against the in-process preview API. Not all UI paths have been verified against a live server. Permission cards, robust Markdown/virtualized transcript behavior, comprehensive shortcuts, dark-theme parity, and interaction/accessibility testing still need work. Do not treat a successful preview capture as proof of those features.
 
@@ -15,6 +15,8 @@ Build for Linux:
 ```bash
 cargo build --release
 ```
+
+On a Mac with the amd64 Docker builder image, use `./build-linux-release.sh` instead. It builds from the current checkout with a per-checkout Linux-native Cargo target volume and a shared persistent registry volume, then exports the completed binary to `target/release/opencode-gpui`. This avoids false Cargo cache misses caused by rounded mtimes on Docker Desktop's macOS bind mount. Set `CARGO_BUILD_JOBS=1` if the builder runs out of memory.
 
 Run the deterministic offline screenshot fixture, or exercise the real command/event UI against its in-process preview server:
 
