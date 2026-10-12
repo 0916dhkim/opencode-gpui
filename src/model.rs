@@ -467,10 +467,13 @@ impl ChatMessage {
     }
 
     /// An undelivered user prompt: a tray item, not a transcript row. An
-    /// optimistic idle send has no delivery mode and remains a transcript
-    /// row; optimistic steer/queue sends belong in the tray immediately.
+    /// idle direct send stays in the transcript even after an enqueue event
+    /// briefly precedes its delivery; it has no delivery mode and still
+    /// needs canonical history. Actual waiting items belong in the tray.
     pub fn in_tray(&self) -> bool {
-        self.queued && self.role == Role::User && (!self.optimistic || self.delivery.is_some())
+        self.queued
+            && self.role == Role::User
+            && (self.delivery.is_some() || !self.needs_canonical_history)
     }
 
     pub fn render_revision(&self) -> u64 {
@@ -1330,13 +1333,21 @@ impl Conversation {
             {
                 let mut canonical = user_chat_message(id, created, &payload.text, &payload.files);
                 canonical.queued = true;
-                // Once the server confirms an inbox item, use the normal
-                // waiting tray. Keeping it in the transcript would hide the
-                // tray's switch/cancel controls for this prompt.
+                // A waiting send gets the normal tray and its switch/cancel
+                // controls; an idle direct send stays in the transcript.
                 canonical.optimistic = false;
                 canonical.needs_canonical_history = false;
                 canonical.delivery = item_delivery(item);
                 let previous = &self.messages[index];
+                if previous.delivery.is_none()
+                    && canonical.delivery != Some(protocol::Delivery::Queue)
+                {
+                    // The server emits enqueued before delivered even for an
+                    // idle direct send. Keep its row in the transcript until
+                    // delivery instead of flashing the steer tray for a frame.
+                    canonical.delivery = None;
+                    canonical.needs_canonical_history = true;
+                }
                 let changed = !previous.same_rendered_content(&canonical);
                 let was_optimistic = previous.optimistic;
                 canonical.render_revision = previous.render_revision + u64::from(changed);
@@ -3929,6 +3940,35 @@ mod tests {
                 .iter()
                 .any(|row| row["body"] == "Hello")
         );
+        let enqueued = live(
+            "session.inbox.enqueued",
+            json!({
+                "inboxID": "msg_idle", "item": { "type": "user",
+                    "payload": { "text": "Hello", "files": [] }, "delivery": "steer" }
+            }),
+        );
+        assert!(conversation.apply_event(&enqueued));
+        assert!(conversation.has_confirmed_user_message("msg_idle"));
+        assert!(conversation.needs_canonical_user_message("msg_idle"));
+        assert!(
+            conversation.tray_items().is_empty(),
+            "no transient steer tray"
+        );
+        assert_eq!(
+            row_values(&conversation)
+                .iter()
+                .filter(|row| row["body"] == "Hello")
+                .count(),
+            1,
+            "the same user row stays visible through enqueue"
+        );
+        assert!(!conversation.remove_unconfirmed_local_prompt("msg_idle"));
+        assert!(conversation.apply_event(&live(
+            "session.inbox.delivered",
+            json!({ "inboxID": "msg_idle" }),
+        )));
+        assert!(conversation.tray_items().is_empty());
+        assert!(conversation.has_delivered_user_message("msg_idle"));
     }
 
     #[test]

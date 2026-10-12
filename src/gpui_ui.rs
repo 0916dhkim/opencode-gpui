@@ -16522,8 +16522,10 @@ mod tests {
                         .iter()
                         .filter(|row| row.key.message_id == pending.message_id)
                         .count(),
-                    0
+                    1,
+                    "the idle direct send stays visible during enqueue"
                 );
+                assert!(client.conversations[&session].tray_items().is_empty());
                 assert!(client.deferred_abort.contains(&session));
                 client.handle_live_event(
                     event(
