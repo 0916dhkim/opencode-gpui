@@ -6296,12 +6296,35 @@ impl Client {
 
     fn tab_drop_slot(&self, target: &str, after: bool, cx: &Context<Self>) -> AnyElement {
         let target = target.to_owned();
+        let motion_target = target.clone();
         let position = if after { "after" } else { "before" };
         let animation_id = format!("tab-drop-slot-expand-{target}-{position}");
         div()
             .id(format!("tab-drop-slot-{target}-{position}"))
             .test_support()
             .w_full()
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                    if this.tab_shortcut_hint || event.drag(cx).0 == motion_target {
+                        return;
+                    }
+                    let Some((_, origin)) = this
+                        .tab_drop_anchor
+                        .as_ref()
+                        .filter(|(id, _)| id == &motion_target)
+                    else {
+                        return;
+                    };
+                    let destination = Some((
+                        motion_target.clone(),
+                        event.event.position.y >= *origin + px(17.),
+                    ));
+                    if this.tab_drop_target != destination {
+                        this.tab_drop_target = destination;
+                        cx.notify();
+                    }
+                }),
+            )
             .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
                 this.drop_tab(&drag.0, &target, cx);
             }))
@@ -14999,7 +15022,7 @@ mod tests {
             window.render_frame(cx);
             let from = window.find(format!("drag-tab-{first}")).bounds().center();
             let second_row = window.find(format!("tab-{second}")).bounds();
-            window.drag(from, second_row.origin + point(px(30.), px(28.)), cx);
+            window.drag(from, second_row.origin + point(px(30.), px(32.)), cx);
             assert_eq!(client.read(cx).open_tabs, reordered);
             assert_eq!(client.read(cx).active, *first);
             assert_eq!(
@@ -15069,7 +15092,7 @@ mod tests {
             window.render_frame(cx);
             let from = window.find(format!("drag-tab-{first}")).bounds().center();
             let second_row = window.find(format!("tab-{second}")).bounds();
-            window.drag(from, second_row.origin + point(px(30.), px(28.)), cx);
+            window.drag(from, second_row.origin + point(px(30.), px(32.)), cx);
             assert_eq!(client.read(cx).open_tabs, reordered);
             window.render_frame(cx);
             window.click(format!("close-{second}"), cx);
