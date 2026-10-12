@@ -8374,35 +8374,36 @@ impl Client {
             Modal::Sessions | Modal::NewSession => {
                 let sessions = modal == Modal::Sessions;
                 let mut card = div()
+                    .id(if sessions {
+                        "session-picker-card"
+                    } else {
+                        "new-session-picker-card"
+                    })
+                    .test_support()
                     .w(px(if sessions { 520. } else { 349. }))
                     .h(px(if sessions { 410. } else { 319. }))
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(self.tone(0xc8c3ba, if sessions { 0x27272a } else { 0x2a3038 }))
-                    .bg(self.tone(0xffffff, if sessions { 0x18181b } else { 0x15181c }))
+                    .border_color(self.tone(0xc8c3ba, 0x27272a))
+                    .bg(self.tone(0xffffff, 0x18181b))
                     .shadow_lg()
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .h(px(if sessions { 48. } else { 55. }))
+                            .h(px(48.))
                             .px(px(12.))
                             .border_b_1()
-                            .border_color(self.tone(
-                                if sessions { 0xded8cb } else { 0x4f99ee },
-                                if sessions { 0x27272a } else { 0x62bceb },
-                            ))
-                            .when(!sessions, |header| header.border_1().rounded(px(6.)))
+                            .border_color(self.tone(0xded8cb, 0x27272a))
                             .flex()
                             .items_center()
-                            .when(sessions, |view| {
-                                view.child(
-                                    Icon::default()
-                                        .data(include_bytes!("icons/search.svg"))
-                                        .with_size(px(16.))
-                                        .text_color(self.tone(0x8b918e, 0x71717a)),
-                                )
-                            })
+                            .child(
+                                Icon::default()
+                                    .data(include_bytes!("icons/search.svg"))
+                                    .with_size(px(16.))
+                                    .text_color(self.tone(0x8b918e, 0x71717a)),
+                            )
                             .child(Input::new(&self.search).appearance(false)),
                     );
                 if sessions {
@@ -8411,6 +8412,7 @@ impl Client {
                         .id("session-picker-list")
                         .flex_1()
                         .min_h_0()
+                        .min_w_0()
                         .overflow_y_scroll()
                         .track_scroll(&self.sessions_picker_scroll)
                         .flex()
@@ -8437,12 +8439,11 @@ impl Client {
                                     style.border_color(self.tone(0x2356a8, 0x78baff))
                                 })
                                 .h(px(44.))
+                                .w_full()
                                 .flex_shrink_0()
-                                .mx(px(10.))
-                                .px(px(12.))
+                                .px(px(20.))
                                 .flex()
                                 .items_center()
-                                .rounded(px(6.))
                                 .bg(self.tone(
                                     if self.picker_highlight == Some(index) || selected {
                                         0xf1efec
@@ -8463,12 +8464,25 @@ impl Client {
                                 }))
                                 .child(
                                     div()
+                                        .id(format!("session-title-{}", session.id))
+                                        .test_support()
                                         .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .font_weight(FontWeight::BOLD)
                                         .child(session.title.clone()),
                                 )
                                 .child(
                                     div()
+                                        .id(format!("session-path-{}", session.id))
+                                        .test_support()
+                                        .max_w(px(190.))
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .text_size(px(11.))
                                         .text_color(self.tone(0x85909a, 0xa1a1aa))
                                         .child(session.directory.clone()),
@@ -8550,6 +8564,7 @@ impl Client {
                         .id("new-session-picker-list")
                         .flex_1()
                         .min_h_0()
+                        .min_w_0()
                         .overflow_y_scroll()
                         .track_scroll(&self.projects_picker_scroll)
                         .flex()
@@ -8564,6 +8579,8 @@ impl Client {
                     }
                     for (index, (label, directory)) in choices.into_iter().enumerate() {
                         let path = directory.clone();
+                        let title_id = format!("project-title-{directory}");
+                        let path_id = format!("project-path-{directory}");
                         list = list.child(
                             div()
                                 .id(format!("project-choice-{directory}"))
@@ -8583,31 +8600,47 @@ impl Client {
                                     this.create_session(directory.clone(), cx);
                                 }))
                                 .h(px(44.))
+                                .w_full()
                                 .flex_shrink_0()
-                                .m(px(4.))
-                                .px(px(18.))
+                                .px(px(20.))
                                 .flex()
                                 .items_center()
-                                .rounded(px(6.))
                                 .bg(self.tone(
                                     if self.picker_highlight.is_none_or(|at| at == index) {
-                                        0xece9e2
+                                        0xf1efec
                                     } else {
                                         0xffffff
                                     },
                                     if self.picker_highlight.is_none_or(|at| at == index) {
-                                        0x252d37
+                                        0x27272a
                                     } else {
-                                        0x15181c
+                                        0x18181b
                                     },
                                 ))
                                 .font_weight(FontWeight::BOLD)
-                                .child(div().flex_1().child(label))
                                 .child(
                                     div()
+                                        .id(title_id)
+                                        .test_support()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .id(path_id)
+                                        .test_support()
+                                        .max_w(px(120.))
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .text_size(px(11.))
                                         .font_weight(FontWeight::NORMAL)
-                                        .text_color(self.tone(0x758080, 0x7d8590))
+                                        .text_color(self.tone(0x85909a, 0xa1a1aa))
                                         .child(path),
                                 ),
                         );
@@ -13203,6 +13236,66 @@ mod tests {
             focus.focus(window, cx);
             window.press("space", cx);
             assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn tab_and_project_picker_rows_fill_cards_without_long_text_overflow(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("sessions".into())))
+            })
+            .expect("headless picker window")
+        });
+        let session_id = cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let session_id = client.open_tabs[0].clone();
+                let session = client
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                    .unwrap();
+                session.title = "A very long session title ".repeat(12);
+                session.directory = format!("/{}", "long-path-segment/".repeat(30));
+                cx.notify();
+                session_id
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.resize(size(px(780.), px(791.)));
+            window.bounds_changed(cx);
+            window.render_frame(cx);
+            let card = window.find("session-picker-card").bounds();
+            let row = window.find(format!("session-choice-{session_id}")).bounds();
+            let title = window.find(format!("session-title-{session_id}")).bounds();
+            let path = window.find(format!("session-path-{session_id}")).bounds();
+            assert!(row.origin.x <= card.origin.x + px(2.));
+            assert!(row.origin.x + row.size.width >= card.origin.x + card.size.width - px(3.));
+            assert!(title.origin.x + title.size.width <= path.origin.x + px(1.));
+            assert!(path.origin.x + path.size.width <= row.origin.x + row.size.width - px(12.));
+
+            let worktree = format!("/{}", "very-long-project-name".repeat(16));
+            client.update(cx, |client, cx| {
+                client.projects.insert(
+                    0,
+                    model::Project {
+                        worktree: worktree.clone(),
+                        name: None,
+                    },
+                );
+                client.show_modal(Modal::NewSession, window, cx);
+            });
+            window.render_frame(cx);
+            let card = window.find("new-session-picker-card").bounds();
+            let row = window.find(format!("project-choice-{worktree}")).bounds();
+            let title = window.find(format!("project-title-{worktree}")).bounds();
+            let path = window.find(format!("project-path-{worktree}")).bounds();
+            assert!(row.origin.x <= card.origin.x + px(2.));
+            assert!(row.origin.x + row.size.width >= card.origin.x + card.size.width - px(3.));
+            assert!(title.origin.x + title.size.width <= path.origin.x + px(1.));
+            assert!(path.origin.x + path.size.width <= row.origin.x + row.size.width - px(12.));
         })
         .unwrap();
     }
