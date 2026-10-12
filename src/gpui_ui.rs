@@ -1526,6 +1526,86 @@ impl Element for TranscriptMeasurementProbe {
     }
 }
 
+/// A Markdown TextView may finish parsing after its detached row was measured.
+/// Compare the mounted row's natural layout with that exact cached slot; a
+/// child-only refresh otherwise leaves the following virtual row at the old
+/// position, painting both rows on top of each other indefinitely.
+struct TranscriptMeasuredRow {
+    row: AnyElement,
+    cache: Rc<RefCell<RowHeightCache>>,
+    stamp: RowLayoutStamp,
+    key: TranscriptRowKey,
+    revision: u64,
+}
+
+impl IntoElement for TranscriptMeasuredRow {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for TranscriptMeasuredRow {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.row.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let height = bounds.size.height;
+        let mut cache = self.cache.borrow_mut();
+        if cache.stamp == Some(self.stamp)
+            && cache.entries.get(&self.key).is_some_and(|entry| {
+                entry.revision == self.revision
+                    && (entry.height.as_f32() - height.as_f32()).abs() > 0.5
+            })
+        {
+            cache.record(self.stamp, self.key.clone(), self.revision, height);
+            window.refresh();
+        }
+        drop(cache);
+        self.row.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.row.paint(window, cx);
+    }
+}
+
 fn image_display_size(width: usize, height: usize, available_width: f32) -> (f32, f32) {
     let (width, height) = if width == 0 || height == 0 {
         (200, 120)
@@ -6789,13 +6869,26 @@ impl Client {
         self.rendered_rows.borrow_mut().push(index);
         let element = self.message_row_with_images(row, index, stale_images, cx);
         #[cfg(test)]
-        {
+        let element = {
             use gpui_kit::base::TestSupportExt as _;
             element.test_support().into_any_element()
-        }
+        };
         #[cfg(not(test))]
+        let element = element.into_any_element();
+        if stale_images.is_none()
+            && let Some(cache) = self.row_heights.get(&self.active)
+            && let Some(stamp) = cache.borrow().stamp
         {
-            element.into_any_element()
+            TranscriptMeasuredRow {
+                row: element,
+                cache: cache.clone(),
+                stamp,
+                key: row.key.clone(),
+                revision: row.render_revision(),
+            }
+            .into_any_element()
+        } else {
+            element
         }
     }
 
@@ -12303,9 +12396,10 @@ mod tests {
                     rendered.iter().all(|index| *index == 0 || *index > 280),
                     "only near-tail rows were requested"
                 );
-                assert_eq!(
-                    client.row_heights[&client.active].borrow().layouts,
-                    baseline_layouts + token
+                let layouts = client.row_heights[&client.active].borrow().layouts;
+                assert!(
+                    (baseline_layouts + token..=baseline_layouts + token * 2).contains(&layouts),
+                    "token {token} remeasured too many rows: {layouts} after {baseline_layouts}"
                 );
             });
             cx.update_window(handle, |_, window, cx| {
@@ -16822,6 +16916,57 @@ mod tests {
             );
             let cache = state.row_heights[&state.active].borrow();
             assert_eq!(cache.height(&rows[index]), Some(list.size.height));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn large_async_markdown_remeasures_before_the_following_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1200.), px(1500.)),
+            ))),
+            ..Default::default()
+        };
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless long-markdown window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                let long_body = format!("# Long answer\n\n{}", "word ".repeat(1200));
+                client.transcript.insert(
+                    client.active.clone(),
+                    vec![
+                        cache_row("large_markdown", &long_body),
+                        cache_row("following", "Next row"),
+                    ],
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let state = client.read(cx);
+            let rows = &state.transcript[&state.active];
+            let list = window.find(("message", 0usize)).bounds();
+            let following = window.find(("message", 1usize)).bounds();
+            assert!(
+                following.origin.y >= list.origin.y + list.size.height,
+                "long Markdown overlaps the next row: {list:?} vs {following:?}"
+            );
+            let cache = state.row_heights[&state.active].borrow();
+            assert_eq!(cache.height(&rows[0]), Some(list.size.height));
         })
         .unwrap();
     }
