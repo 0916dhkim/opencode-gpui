@@ -707,7 +707,7 @@ enum MarkdownBlock {
 
 // Increment this when the row's typography or layout rules change. The other
 // parts of the stamp follow the live width, theme and conversation snapshot.
-const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 2;
+const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 3;
 const TRANSCRIPT_MEASURE_BATCH: usize = 64;
 const TRANSCRIPT_PROGRESSIVE_MIN_ROWS: usize = 256;
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
@@ -6478,6 +6478,7 @@ impl Client {
             .transcript
             .get(&self.active)
             .is_some_and(|transcript| index + 1 == transcript.len());
+        let show_separator = user && !last;
         let shade = if user {
             self.tone(0xe4ddd0, 0x1c242b)
         } else {
@@ -6585,17 +6586,18 @@ impl Client {
             .gap(px(if user { 10. } else { 6. }))
             .px(px(28.))
             .pt(px(18.))
-            // Replace the final row's 1px separator with padding so a later
-            // append does not change its cached measured height.
-            .pb(px(if last { 21. } else { 20. }))
+            // Agent segments stay continuous. A final user row replaces its
+            // separator with padding so an append keeps its measured height.
+            .pb(px(if user && last { 21. } else { 20. }))
             .bg(shade)
+            .when(user, |view| {
+                view.border_t_1()
+                    .border_color(self.tone(0xcfc6b6, 0x313a41))
+            })
             .when(row.kind == TranscriptRowKind::Reasoning, |view| {
                 view.opacity(0.42)
             })
-            .when(!last, |view| {
-                view.border_b_1()
-                    .border_color(self.tone(0xc8c3ba, 0x24282c))
-            })
+            .when(show_separator, |view| view.border_b_1())
             .child(
                 div()
                     .flex()
@@ -10700,10 +10702,9 @@ mod tests {
         });
         cx.update(|cx| {
             client.update(cx, |client, cx| {
-                client.transcript.insert(
-                    client.active.clone(),
-                    vec![cache_row("first", "One short response.")],
-                );
+                let mut first = cache_row("first", "One short response.");
+                first.role = model::Role::User;
+                client.transcript.insert(client.active.clone(), vec![first]);
                 client.row_heights.remove(&client.active);
                 cx.notify();
             });
