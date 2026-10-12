@@ -12185,6 +12185,13 @@ mod tests {
                 rendered.contains(&9999),
                 "painted tail is present on first frame"
             );
+            let viewport = current.scroll.bounds();
+            let last = window.find(("message", 9999usize)).bounds();
+            assert!(
+                last.origin.y < viewport.origin.y + viewport.size.height
+                    && last.origin.y + last.size.height > viewport.origin.y,
+                "tail row {last:?} is outside the first-frame viewport {viewport:?}"
+            );
         })
         .unwrap();
         cx.update(|cx| client.read(cx).rendered_rows.borrow_mut().clear());
