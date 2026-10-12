@@ -6022,7 +6022,7 @@ impl Client {
         let modal = match overlay.as_deref() {
             Some("settings") | Some("settings-sessions") => Some(Modal::Settings),
             Some("sessions") => Some(Modal::Sessions),
-            Some("new-session") => Some(Modal::NewSession),
+            Some("new-session") | Some("many-projects") => Some(Modal::NewSession),
             Some("rename") => Some(Modal::Rename),
             Some("model") => Some(Modal::Model),
             Some("level") => Some(Modal::Level),
@@ -6112,6 +6112,7 @@ impl Client {
         };
         let preview_long_jobs = overlay.as_deref() == Some("long-jobs");
         let preview_working_pill = overlay.as_deref() == Some("working-pill");
+        let preview_many_projects = overlay.as_deref() == Some("many-projects");
         if let Some(preview_markdown) = preview_markdown
             && let Some(row) = transcript.get_mut(&active).and_then(|rows| {
                 rows.iter_mut().find(|row| {
@@ -6308,6 +6309,14 @@ impl Client {
                 conversation.add_local_prompt("msg_working_preview", "continue", &[], None);
             }
             client.update_transcript(&active);
+        }
+        if preview_many_projects {
+            for index in 0..7 {
+                client.projects.push(model::Project {
+                    worktree: format!("/preview/project-{index}"),
+                    name: Some(format!("Project {index}")),
+                });
+            }
         }
         cx.subscribe(
             &client.search,
@@ -9186,6 +9195,10 @@ impl Client {
                     .bg(self.tone(0xffffff, 0x18181b))
                     .shadow_lg()
                     .overflow_hidden()
+                    // GPUI currently clips children to a rectangle, not this
+                    // card's rounded outline. Keep scrolling row backgrounds
+                    // away from the lower corner arc.
+                    .when(!sessions, |card| card.pb(px(9.)))
                     .flex()
                     .flex_col()
                     .child(
@@ -9360,6 +9373,7 @@ impl Client {
                     );
                     let mut list = div()
                         .id("new-session-picker-list")
+                        .test_support()
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
@@ -9376,6 +9390,8 @@ impl Client {
                         );
                     }
                     for (index, (label, directory)) in choices.into_iter().enumerate() {
+                        let highlighted = self.picker_highlight == Some(index)
+                            || (self.picker_highlight.is_none() && index == 0);
                         let path = directory.clone();
                         let title_id = format!("project-title-{directory}");
                         let path_id = format!("project-path-{directory}");
@@ -9403,18 +9419,7 @@ impl Client {
                                 .px(px(20.))
                                 .flex()
                                 .items_center()
-                                .bg(self.tone(
-                                    if self.picker_highlight.is_none_or(|at| at == index) {
-                                        0xf1efec
-                                    } else {
-                                        0xffffff
-                                    },
-                                    if self.picker_highlight.is_none_or(|at| at == index) {
-                                        0x27272a
-                                    } else {
-                                        0x18181b
-                                    },
-                                ))
+                                .when(highlighted, |row| row.bg(self.tone(0xf1efec, 0x27272a)))
                                 .font_weight(FontWeight::BOLD)
                                 .child(
                                     div()
@@ -14315,6 +14320,11 @@ mod tests {
             });
             window.render_frame(cx);
             let card = window.find("new-session-picker-card").bounds();
+            let list = window.find("new-session-picker-list").bounds();
+            assert!(
+                list.origin.y + list.size.height <= card.origin.y + card.size.height - px(9.),
+                "scrolling row backgrounds must stop above the lower corner arc"
+            );
             let row = window.find(format!("project-choice-{worktree}")).bounds();
             let title = window.find(format!("project-title-{worktree}")).bounds();
             let path = window.find(format!("project-path-{worktree}")).bounds();
