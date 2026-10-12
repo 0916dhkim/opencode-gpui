@@ -5958,6 +5958,7 @@ impl Client {
             Some("long-ordered-list") => Some(LONG_ORDERED_LIST_PREVIEW),
             _ => None,
         };
+        let preview_long_jobs = overlay.as_deref() == Some("long-jobs");
         if let Some(preview_markdown) = preview_markdown
             && let Some(row) = transcript.get_mut(&active).and_then(|rows| {
                 rows.iter_mut().find(|row| {
@@ -6057,7 +6058,7 @@ impl Client {
             attachments_draft: Vec::new(),
             attachment_drafts: HashMap::new(),
             owned_pastes: HashMap::new(),
-            overlay: if modal.is_none() && preview_markdown.is_none() {
+            overlay: if modal.is_none() && preview_markdown.is_none() && !preview_long_jobs {
                 overlay
             } else {
                 None
@@ -6128,6 +6129,17 @@ impl Client {
             rename: cx
                 .new(|cx| InputState::new(window, cx).default_value("Fix the attach clip padding")),
         };
+        if preview_long_jobs {
+            client.jobs.push(JobRow {
+                id: "long-job-preview".into(),
+                kind: JobKind::Shell,
+                title: "printf 'CARGO_HOME=%s\\nHOME=%s'".repeat(3),
+                owner: Some(
+                    "Audit rounded window surfaces and transcript pointer interactions".into(),
+                ),
+                started: 1_704_067_300_000,
+            });
+        }
         cx.subscribe(
             &client.search,
             |this, _, event: &InputEvent, cx| match event {
@@ -6745,6 +6757,7 @@ impl Client {
                 let (label, elapsed) = job.subtitle_parts(1_704_067_320_000);
                 jobs_panel = jobs_panel.child(
                     div()
+                        .min_w_0()
                         .flex()
                         .px(px(6.))
                         .gap(px(8.))
@@ -6777,6 +6790,9 @@ impl Client {
                                 .flex_col()
                                 .child(
                                     div()
+                                        .id(format!("job-title-{}", job.id))
+                                        .test_support()
+                                        .min_w_0()
                                         .text_size(px(12.))
                                         .text_color(self.tone(0x252829, 0xd4d8dc))
                                         .overflow_hidden()
@@ -6786,12 +6802,29 @@ impl Client {
                                 )
                                 .child(
                                     div()
+                                        .min_w_0()
                                         .flex()
                                         .text_size(px(11.))
                                         .text_color(self.tone(0x87908d, 0x6a7279))
-                                        .child(label)
+                                        .child(
+                                            div()
+                                                .id(format!("job-label-{}", job.id))
+                                                .test_support()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(label),
+                                        )
                                         .when_some(elapsed, |view, elapsed| {
-                                            view.child(format!(" · {elapsed}"))
+                                            view.child(
+                                                div()
+                                                    .id(format!("job-elapsed-{}", job.id))
+                                                    .test_support()
+                                                    .flex_shrink_0()
+                                                    .child(format!(" · {elapsed}")),
+                                            )
                                         }),
                                 ),
                         ),
@@ -15890,6 +15923,40 @@ mod tests {
             });
             window.render_frame(cx);
             assert!(window.try_find("background-jobs").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn long_background_job_owner_ellipsizes_before_the_elapsed_time(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless sidebar window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.jobs = vec![super::JobRow {
+                    id: "overflow".into(),
+                    kind: super::JobKind::Shell,
+                    title: "printf 'CARGO_HOME=%s\\nHOME=%s' ...".repeat(5),
+                    owner: Some("Audit very long nested agent session title".repeat(5)),
+                    started: 1_704_067_300_000,
+                }];
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let panel = window.find("background-jobs").bounds();
+            let right = panel.origin.x + panel.size.width;
+            let title = window.find("job-title-overflow").bounds();
+            let label = window.find("job-label-overflow").bounds();
+            let elapsed = window.find("job-elapsed-overflow").bounds();
+            assert!(title.origin.x + title.size.width <= right);
+            assert!(label.origin.x + label.size.width <= elapsed.origin.x);
+            assert!(elapsed.origin.x + elapsed.size.width <= right);
+            assert!(elapsed.size.width > px(0.));
         })
         .unwrap();
     }
