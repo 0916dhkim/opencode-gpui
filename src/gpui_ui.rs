@@ -799,7 +799,7 @@ enum MarkdownBlock {
 
 // Increment this when the row's typography or layout rules change. The other
 // parts of the stamp follow the live width, theme and conversation snapshot.
-const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 3;
+const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 4;
 const TRANSCRIPT_MEASURE_BATCH: usize = 64;
 const TRANSCRIPT_PROGRESSIVE_MIN_ROWS: usize = 256;
 // A width change invalidates exact heights, but it should not build 64 natural
@@ -808,6 +808,7 @@ fn transcript_fallback_budget(viewport_height: Pixels) -> usize {
     ((viewport_height.as_f32() / 48.).ceil() as usize + 4).clamp(8, TRANSCRIPT_MEASURE_BATCH)
 }
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
+const LONG_BULLET_OVERFLOW_PREVIEW: &str = "- The parent session (`opencode-gpui`) is waiting on an explore subagent, \"Audit idle send queue flash\" (`ses_ece0a1bdfffes1R6C9nEGp5Z77`).\n\n- The subagent's last model request started at 17:13:47 and never got a single token back. [Open log](https://example.com/log).";
 const LONG_ORDERED_LIST_PREVIEW: &str = r#"A long answer with rich list items and linked source locations. The remaining differences are:
 
 1. **User-row entry edge is missing.** GTK gives every `.user-message` a 1px *top* border as well as its bottom border. See [GPUI row rendering](/test/worktrees/really-long-reproduction-project/source/tree/src/gpui_ui.rs#L6576) versus `reference:src/style.css`.
@@ -2289,6 +2290,8 @@ impl Client {
                         app.open_url(url);
                     }
                 })
+                .w_full()
+                .min_w_0()
             };
             let element: AnyElement = match block {
                 MarkdownBlock::Heading(level, title) => {
@@ -2400,7 +2403,12 @@ impl Client {
                                         .text_color(self.tone(0x777e7d, 0xaeb4b9))
                                         .child("•"),
                                 )
-                                .child(markdown_view(item_index, item)),
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .child(markdown_view(item_index, item)),
+                                ),
                         );
                     }
                     list.into_any_element()
@@ -6099,6 +6107,7 @@ impl Client {
         let preview_markdown = match overlay.as_deref() {
             Some("complex-markdown") => Some(COMPLEX_MARKDOWN_PREVIEW),
             Some("long-ordered-list") => Some(LONG_ORDERED_LIST_PREVIEW),
+            Some("long-bullet") => Some(LONG_BULLET_OVERFLOW_PREVIEW),
             _ => None,
         };
         let preview_long_jobs = overlay.as_deref() == Some("long-jobs");
@@ -10828,13 +10837,14 @@ mod tests {
 
     use super::{
         ApiHandle, COMPLEX_MARKDOWN_PREVIEW, Client, ClipboardItem, Image, ImageFormat,
-        LONG_ORDERED_LIST_PREVIEW, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp,
-        SESSION_PICKER_LIMIT, TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode,
-        UiEvent, VirtualListScrollHandle, filter_all_sessions, filter_levels, filter_models,
-        filter_new_session_projects, filter_tab_sessions, fuzzy_score, markdown_blocks,
-        markdown_view_id, model, needs_new_connection, new_session_choice, picker_list_height,
-        reorder_tab_ids, safe_connection_error, splice_transcript, sticky_user_index,
-        tab_indicator, tab_number_key, unread_on_server_switch, update_session_projection,
+        LONG_BULLET_OVERFLOW_PREVIEW, LONG_ORDERED_LIST_PREVIEW, MarkdownBlock, Modal,
+        RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT, TRANSCRIPT_ROW_STYLE_REVISION,
+        TabAttention, Theme, ThemeMode, UiEvent, VirtualListScrollHandle, filter_all_sessions,
+        filter_levels, filter_models, filter_new_session_projects, filter_tab_sessions,
+        fuzzy_score, markdown_blocks, markdown_view_id, model, needs_new_connection,
+        new_session_choice, picker_list_height, reorder_tab_ids, safe_connection_error,
+        splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
+        unread_on_server_switch, update_session_projection,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -18149,6 +18159,53 @@ mod tests {
             );
             let cache = state.row_heights[&state.active].borrow();
             assert_eq!(cache.height(&rows[index]), Some(list.size.height));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn long_linked_bullet_wraps_and_measures_within_narrow_transcript(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(780.), px(791.)),
+            ))),
+            ..Default::default()
+        };
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("long-bullet".into())))
+            })
+            .expect("headless bullet window")
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            client.read(cx).scroll.set_offset(point(px(0.), px(0.)));
+            window.render_frame(cx);
+            let state = client.read(cx);
+            let rows = &state.transcript[&state.active];
+            let index = rows
+                .iter()
+                .position(|row| row.body == LONG_BULLET_OVERFLOW_PREVIEW)
+                .expect("bullet row");
+            let bullet = window.find(("message", index)).bounds();
+            let following = window.find(("message", index + 1)).bounds();
+            assert!(
+                bullet.size.height >= px(150.),
+                "the bullet must gain wrapped lines rather than paint past the viewport: {bullet:?}"
+            );
+            assert!(following.origin.y >= bullet.origin.y + bullet.size.height);
+            assert_eq!(
+                state.row_heights[&state.active]
+                    .borrow()
+                    .height(&rows[index]),
+                Some(bullet.size.height)
+            );
         })
         .unwrap();
     }
