@@ -2551,7 +2551,6 @@ impl Client {
                 );
             }
             self.attachments_draft = self.attachment_drafts.remove(&id).unwrap_or_default();
-            let first_visit = !self.virtual_scrolls.contains_key(&id);
             self.scroll = self
                 .virtual_scrolls
                 .entry(id.clone())
@@ -2559,10 +2558,10 @@ impl Client {
                 .clone();
             self.preserve_scroll = None;
             self.pending_jump = None;
-            self.follow_bottom = first_visit.then(|| (id.clone(), self.scroll.offset()));
+            self.follow_bottom = Some((id.clone(), self.scroll.offset()));
             self.active = id.clone();
-            // First visits pin after exact heights arrive. Returning to a
-            // previously viewed tab retains its own scroll offset.
+            // Switching tabs intentionally follows the selected session's
+            // latest message once its exact or provisional heights settle.
         }
         self.jobs = self.running_jobs.rows(Some(&id));
         if !self
@@ -4560,7 +4559,16 @@ impl Client {
             && self.transcript.contains_key(session_id)
         {
             let offset = self.scroll.offset();
-            if offset.y + self.scroll.max_offset().y <= px(16.) {
+            let pending_at_same_offset =
+                self.follow_bottom
+                    .as_ref()
+                    .is_some_and(|(session, pending_offset)| {
+                        session == session_id && *pending_offset == offset
+                    });
+            // A stream can grow the virtual list's max offset one frame
+            // before the pending correction moves the actual scroll handle.
+            // That temporary gap is not evidence that the user scrolled away.
+            if pending_at_same_offset || offset.y + self.scroll.max_offset().y <= px(16.) {
                 self.follow_bottom = Some((session_id.to_owned(), offset));
             } else {
                 self.follow_bottom = None;
@@ -12138,7 +12146,58 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn tab_switch_retains_previous_scroll_after_prepend_correction(cx: &mut TestAppContext) {
+    fn pending_tail_follow_survives_growth_but_not_user_scrolling(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..30)
+                        .map(|i| cache_row(&format!("follow_{i}"), "A visible history row"))
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            for _ in 0..3 {
+                window.render_frame(cx);
+                window.simulate_next_frame(cx);
+            }
+        })
+        .unwrap();
+        cx.update(|cx| {
+            client.update(cx, |client, _| {
+                let id = client.active.clone();
+                let max = client.scroll.max_offset().y;
+                assert!(max > px(500.));
+                // A previous bottom offset can be 120px from the newly grown
+                // virtual max before its pending correction gets a frame.
+                let pending = point(px(0.), -(max - px(120.)));
+                client.scroll.set_offset(pending);
+                client.follow_bottom = Some((id.clone(), pending));
+                client.prepare_follow_bottom(&id);
+                assert_eq!(client.follow_bottom, Some((id.clone(), pending)));
+
+                // An actual user scroll changes the offset, so it must win.
+                client
+                    .scroll
+                    .set_offset(point(px(0.), pending.y + px(100.)));
+                client.prepare_follow_bottom(&id);
+                assert!(client.follow_bottom.is_none());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn tab_switch_follows_latest_without_moving_the_inactive_tab(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -12195,8 +12254,8 @@ mod tests {
                 cx.notify();
             })
         });
-        // Correction runs before range selection, not in a delayed callback.
-        // Switching tabs must retain the old handle's resolved offset.
+        // Switching away must not move the inactive tab's saved handle, even
+        // when a history prepend has a pending semantic-anchor correction.
         let retained_offset = cx.update(|cx| client.read(cx).scroll.offset());
         cx.update(|cx| {
             client.update(cx, |client, cx| {
@@ -12222,12 +12281,18 @@ mod tests {
                 cx.notify();
             })
         });
-        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
-            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            for _ in 0..4 {
+                window.render_frame(cx);
+                window.simulate_next_frame(cx);
+            }
+        })
+        .unwrap();
+        assert!(old_handle.offset().y < retained_offset.y);
         assert_eq!(
-            old_handle.offset(),
-            retained_offset,
-            "returning to a tab retains its scroll offset"
+            old_handle.offset().y,
+            -old_handle.max_offset().y,
+            "returning to a tab follows its latest message"
         );
     }
 
