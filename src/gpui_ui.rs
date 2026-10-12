@@ -16765,4 +16765,49 @@ mod tests {
         })
         .unwrap();
     }
+
+    #[gpui_kit::test]
+    fn linked_ordered_list_does_not_overlap_the_following_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1200.), px(1500.)),
+            ))),
+            ..Default::default()
+        };
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("long-ordered-list".into())))
+            })
+            .expect("headless linked-list window")
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let state = client.read(cx);
+            let rows = &state.transcript[&state.active];
+            let index = rows
+                .iter()
+                .position(|row| row.body == LONG_ORDERED_LIST_PREVIEW)
+                .expect("list row");
+            assert!(
+                index + 1 < rows.len(),
+                "fixture must have a neighboring row"
+            );
+            let list = window.find(("message", index)).bounds();
+            let following = window.find(("message", index + 1)).bounds();
+            assert!(
+                following.origin.y >= list.origin.y + list.size.height,
+                "list and following row overlap: {list:?} vs {following:?}"
+            );
+            let cache = state.row_heights[&state.active].borrow();
+            assert_eq!(cache.height(&rows[index]), Some(list.size.height));
+        })
+        .unwrap();
+    }
 }
