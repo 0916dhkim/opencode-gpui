@@ -9859,18 +9859,36 @@ fn client_window_options() -> WindowOptions {
     }
 }
 
+fn follow_system_appearance(window: &mut Window, cx: &mut App) {
+    // On Linux the live window appearance can differ from the application
+    // default sampled before the window opens.
+    Theme::sync_system_appearance(Some(window), cx);
+    window
+        .observe_window_appearance(|window, cx| {
+            Theme::sync_system_appearance(Some(window), cx);
+        })
+        .detach();
+}
+
 pub fn run(args: Args) {
     application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            Theme::sync_system_appearance(None, cx);
-            match std::env::var("OPENCODE_GPUI_THEME").as_deref() {
-                Ok("dark") => Theme::change(ThemeMode::Dark, None, cx),
-                Ok("light") => Theme::change(ThemeMode::Light, None, cx),
-                _ => {}
+            let theme_override = match std::env::var("OPENCODE_GPUI_THEME").as_deref() {
+                Ok("dark") => Some(ThemeMode::Dark),
+                Ok("light") => Some(ThemeMode::Light),
+                _ => None,
+            };
+            if let Some(mode) = theme_override {
+                Theme::change(mode, None, cx);
+            } else {
+                Theme::sync_system_appearance(None, cx);
             }
             gpui_kit::open_window(client_window_options(), cx, |window, cx| {
+                if theme_override.is_none() {
+                    follow_system_appearance(window, cx);
+                }
                 cx.new(|cx| {
                     if args.preview {
                         Client::from_preview(window, cx, args.drawer.clone())
@@ -9951,6 +9969,44 @@ mod tests {
         let titlebar = options.titlebar.expect("titlebar options");
         assert_eq!(titlebar.title.as_deref(), Some("OpenCode"));
         assert!(titlebar.appears_transparent);
+    }
+
+    #[gpui_kit::test]
+    fn system_theme_uses_window_appearance_and_refreshes_after_mode_changes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                super::follow_system_appearance(window, cx);
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless themed window")
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update(|cx| {
+            assert!(!Theme::global(cx).is_dark());
+            assert!(!client.read(cx).dark);
+        });
+
+        // GPUI's test platform does not expose its private appearance-change
+        // trigger; the live observer above invokes the same Theme::change path.
+        cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update(|cx| {
+            assert!(Theme::global(cx).is_dark());
+            assert!(client.read(cx).dark);
+        });
+        cx.update(|cx| Theme::change(ThemeMode::Light, None, cx));
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.update(|cx| {
+            assert!(!Theme::global(cx).is_dark());
+            assert!(!client.read(cx).dark);
+        });
     }
 
     #[test]
