@@ -9147,7 +9147,17 @@ impl Client {
                                         rename_id.clone(),
                                     ));
                                 }))
-                                .child("▣"),
+                                .w(self.scaled(24.))
+                                .h(self.scaled(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::default()
+                                        .data(include_bytes!("icons/copy.svg"))
+                                        .with_size(self.scaled(14.))
+                                        .text_color(self.tone(0x454b4b, 0xc9ced2)),
+                                ),
                         ),
                 )
                 .child(div().flex_1())
@@ -14530,6 +14540,12 @@ mod tests {
             let copy_focus = client.read(cx).rename_action_focus[0].clone();
             copy_focus.focus(window, cx);
             window.press("space", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(client.read(cx).active.clone())
+            );
+            cx.write_to_clipboard(ClipboardItem::new_string("cleared".into()));
+            window.click("rename-copy-id", cx);
             assert_eq!(
                 cx.read_from_clipboard().and_then(|item| item.text()),
                 Some(client.read(cx).active.clone())
