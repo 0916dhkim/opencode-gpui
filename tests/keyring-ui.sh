@@ -166,7 +166,7 @@ open_password_field() {
   gpui_click 410 680
   key ctrl+comma
   sleep 0.4
-  gpui_click 440 367
+  gpui_click 440 355
 }
 
 stored_entry() {
@@ -218,7 +218,9 @@ expect "save.unauthenticated-before" "${auth_route} and r['auth'] == 'missing'"
 open_password_field
 mark_now
 type_text "${password}"
-gpui_click 760 727
+# Use the Settings keyboard action instead of a fixed Apply coordinate: the
+# responsive modal is centered and its position changes with window width.
+key ctrl+Return
 expect "save.connects" "http and r['auth'] == 'ok'"
 check "save.state-flag" 'wait_state_flag true'
 check "save.keyring-entry" '[[ "$(stored_entry)" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
@@ -238,7 +240,7 @@ expect_none_since_mark "restart.no-unauthenticated-requests" "http and r['auth']
 open_password_field
 gpui_click 310 404
 mark_now
-gpui_click 760 727
+key ctrl+Return
 sleep 1
 check "forget.keyring-entry-removed" 'wait_keyring_removed'
 check "forget.state-flag" 'wait_state_flag false'
@@ -253,7 +255,7 @@ quit
 launch OPENCODE_SERVER_URL="${address}" OPENCODE_SERVER_PASSWORD="${password}"
 expect "env.connects" "${auth_route} and r['auth'] == 'ok'"
 open_password_field
-gpui_click 760 727
+key ctrl+Return
 sleep 1
 quit
 check "env.not-saved" '[[ -z "$(stored_entry)" ]]'
@@ -281,8 +283,9 @@ check "migration.new-keyring-entry" '[[ "$(stored_entry)" == "{\"version\":1,\"p
 check "migration.old-keyring-entry-retained" '[[ "$(secret-tool lookup service ai.opencode.Cosmic.basic-auth username "${account}")" == "$(stored_entry)" ]]'
 check "migration.old-state-untouched" '[[ "$(sha256sum "${legacy_state}" | cut -d" " -f1)" == "${legacy_hash}" ]]'
 open_password_field
-gpui_click 310 404
-gpui_click 760 727
+key Tab
+key space
+key ctrl+Return
 check "migration.forget-state-flag" 'wait_state_flag false'
 check "migration.forget-marker" '[[ "$(secret-tool lookup service ai.opencode.Gpui.basic-auth username "${account}")" == "{\"version\":1,\"removed\":true}" ]]'
 check "migration.forget-retains-old-entry" '[[ "$(secret-tool lookup service ai.opencode.Cosmic.basic-auth username "${account}")" == "{\"version\":1,\"password\":\"${password}\"}" ]]'
