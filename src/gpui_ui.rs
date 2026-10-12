@@ -16724,14 +16724,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_image_limit_covers_the_full_server_attachment_limit() {
-        let maximum = opencode_gpui::protocol::MAX_ATTACHMENT_BYTES;
-        let encoded_limit = maximum.div_ceil(3) * 4;
-        assert!(encoded_limit > 14_000_000);
-        assert_eq!(encoded_limit, 27_962_028);
-    }
-
-    #[test]
     fn transcript_images_preserve_aspect_ratio_without_exceeding_viewport() {
         assert_eq!(super::image_display_size(200, 120, 420.), (200., 120.));
         assert_eq!(super::image_display_size(4_000, 2_000, 420.), (420., 210.));

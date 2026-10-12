@@ -167,16 +167,9 @@ expect "ctrl-enter.queue" \
 expect_count "ctrl-enter.queue-once" \
   "http and route == 'session.prompt' and 'shortcut queue three' in (b.get('text') or '')" 1
 
-# ------------------------------------------- overlay and layout shortcuts
-# Ctrl+P and Ctrl+, open a modal, Escape closes it, and Ctrl+W closes the tab.
-# None of them sends anything, so the check is
-# that the client stays alive and never panics.
-mark_now
-for combo in ctrl+p Escape ctrl+comma Escape; do
-  key "${combo}"
-  alive || { cat "${app_log}" >&2; fail "overlay-keys.alive" "client exited on ${combo}"; break; }
-done
-if alive; then pass "overlay-keys.alive"; fi
+# The smoke suite exercises overlay shortcuts; this suite keeps the assertions
+# that observe actual create/send/steer/queue requests instead of repeating
+# alive-only input sequences.
 if grep -qi panicked "${app_log}"; then
   cat "${app_log}" >&2
   fail "no-panic" "client logged a panic"
@@ -184,10 +177,6 @@ else
   pass "no-panic"
 fi
 
-mark_now
-key ctrl+w
-sleep 0.5
-if alive; then pass "ctrl-w.close-tab.alive"; else cat "${app_log}" >&2; fail "ctrl-w.close-tab.alive" "client exited"; fi
 expect_count "no.unexpected-prompts" \
   "http and route == 'session.prompt' and 'shortcut' not in (b.get('text') or '')" 0
 
