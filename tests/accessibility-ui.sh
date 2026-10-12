@@ -23,7 +23,21 @@ source tests/gpui-headless.sh
 cleanup() {
   if [[ -n "$app_pid" ]]; then kill "$app_pid" 2>/dev/null || true; wait "$app_pid" 2>/dev/null || true; fi
   gpui_stop_display
-  if [[ -n "${ACCESSIBILITY_KEEP:-}" ]]; then echo "Kept $temporary" >&2; else rm -rf "$temporary"; fi
+  if [[ -n "${ACCESSIBILITY_KEEP:-}" ]]; then
+    echo "Kept $temporary" >&2
+  else
+    # D-Bus activation can mount xdg-document-portal's FUSE filesystem under
+    # this private runtime directory. Unmount it before removing the fixture;
+    # cleanup must not turn a passing accessibility assertion into a failure.
+    if mountpoint -q "$temporary/runtime/doc" 2>/dev/null; then
+      if command -v fusermount3 >/dev/null; then
+        fusermount3 -u "$temporary/runtime/doc" 2>/dev/null || true
+      elif command -v fusermount >/dev/null; then
+        fusermount -u "$temporary/runtime/doc" 2>/dev/null || true
+      fi
+    fi
+    rm -rf "$temporary" 2>/dev/null || echo "Could not remove all of $temporary" >&2
+  fi
 }
 trap cleanup EXIT
 
