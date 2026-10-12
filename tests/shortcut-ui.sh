@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Headless keyboard-shortcut check for the GPUI client against the fake v2
-# server (tests/fake_opencode_server.py). Every keyboard effect is asserted as
-# a request in the server's log, so this verifies the shortcuts end to end
+# server (tests/fake_opencode_server.py). Keyboard effects are asserted from
+# server requests or the app lifecycle, so this verifies the shortcuts end to end
 # instead of only proving that the client survives them (tests/smoke-ui.sh).
 #   Docker: docker run --rm --platform linux/amd64 -v "$PWD":/repo -w /repo \
 #             opencode-gpui-builder-amd64:latest bash tests/shortcut-ui.sh
@@ -73,6 +73,23 @@ expect_count() {
 }
 
 alive() { [[ -n "${app_pid}" ]] && kill -0 "${app_pid}" 2>/dev/null; }
+expect_zoom() {
+  local name="$1" wanted="$2" state="${temporary}/config/opencode-gpui/state.json"
+  for _ in {1..30}; do
+    if python3 - "$state" "$wanted" <<'PY' 2>/dev/null
+import json, sys
+with open(sys.argv[1]) as file:
+    actual = json.load(file)['zoom_level']
+assert abs(actual - float(sys.argv[2])) < 0.001
+PY
+    then
+      pass "$name"
+      return
+    fi
+    sleep 0.1
+  done
+  fail "$name" "saved zoom did not reach $wanted"
+}
 
 gpui_start_display || exit 1
 
@@ -179,6 +196,22 @@ fi
 
 expect_count "no.unexpected-prompts" \
   "http and route == 'session.prompt' and 'shortcut' not in (b.get('text') or '')" 0
+
+key ctrl+equal
+expect_zoom "ctrl-equal.zoom-in" 1.1
+key ctrl+minus
+expect_zoom "ctrl-minus.zoom-out" 1.0
+key ctrl+equal
+expect_zoom "ctrl-equal.zoom-again" 1.1
+key ctrl+0
+expect_zoom "ctrl-0.zoom-reset" 1.0
+
+key ctrl+q
+for _ in {1..30}; do
+  alive || break
+  sleep 0.1
+done
+if alive; then fail "ctrl-q.quit" "application remained running"; else pass "ctrl-q.quit"; fi
 
 printf '\n%s passed, %s failed\n' "${passes}" "${failures}"
 if ((failures)); then

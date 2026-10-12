@@ -54,6 +54,32 @@ fn tab_number_key(key: &str) -> Option<usize> {
     }
 }
 
+const ZOOM_STEPS: [f64; 9] = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.75];
+
+fn normalized_zoom(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(ZOOM_STEPS[0], *ZOOM_STEPS.last().unwrap())
+    } else {
+        1.0
+    }
+}
+
+fn stepped_zoom(current: f64, direction: i8) -> f64 {
+    let current = normalized_zoom(current);
+    match direction {
+        1 => ZOOM_STEPS
+            .into_iter()
+            .find(|step| *step > current + 0.04)
+            .unwrap_or(*ZOOM_STEPS.last().unwrap()),
+        -1 => ZOOM_STEPS
+            .into_iter()
+            .rev()
+            .find(|step| *step < current - 0.04)
+            .unwrap_or(ZOOM_STEPS[0]),
+        _ => 1.0,
+    }
+}
+
 /// Old prototype builds wrote tabs under the configured spelling, while the
 /// transport restores them under its normalized mount-root key. Copy rather
 /// than remove that entry so the older client/state remains recoverable.
@@ -479,6 +505,7 @@ struct Client {
     reload_after_load: HashSet<String>,
     preserve_scroll: Option<TranscriptAnchor>,
     follow_bottom: Option<(String, Point<Pixels>)>,
+    zoom_follow_bottom: bool,
     catalogs: HashMap<String, ModelCatalog>,
     model_retry_count: HashMap<String, u8>,
     model_retry_scheduled: HashSet<String>,
@@ -486,6 +513,9 @@ struct Client {
     sessions: Vec<Session>,
     open_tabs: Vec<String>,
     sidebar_visible: bool,
+    sidebar_auto_hidden: bool,
+    sidebar_zoom_initialized: bool,
+    sidebar_zoom_width: Pixels,
     sidebar_toggle_focus: FocusHandle,
     tab_focus: HashMap<String, [FocusHandle; 3]>,
     tab_shortcut_hint: bool,
@@ -2145,14 +2175,14 @@ impl Client {
             .overflow_hidden()
             .child(
                 div()
-                    .h(px(32.))
-                    .px(px(12.))
+                    .h(self.scaled(32.))
+                    .px(self.scaled(12.))
                     .flex()
                     .items_center()
                     .bg(self.tone(0xece9e2, 0x14171a))
                     .border_b_1()
                     .border_color(self.tone(0xd2cdc5, 0x282c30))
-                    .text_size(px(10.))
+                    .text_size(self.scaled(10.))
                     .font_weight(FontWeight::BOLD)
                     .text_color(self.tone(0x777e7d, 0x899198))
                     .child(language)
@@ -2166,17 +2196,19 @@ impl Client {
                             .child(
                                 Icon::default()
                                     .data(include_bytes!("icons/copy.svg"))
-                                    .with_size(px(12.))
+                                    .with_size(self.scaled(12.))
                                     .text_color(self.tone(0x777e7d, 0x899198)),
                             ),
                     ),
             )
             .child(
                 div()
-                    .min_h(px(65.))
-                    .p(px(12.))
+                    .id(format!("code-body-{row_index}-{block_index}"))
+                    .test_support()
+                    .min_h(self.scaled(65.))
+                    .p(self.scaled(12.))
                     .font_family("monospace")
-                    .text_size(px(12.))
+                    .text_size(self.scaled(12.))
                     .child(code),
             )
             .into_any_element()
@@ -2188,7 +2220,7 @@ impl Client {
         row_index: usize,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let mut content = div().w_full().flex().flex_col().gap(px(10.));
+        let mut content = div().w_full().flex().flex_col().gap(self.scaled(10.));
         for (block_index, block) in markdown_blocks(&row.body).into_iter().enumerate() {
             // The stateless markdown() helper identifies views by its caller
             // location. Repeated items at one call site then share parser
@@ -2202,7 +2234,7 @@ impl Client {
             let element: AnyElement = match block {
                 MarkdownBlock::Heading(level, title) => {
                     let heading = div()
-                        .text_size(px(match level {
+                        .text_size(self.scaled(match level {
                             1 => 18.,
                             2 => 16.,
                             _ => 14.,
@@ -2215,7 +2247,7 @@ impl Client {
                     }
                 }
                 MarkdownBlock::Paragraph(text) => div()
-                    .line_height(px(22.))
+                    .line_height(self.scaled(22.))
                     .child(markdown_view(0, text))
                     .into_any_element(),
                 MarkdownBlock::Structured {
@@ -2229,7 +2261,7 @@ impl Client {
                     if let Some(marker) = marker {
                         line = line.child(
                             div()
-                                .w(px(24.))
+                                .w(self.scaled(24.))
                                 .flex_shrink_0()
                                 .text_color(self.tone(0x777e7d, 0xaeb4b9))
                                 .child(marker),
@@ -2238,10 +2270,10 @@ impl Client {
                     line = line.child(div().flex_1().min_w_0().child(markdown_view(0, content)));
                     let mut block = div()
                         .w_full()
-                        .pl(px(16. * list_depth.saturating_sub(1) as f32))
-                        .when(heading.is_none(), |view| view.line_height(px(22.)))
+                        .pl(self.scaled(16. * list_depth.saturating_sub(1) as f32))
+                        .when(heading.is_none(), |view| view.line_height(self.scaled(22.)))
                         .when_some(heading, |view, level| {
-                            view.text_size(px(if level == 1 {
+                            view.text_size(self.scaled(if level == 1 {
                                 18.
                             } else if level == 2 {
                                 16.
@@ -2254,9 +2286,9 @@ impl Client {
                         block = block
                             .border_l_1()
                             .border_color(self.tone(0xb7b3ac, 0x50565b))
-                            .py(px(7.))
-                            .pr(px(12.))
-                            .pl(px(12. + 14. * (quote_depth - 1) as f32))
+                            .py(self.scaled(7.))
+                            .pr(self.scaled(12.))
+                            .pl(self.scaled(12. + 14. * (quote_depth - 1) as f32))
                             .text_color(self.tone(0x555b5c, 0xb5b9bb));
                     }
                     block.child(line).into_any_element()
@@ -2295,16 +2327,16 @@ impl Client {
                     .bg(self.tone(0xc8c3ba, 0x343a3f))
                     .into_any_element(),
                 MarkdownBlock::List(items) => {
-                    let mut list = div().flex().flex_col().gap(px(10.));
+                    let mut list = div().flex().flex_col().gap(self.scaled(10.));
                     for (item_index, item) in items.into_iter().enumerate() {
                         list = list.child(
                             div()
                                 .flex()
-                                .line_height(px(22.))
-                                .gap(px(9.))
+                                .line_height(self.scaled(22.))
+                                .gap(self.scaled(9.))
                                 .child(
                                     div()
-                                        .w(px(17.))
+                                        .w(self.scaled(17.))
                                         .text_right()
                                         .text_color(self.tone(0x777e7d, 0xaeb4b9))
                                         .child("•"),
@@ -2449,6 +2481,7 @@ impl Client {
             reload_after_load: HashSet::new(),
             preserve_scroll: None,
             follow_bottom: None,
+            zoom_follow_bottom: false,
             catalogs: HashMap::new(),
             model_retry_count: HashMap::new(),
             model_retry_scheduled: HashSet::new(),
@@ -2456,6 +2489,9 @@ impl Client {
             sessions: Vec::new(),
             open_tabs: Vec::new(),
             sidebar_visible: true,
+            sidebar_auto_hidden: false,
+            sidebar_zoom_initialized: false,
+            sidebar_zoom_width: px(0.),
             sidebar_toggle_focus: cx.focus_handle().tab_stop(true),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
@@ -2664,6 +2700,7 @@ impl Client {
             self.preserve_scroll = None;
             self.pending_jump = None;
             self.follow_bottom = Some((id.clone(), self.scroll.offset()));
+            self.zoom_follow_bottom = false;
             self.active = id.clone();
             // Switching tabs intentionally follows the selected session's
             // latest message once its exact or provisional heights settle.
@@ -2712,12 +2749,73 @@ impl Client {
         };
         window.viewport_size().width
             - frame
-            - px(if self.sidebar_visible {
+            - self.scaled(if self.sidebar_visible {
                 SIDEBAR_WIDTH
             } else {
                 0.
             })
-            - px(TRANSCRIPT_SCROLLBAR_GUTTER)
+            - self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER)
+    }
+
+    fn zoom(&self) -> f32 {
+        normalized_zoom(self.settings.persisted.zoom_level) as f32
+    }
+
+    fn scaled(&self, value: f32) -> Pixels {
+        px(value * self.zoom())
+    }
+
+    fn row_style_revision(&self) -> u64 {
+        TRANSCRIPT_ROW_STYLE_REVISION ^ (u64::from(self.zoom().to_bits() ^ 1.0f32.to_bits()) << 32)
+    }
+
+    fn set_zoom(&mut self, zoom: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let zoom = normalized_zoom(zoom);
+        if (self.settings.persisted.zoom_level - zoom).abs() < f64::EPSILON {
+            return;
+        }
+        if let Some(jump) = self.pending_jump.take() {
+            self.preserve_scroll = Some(jump.anchor);
+            self.follow_bottom = None;
+            self.zoom_follow_bottom = false;
+        } else if self.scroll.offset().y + self.scroll.max_offset().y <= px(16.) {
+            self.preserve_scroll = None;
+            self.follow_bottom = Some((self.active.clone(), self.scroll.offset()));
+            self.zoom_follow_bottom = true;
+        } else {
+            self.preserve_scroll = self.transcript_anchor();
+            self.follow_bottom = None;
+            self.zoom_follow_bottom = false;
+        }
+        self.settings.persisted.zoom_level = zoom;
+        self.reconcile_zoom_sidebar(window);
+        window.set_rem_size(px(16. * zoom as f32));
+        // During startup the saved active tab has not been selected yet. Save
+        // only the zoom field instead of projecting the still-empty live tab
+        // selection over its persisted value.
+        if self.api.is_some()
+            && !self.preview_api
+            && let Err(error) = self.settings.persisted.save(&persist::default_path())
+        {
+            self.connection_status = format!("State save failed: {error}");
+        }
+        window.refresh();
+        cx.notify();
+    }
+
+    fn reconcile_zoom_sidebar(&mut self, window: &Window) {
+        // A zoomed fixed-width sidebar must not leave the chat narrower than
+        // its controls. Auto-collapse it, but let Ctrl+B reopen it on demand.
+        let cramped = window.viewport_size().width < self.scaled(SIDEBAR_WIDTH + 350.);
+        if cramped && self.sidebar_visible {
+            self.sidebar_visible = false;
+            self.sidebar_auto_hidden = true;
+        } else if !cramped && self.sidebar_auto_hidden {
+            self.sidebar_visible = true;
+            self.sidebar_auto_hidden = false;
+        }
+        self.sidebar_zoom_initialized = true;
+        self.sidebar_zoom_width = window.viewport_size().width;
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -2730,6 +2828,7 @@ impl Client {
             self.follow_bottom = None;
         }
         self.sidebar_visible = !self.sidebar_visible;
+        self.sidebar_auto_hidden = false;
         cx.notify();
     }
 
@@ -3433,6 +3532,7 @@ impl Client {
         self.reload_after_load.clear();
         self.preserve_scroll = None;
         self.follow_bottom = None;
+        self.zoom_follow_bottom = false;
         self.catalogs.clear();
         self.model_retry_count.clear();
         self.model_retry_scheduled.clear();
@@ -3979,6 +4079,23 @@ impl Client {
             return;
         }
         if !modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        if key == "q" && !modifiers.shift {
+            cx.quit();
+            cx.stop_propagation();
+            return;
+        }
+        let zoom_direction = match key.as_str() {
+            "=" | "equal" | "+" | "plus" | "kp_add" => Some(1),
+            "-" | "minus" | "kp_subtract" => Some(-1),
+            "0" | "kp_0" | "numpad0" => Some(0),
+            _ => None,
+        };
+        if let Some(direction) = zoom_direction {
+            let next = stepped_zoom(self.settings.persisted.zoom_level, direction);
+            self.set_zoom(next, window, cx);
+            cx.stop_propagation();
             return;
         }
         if key == "x" && modifiers.shift {
@@ -4739,7 +4856,7 @@ impl Client {
         let stamp = RowLayoutStamp {
             width,
             dark: self.dark,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            style_revision: self.row_style_revision(),
             epoch: self
                 .conversations
                 .get(&self.active)
@@ -4759,12 +4876,13 @@ impl Client {
         if cache.stamp != Some(stamp) {
             self.safe_scroll.remove(&self.active);
             self.safe_anchors.remove(&self.active);
-            if self
-                .follow_bottom
-                .as_ref()
-                .is_some_and(|(session, offset)| {
-                    session == &self.active && *offset == self.scroll.offset()
-                })
+            if self.zoom_follow_bottom
+                || self
+                    .follow_bottom
+                    .as_ref()
+                    .is_some_and(|(session, offset)| {
+                        session == &self.active && *offset == self.scroll.offset()
+                    })
             {
                 self.pending_jump = None;
                 return;
@@ -4801,6 +4919,10 @@ impl Client {
             return;
         }
         let current = self.scroll.offset();
+        if self.zoom_follow_bottom {
+            self.pending_jump = None;
+            return;
+        }
         if cache.sizes(rows, has_load, width).is_some() {
             self.safe_scroll
                 .insert(self.active.clone(), (stamp, current));
@@ -4896,7 +5018,7 @@ impl Client {
         let stamp = RowLayoutStamp {
             width,
             dark: self.dark,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            style_revision: self.row_style_revision(),
             epoch: self
                 .conversations
                 .get(&self.active)
@@ -4938,7 +5060,7 @@ impl Client {
             && let Some((session, offset)) = self.follow_bottom.clone()
             && session == self.active
         {
-            if self.scroll.offset() != offset {
+            if self.scroll.offset() != offset && !self.zoom_follow_bottom {
                 self.follow_bottom = None; // The user moved away from the tail.
                 return;
             }
@@ -4960,6 +5082,7 @@ impl Client {
             let next = point(offset.x, -(content_height - viewport_height).max(px(0.)));
             self.scroll.set_offset(next);
             self.safe_scroll.insert(self.active.clone(), (stamp, next));
+            self.zoom_follow_bottom = false;
             if exact_sizes.is_some() {
                 self.follow_bottom = None;
             } else {
@@ -5854,6 +5977,7 @@ impl Client {
             reload_after_load: HashSet::new(),
             preserve_scroll: None,
             follow_bottom: Some((active.clone(), scroll.offset())),
+            zoom_follow_bottom: false,
             catalogs: HashMap::new(),
             model_retry_count: HashMap::new(),
             model_retry_scheduled: HashSet::new(),
@@ -5861,6 +5985,9 @@ impl Client {
             sessions,
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
             sidebar_visible: true,
+            sidebar_auto_hidden: false,
+            sidebar_zoom_initialized: false,
+            sidebar_zoom_width: px(0.),
             sidebar_toggle_focus: cx.focus_handle().tab_stop(true),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
@@ -6146,8 +6273,8 @@ impl Client {
             status_gear(rgb(dot_color), format!("tab-gear-{}", session.id), busy)
         } else {
             div()
-                .w(px(9.))
-                .h(px(9.))
+                .w(self.scaled(9.))
+                .h(self.scaled(9.))
                 .rounded_full()
                 .bg(rgb(dot_color))
                 .into_any_element()
@@ -6168,12 +6295,12 @@ impl Client {
                 }
             }))
             .relative()
-            .h(px(34.))
+            .h(self.scaled(34.))
             .w_full()
-            .px(px(8.))
+            .px(self.scaled(8.))
             .flex()
             .items_center()
-            .gap(px(7.))
+            .gap(self.scaled(7.))
             .rounded(px(6.))
             .bg(if selected {
                 self.tone(0xe3e0da, 0x22262a)
@@ -6309,8 +6436,8 @@ impl Client {
                     } else {
                         self.tone(0xcfd0cc, 0x45494c)
                     })
-                    .w(px(24.))
-                    .h(px(24.))
+                    .w(self.scaled(24.))
+                    .h(self.scaled(24.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -6325,7 +6452,7 @@ impl Client {
                     .child(
                         Icon::default()
                             .data(include_bytes!("icons/edit.svg"))
-                            .with_size(px(16.))
+                            .with_size(self.scaled(16.))
                             .text_color(if selected {
                                 self.tone(0x555b5c, 0xc8c4bd)
                             } else {
@@ -6353,8 +6480,8 @@ impl Client {
                     } else {
                         self.tone(0xcfd0cc, 0x45494c)
                     })
-                    .w(px(24.))
-                    .h(px(24.))
+                    .w(self.scaled(24.))
+                    .h(self.scaled(24.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -6373,7 +6500,7 @@ impl Client {
                     .child(
                         Icon::default()
                             .data(include_bytes!("icons/close.svg"))
-                            .with_size(px(16.)),
+                            .with_size(self.scaled(16.)),
                     ),
             )
             .into_any_element()
@@ -6384,6 +6511,8 @@ impl Client {
         let motion_target = target.clone();
         let position = if after { "after" } else { "before" };
         let animation_id = format!("tab-drop-slot-expand-{target}-{position}");
+        let midpoint = self.scaled(17.);
+        let slot_height = self.scaled(36.);
         div()
             .id(format!("tab-drop-slot-{target}-{position}"))
             .test_support()
@@ -6402,7 +6531,7 @@ impl Client {
                     };
                     let destination = Some((
                         motion_target.clone(),
-                        event.event.position.y >= *origin + px(17.),
+                        event.event.position.y >= *origin + midpoint,
                     ));
                     if this.tab_drop_target != destination {
                         this.tab_drop_target = destination;
@@ -6416,7 +6545,7 @@ impl Client {
             .with_animation(
                 animation_id,
                 Animation::new(Duration::from_millis(150)),
-                |slot, progress| slot.h(px(36. * progress)),
+                move |slot, progress| slot.h(px(slot_height.as_f32() * progress)),
             )
             .into_any_element()
     }
@@ -6454,8 +6583,8 @@ impl Client {
             )
         } else {
             div()
-                .w(px(9.))
-                .h(px(9.))
+                .w(self.scaled(9.))
+                .h(self.scaled(9.))
                 .rounded_full()
                 .bg(dot_color)
                 .into_any_element()
@@ -6464,17 +6593,17 @@ impl Client {
             div()
                 .id("session-header")
                 .test_support()
-                .h(px(50.))
+                .h(self.scaled(50.))
                 .w_full()
                 .flex_shrink_0()
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .px(px(28.))
+                .gap(self.scaled(8.))
+                .px(self.scaled(28.))
                 .border_b_1()
                 .border_color(self.tone(0xc8c3ba, 0x2a2e32))
                 .bg(self.tone(0xf4f1eb, 0x14171a))
-                .child(div().w(px(14.)).flex_shrink_0().child(status))
+                .child(div().w(self.scaled(14.)).flex_shrink_0().child(status))
                 .child(
                     div()
                         .min_w_0()
@@ -6482,7 +6611,7 @@ impl Client {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .text_size(px(12.))
+                        .text_size(self.scaled(12.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title.to_owned()),
                 )
@@ -6492,7 +6621,7 @@ impl Client {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.show_modal(Modal::Sessions, window, cx);
                         }))
-                        .text_size(px(11.))
+                        .text_size(self.scaled(11.))
                         .text_color(self.tone(0x87908d, 0x899097))
                         .child("Ctrl+P to switch"),
                 )
@@ -6504,8 +6633,8 @@ impl Client {
         let mut tabs = div()
             .flex()
             .flex_col()
-            .p(px(8.))
-            .gap(px(5.))
+            .p(self.scaled(8.))
+            .gap(self.scaled(5.))
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
                 if !event.bounds.contains(&event.event.position)
                     && this.tab_drop_target.take().is_some()
@@ -6630,7 +6759,7 @@ impl Client {
             }
         }
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(self.scaled(SIDEBAR_WIDTH))
             .h_full()
             .flex()
             .flex_col()
@@ -6640,9 +6769,9 @@ impl Client {
             .child(
                 BaseButton::new("new-session")
                     .accessibility_label("New session")
-                    .h(px(39.))
-                    .px(px(16.))
-                    .line_height(px(16.))
+                    .h(self.scaled(39.))
+                    .px(self.scaled(16.))
+                    .line_height(self.scaled(16.))
                     .justify_start()
                     .text_color(self.tone(0x667078, 0x92999f))
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -6655,17 +6784,17 @@ impl Client {
             .when(!self.jobs.is_empty(), |sidebar| sidebar.child(jobs_panel))
             .child(
                 div()
-                    .p(px(14.))
+                    .p(self.scaled(14.))
                     .border_t_1()
                     .border_color(self.tone(0xded8cb, 0x2b3034))
                     .flex()
                     .flex_col()
-                    .gap(px(12.))
+                    .gap(self.scaled(12.))
                     .child(
                         BaseButton::new("footer-tabs")
                             .accessibility_label("Open tabs")
-                            .h(px(21.))
-                            .line_height(px(16.))
+                            .h(self.scaled(21.))
+                            .line_height(self.scaled(16.))
                             .justify_start()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Sessions, window, cx);
@@ -6675,8 +6804,8 @@ impl Client {
                     .child(
                         BaseButton::new("footer-settings")
                             .accessibility_label("Open settings")
-                            .h(px(21.))
-                            .line_height(px(16.))
+                            .h(self.scaled(21.))
+                            .line_height(self.scaled(16.))
                             .justify_start()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Settings, window, cx);
@@ -6685,11 +6814,11 @@ impl Client {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(7.))
+                                    .gap(self.scaled(7.))
                                     .child(
                                         Icon::default()
                                             .data(include_bytes!("icons/settings.svg"))
-                                            .with_size(px(14.)),
+                                            .with_size(self.scaled(14.)),
                                     )
                                     .child("Settings"),
                             ),
@@ -6722,7 +6851,7 @@ impl Client {
         } else {
             self.tone(0xf4f1eb, 0x101214)
         };
-        let mut body = div().flex().flex_col().gap(px(10.));
+        let mut body = div().flex().flex_col().gap(self.scaled(10.));
         match row.kind {
             TranscriptRowKind::Tool => {
                 body = body.child(div().font_family("monospace").child(row.body.clone()))
@@ -6817,16 +6946,16 @@ impl Client {
             // The transcript inherits these from app-root. Make them explicit
             // so a detached root gets the same text metrics as a mounted row.
             .font_family("Noto Sans")
-            .text_size(px(13.))
+            .text_size(self.scaled(13.))
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap(px(if user { 10. } else { 6. }))
-            .px(px(28.))
-            .pt(px(18.))
+            .gap(self.scaled(if user { 10. } else { 6. }))
+            .px(self.scaled(28.))
+            .pt(self.scaled(18.))
             // Agent segments stay continuous. A final user row replaces its
             // separator with padding so an append keeps its measured height.
-            .pb(px(if user && last { 21. } else { 20. }))
+            .pb(self.scaled(if user && last { 21. } else { 20. }))
             .bg(shade)
             .when(user, |view| {
                 view.border_t_1()
@@ -6840,7 +6969,7 @@ impl Client {
                 div()
                     .flex()
                     .items_center()
-                    .text_size(px(11.))
+                    .text_size(self.scaled(11.))
                     .font_weight(FontWeight::BOLD)
                     .text_color(if user {
                         self.tone(0x666f76, 0xd7c4a3)
@@ -6920,7 +7049,7 @@ impl Client {
         let stamp = RowLayoutStamp {
             width,
             dark: self.dark,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            style_revision: self.row_style_revision(),
             epoch: self
                 .conversations
                 .get(&self.active)
@@ -6983,8 +7112,9 @@ impl Client {
                 } else {
                     (window.viewport_size().height - px(220.)).max(px(160.))
                 };
-                let follows_bottom =
-                    self.follow_bottom
+                let follows_bottom = self.zoom_follow_bottom
+                    || self
+                        .follow_bottom
                         .as_ref()
                         .is_some_and(|(session, offset)| {
                             session == &self.active && *offset == self.scroll.offset()
@@ -7169,13 +7299,13 @@ impl Client {
     fn form_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let notice = self.forms.notice(Some(&self.active), &self.child_parents)?;
         let mut bar = div()
-            .mx(px(16.))
-            .mb(px(8.))
-            .h(px(45.))
+            .mx(self.scaled(16.))
+            .mb(self.scaled(8.))
+            .h(self.scaled(45.))
             .flex()
             .items_center()
-            .gap(px(8.))
-            .px(px(12.))
+            .gap(self.scaled(8.))
+            .px(self.scaled(12.))
             .rounded(px(9.))
             .border_1()
             .border_color(self.tone(0xc8c3ba, 0x2d3236))
@@ -7183,6 +7313,10 @@ impl Client {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .font_weight(FontWeight::BOLD)
                     .text_color(self.tone(0x98600f, 0xd8a55f))
                     .child(notice.text),
@@ -7191,6 +7325,7 @@ impl Client {
                 BaseButton::new("open-web-ui")
                     .accessibility_label("Open web UI to answer form")
                     .on_click(cx.listener(|this, _, _, cx| this.open_web_ui(cx)))
+                    .flex_shrink_0()
                     .text_color(self.tone(0x4d5354, 0xc4c8ca))
                     .child("Open web UI"),
             );
@@ -7202,6 +7337,7 @@ impl Client {
                     .role(Role::Button)
                     .aria_label("Cancel waiting form")
                     .test_support()
+                    .flex_shrink_0()
                     .track_focus(&self.form_cancel_focus)
                     .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -7532,7 +7668,7 @@ impl Client {
             .overflow_y_scroll()
             .track_scroll(self.scroll.base_handle())
             .w_full()
-            .pr(px(TRANSCRIPT_SCROLLBAR_GUTTER))
+            .pr(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
             .flex()
             .flex_col();
         let sticky = self.sticky_user_row(window).map(|row| {
@@ -7542,7 +7678,7 @@ impl Client {
                 .absolute()
                 .top_0()
                 .left_0()
-                .right(px(TRANSCRIPT_SCROLLBAR_GUTTER))
+                .right(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
                 .min_h(px(106.))
                 .max_h(px(226.))
                 .px(px(28.))
@@ -7587,7 +7723,7 @@ impl Client {
         let stamp = RowLayoutStamp {
             width,
             dark: self.dark,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
+            style_revision: self.row_style_revision(),
             epoch: self
                 .conversations
                 .get(&self.active)
@@ -7725,7 +7861,7 @@ impl Client {
                 },
             )
             .track_scroll(&self.scroll)
-            .pr(px(TRANSCRIPT_SCROLLBAR_GUTTER))
+            .pr(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
             .into_any_element()
         } else {
             // A first layout or width/style change has no usable measurements.
@@ -7897,7 +8033,7 @@ impl Client {
         let measured = measured.as_ref().filter(|cache| {
             cache.stamp.is_some_and(|stamp| {
                 stamp.dark == self.dark
-                    && stamp.style_revision == TRANSCRIPT_ROW_STYLE_REVISION
+                    && stamp.style_revision == self.row_style_revision()
                     && stamp.width == self.transcript_width(window)
                     && stamp.epoch
                         == self
@@ -8133,7 +8269,9 @@ impl Client {
             })
             .unwrap_or_default();
         let running = self.is_running(&self.active);
-        let mut files = div().px(px(13.)).flex().gap(px(7.));
+        let compact = self.transcript_width(window) < self.scaled(400.);
+        let very_compact = self.transcript_width(window) < self.scaled(300.);
+        let mut files = div().px(self.scaled(13.)).flex().gap(self.scaled(7.));
         for (index, path) in self.attachments_draft.iter().enumerate() {
             let target = path.clone();
             let session_id = self.active.clone();
@@ -8143,12 +8281,12 @@ impl Client {
                 .unwrap_or_else(|| path.display().to_string());
             files = files.child(
                 div()
-                    .px(px(8.))
-                    .py(px(4.))
+                    .px(self.scaled(8.))
+                    .py(self.scaled(4.))
                     .rounded(px(5.))
                     .bg(self.tone(0xf4f1eb, 0x262b30))
                     .flex()
-                    .gap(px(6.))
+                    .gap(self.scaled(6.))
                     .child(label.clone())
                     .child(
                         BaseButton::new(format!("remove-attachment-{index}"))
@@ -8176,8 +8314,8 @@ impl Client {
         let paste_owner = cx.entity();
         let paste_session = self.active.clone();
         div()
-            .mx(px(16.))
-            .mb(px(17.))
+            .mx(self.scaled(16.))
+            .mb(self.scaled(17.))
             .rounded(px(12.))
             .border_1()
             .border_color(self.tone(0xc8c3ba, 0x30353a))
@@ -8191,18 +8329,24 @@ impl Client {
                         })
                     })
                     .bordered(false)
-                    .h(px(89.)),
+                    .h(self.scaled(89.)),
             )
             .when(!self.attachments_draft.is_empty(), |composer| {
                 composer.child(files)
             })
             .child(
                 div()
-                    .h(px(46.))
-                    .px(px(14.))
+                    .when(!very_compact, |footer| footer.h(self.scaled(46.)))
+                    .when(very_compact, |footer| {
+                        footer
+                            .min_h(self.scaled(46.))
+                            .py(self.scaled(6.))
+                            .flex_wrap()
+                    })
+                    .px(self.scaled(14.))
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(self.scaled(8.))
                     .child(
                         div()
                             .id("attach-file")
@@ -8223,15 +8367,16 @@ impl Client {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.choose_attachments(cx);
                             }))
-                            .w(px(32.))
-                            .h(px(32.))
+                            .w(self.scaled(32.))
+                            .h(self.scaled(32.))
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
                             .child(
                                 Icon::default()
                                     .data(include_bytes!("icons/paperclip.svg"))
-                                    .with_size(px(22.))
+                                    .with_size(self.scaled(22.))
                                     .text_color(self.tone(0x555b5c, 0xc8c4bd)),
                             ),
                     )
@@ -8255,9 +8400,11 @@ impl Client {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Model, window, cx);
                             }))
-                            .max_w(px(160.))
-                            .h(px(32.))
-                            .px(px(8.))
+                            .max_w(self.scaled(160.))
+                            .min_w_0()
+                            .h(self.scaled(32.))
+                            .min_w_0()
+                            .px(self.scaled(8.))
                             .flex()
                             .items_center()
                             .child(
@@ -8290,8 +8437,8 @@ impl Client {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Level, window, cx);
                             }))
-                            .h(px(32.))
-                            .px(px(8.))
+                            .h(self.scaled(32.))
+                            .px(self.scaled(8.))
                             .flex()
                             .items_center()
                             .child(format!(
@@ -8301,21 +8448,23 @@ impl Client {
                                     .unwrap_or_else(|| "Default".into())
                             )),
                     )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .whitespace_nowrap()
-                            .text_size(px(11.))
-                            .text_color(self.tone(0x858e8c, 0x899097))
-                            .child(context),
-                    )
+                    .when(!very_compact, |footer| footer.child(div().flex_1()))
+                    .when(!compact, |footer| {
+                        footer.child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(self.scaled(11.))
+                                .text_color(self.tone(0x858e8c, 0x899097))
+                                .child(context),
+                        )
+                    })
                     .when(
                         running && window.viewport_size().width >= px(900.),
                         |footer| {
                             footer.child(
                                 div()
                                     .whitespace_nowrap()
-                                    .text_size(px(10.))
+                                    .text_size(self.scaled(10.))
                                     .text_color(self.tone(0x858e8c, 0x899097))
                                     .child("Ctrl+Enter to queue"),
                             )
@@ -8347,8 +8496,9 @@ impl Client {
                                     this.stop_active(cx);
                                     this.composer.focus_handle(cx).focus(window, cx);
                                 }))
-                                .w(px(32.))
-                                .h(px(32.))
+                                .w(self.scaled(32.))
+                                .h(self.scaled(32.))
+                                .flex_shrink_0()
                                 .rounded_full()
                                 .border_1()
                                 .border_color(self.tone(0x555b5c, 0x6b7176))
@@ -8358,7 +8508,7 @@ impl Client {
                                 .child(
                                     Icon::default()
                                         .data(include_bytes!("icons/stop.svg"))
-                                        .with_size(px(22.))
+                                        .with_size(self.scaled(22.))
                                         .text_color(self.tone(0x555b5c, 0xc8c4bd)),
                                 ),
                         )
@@ -8391,8 +8541,9 @@ impl Client {
                                         this.send_prompt(false, cx);
                                     }))
                             })
-                            .w(px(32.))
-                            .h(px(32.))
+                            .w(self.scaled(32.))
+                            .h(self.scaled(32.))
+                            .flex_shrink_0()
                             .rounded_full()
                             .bg(self.tone(0xc59535, 0xd29b52))
                             .flex()
@@ -8405,7 +8556,7 @@ impl Client {
                             .child(
                                 Icon::default()
                                     .data(include_bytes!("icons/send.svg"))
-                                    .with_size(px(22.)),
+                                    .with_size(self.scaled(22.)),
                             ),
                     ),
             )
@@ -8594,10 +8745,37 @@ impl Client {
 
     fn modal_view(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal?;
+        let picker_anchor = if matches!(modal, Modal::Model | Modal::Level) {
+            let model = modal == Modal::Model;
+            let sidebar = if self.sidebar_visible {
+                SIDEBAR_WIDTH
+            } else {
+                0.
+            };
+            let (button_center, panel_width) = if model {
+                (134., 368.)
+            } else {
+                let compact = self.transcript_width(window) < self.scaled(400.);
+                (233. + if compact { 30. } else { 0. }, 268.)
+            };
+            let panel_width = self.scaled(panel_width);
+            let margin = self.scaled(8.);
+            let target = self.scaled(sidebar + button_center);
+            let left = (target - px(if model { 184. } else { 129. }))
+                .max(margin)
+                .min((window.viewport_size().width - panel_width - margin).max(margin));
+            let arrow = self.scaled(20.);
+            let arrow_left = (target - left - px(arrow.as_f32() / 2.))
+                .max(margin)
+                .min((panel_width - arrow - margin).max(margin));
+            Some((left, arrow_left))
+        } else {
+            None
+        };
         let backdrop = div()
             .id("modal-backdrop")
             .absolute()
-            .top(px(46.))
+            .top(self.scaled(46.))
             .bottom_0()
             .left_0()
             .right_0()
@@ -9161,6 +9339,8 @@ impl Client {
                         .flex_col()
                         .child(
                             div()
+                                .id("settings-header")
+                                .test_support()
                                 .h(px(82.))
                                 .flex_shrink_0()
                                 .px(px(24.))
@@ -9180,6 +9360,8 @@ impl Client {
                                 )
                                 .child(
                                     div()
+                                        .id("settings-description")
+                                        .test_support()
                                         .min_w_0()
                                         .overflow_hidden()
                                         .whitespace_nowrap()
@@ -9542,27 +9724,32 @@ impl Client {
                     filter_levels(variants, &query).len()
                 };
                 let list = div()
-                    .w(px(if model { 368. } else { 268. }))
+                    .w(self.scaled(if model { 368. } else { 268. }))
                     // The GTK popup's external frame is 2px shorter for
                     // models and 4px taller for levels than the natural list.
-                    .h(px(70.
-                        + picker_list_height(model, count)
-                        + if model { -2. } else { 4. }))
+                    .h(self
+                        .scaled(
+                            70. + picker_list_height(model, count) + if model { -2. } else { 4. },
+                        )
+                        .min(
+                            (window.viewport_size().height - self.scaled(46. + 79. + 8.))
+                                .max(self.scaled(140.)),
+                        ))
                     .relative()
                     .rounded(px(8.))
                     .border_1()
                     .border_color(self.tone(0xc8c3ba, 0x30353a))
                     .bg(self.tone(0xfffdfa, 0x191c1f))
                     .shadow_lg()
-                    .p(px(14.))
+                    .p(self.scaled(14.))
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
+                    .gap(self.scaled(8.))
                     .child(
                         div()
-                            .h(px(34.))
+                            .h(self.scaled(34.))
                             .w_full()
-                            .px(px(6.))
+                            .px(self.scaled(6.))
                             .flex()
                             .items_center()
                             .rounded(px(5.))
@@ -9572,7 +9759,7 @@ impl Client {
                             .child(
                                 Icon::default()
                                     .data(include_bytes!("icons/search.svg"))
-                                    .with_size(px(16.))
+                                    .with_size(self.scaled(16.))
                                     .text_color(self.tone(0x8b918e, 0x71717a)),
                             )
                             .child(Input::new(&self.search).appearance(false)),
@@ -9585,12 +9772,12 @@ impl Client {
                     .track_scroll(&self.picker_list_scroll)
                     .flex()
                     .flex_col()
-                    .gap(px(if model { 8. } else { 0. }));
+                    .gap(self.scaled(if model { 8. } else { 0. }));
                 if model {
                     let query = self.search.read(cx).value();
                     let choices = filter_models(&self.catalog.models, &query);
                     if choices.is_empty() {
-                        rows = rows.child(div().my(px(16.)).child("No matching models"));
+                        rows = rows.child(div().my(self.scaled(16.)).child("No matching models"));
                     }
                     for (index, option) in choices.into_iter().enumerate() {
                         let selected = self.selected_model().as_ref().is_some_and(|preferred| {
@@ -9626,9 +9813,9 @@ impl Client {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.choose_model(selection.clone(), cx);
                                 }))
-                                .h(px(52.))
+                                .h(self.scaled(52.))
                                 .flex_shrink_0()
-                                .px(px(14.))
+                                .px(self.scaled(14.))
                                 .rounded(px(5.))
                                 .bg(self.tone(
                                     if selected || self.picker_highlight == Some(index) {
@@ -9649,7 +9836,7 @@ impl Client {
                                         .flex_1()
                                         .flex()
                                         .flex_col()
-                                        .gap(px(2.))
+                                        .gap(self.scaled(2.))
                                         .child(
                                             div()
                                                 .when(selected, |title| {
@@ -9659,7 +9846,7 @@ impl Client {
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(self.scaled(11.))
                                                 .text_color(self.tone(0x777e7d, 0x899097))
                                                 .child(format!(
                                                     "{}/{}",
@@ -9684,7 +9871,7 @@ impl Client {
                     let query = self.search.read(cx).value();
                     let choices = filter_levels(&variants, &query);
                     if choices.is_empty() {
-                        rows = rows.child(div().my(px(14.)).child("No matching levels"));
+                        rows = rows.child(div().my(self.scaled(14.)).child("No matching levels"));
                     }
                     for (index, variant) in choices.into_iter().enumerate() {
                         let level = variant.as_deref().unwrap_or("Default");
@@ -9716,9 +9903,9 @@ impl Client {
                                         this.choose_model(model.clone(), cx);
                                     }
                                 }))
-                                .h(px(33.))
+                                .h(self.scaled(33.))
                                 .flex_shrink_0()
-                                .px(px(12.))
+                                .px(self.scaled(12.))
                                 .flex()
                                 .items_center()
                                 .bg(self.tone(
@@ -9753,13 +9940,15 @@ impl Client {
                 list.child(rows)
                     .child(
                         div()
+                            .id("picker-arrow")
+                            .test_support()
                             .absolute()
-                            .bottom(px(-20.))
-                            .left(px(if model { 174. } else { 119. }))
+                            .bottom(self.scaled(-20.))
+                            .left(picker_anchor.expect("picker anchor").1)
                             .child(
                                 Icon::default()
                                     .data(include_bytes!("icons/popover-arrow.svg"))
-                                    .with_size(px(20.))
+                                    .with_size(self.scaled(20.))
                                     .text_color(self.tone(0xfffdfa, 0x191c1f)),
                             ),
                     )
@@ -9770,8 +9959,8 @@ impl Client {
             backdrop
                 .items_start()
                 .justify_end()
-                .pl(px(if modal == Modal::Model { 220. } else { 374. }))
-                .pb(px(79.))
+                .pl(picker_anchor.expect("picker anchor").0)
+                .pb(self.scaled(79.))
                 .bg(rgba(0x00000000))
         } else {
             backdrop
@@ -9793,6 +9982,11 @@ impl Client {
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark = Theme::global(cx).is_dark();
+        if !self.sidebar_zoom_initialized || self.sidebar_zoom_width != window.viewport_size().width
+        {
+            self.reconcile_zoom_sidebar(window);
+        }
+        window.set_rem_size(self.scaled(16.));
         let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
         let controls = window.window_controls();
         let title_offset = if client_decorated {
@@ -9801,7 +9995,8 @@ impl Render for Client {
         } else {
             px(0.)
         };
-        self.transcript_content_width = (self.transcript_width(window) - px(56.)).max(px(1.));
+        self.transcript_content_width =
+            (self.transcript_width(window) - self.scaled(56.)).max(px(1.));
         self.sync_composer(window, cx);
         if self.focus_composer_pending
             && self.modal.is_none()
@@ -10034,12 +10229,12 @@ impl Render for Client {
             .flex()
             .flex_col()
             .font_family("Noto Sans")
-            .text_size(px(13.))
+            .text_size(rems(13. / 16.))
             .text_color(self.tone(0x252829, 0xe8e5df))
             .bg(self.tone(0xf4f1eb, 0x101214))
             .child(
                 TitleBar::new()
-                    .h(px(46.))
+                    .h(self.scaled(46.))
                     .pl(px(0.))
                     .border_color(self.tone(0xc8c3ba, 0x2a2e32))
                     .bg(self.tone(0xf4f1eb, 0x14171a))
@@ -10093,12 +10288,12 @@ impl Render for Client {
                                     .left_0()
                                     .top_0()
                                     .h_full()
-                                    .w(px(if self.sidebar_visible {
+                                    .w(self.scaled(if self.sidebar_visible {
                                         SIDEBAR_WIDTH
                                     } else {
                                         48.
                                     }))
-                                    .pl(px(16.))
+                                    .pl(self.scaled(16.))
                                     .flex()
                                     .items_center()
                                     .child(
@@ -13745,18 +13940,29 @@ mod tests {
             });
         });
         cx.update_window(handle, |_, window, cx| {
-            for width in [780., 1200.] {
-                window.resize(size(px(width), px(800.)));
+            for (width, height) in [(780., 800.), (952., 1012.), (1200., 800.)] {
+                window.resize(size(px(width), px(height)));
                 window.bounds_changed(cx);
                 window.render_frame(cx);
                 let card = window.find("settings-card").bounds();
                 let host = window.find("settings-host").bounds();
+                let header = window.find("settings-header").bounds();
+                let description = window.find("settings-description").bounds();
                 let viewport = window.viewport_size();
                 assert!(card.size.width <= viewport.width - px(30.));
                 assert!((card.origin.x - (viewport.width - card.size.width) / 2.).abs() <= px(2.));
-                assert!(card.origin.y >= px(46.));
+                let centered_y = px(46.) + (viewport.height - px(46.) - card.size.height) / 2.;
+                assert!((card.origin.y - centered_y).abs() <= px(6.));
                 assert!(card.origin.y + card.size.height <= viewport.height);
                 assert!(host.origin.x + host.size.width <= card.origin.x + card.size.width / 2.);
+                assert!(
+                    description.origin.x + description.size.width
+                        <= header.origin.x + header.size.width
+                );
+                assert!(
+                    description.origin.y + description.size.height
+                        <= header.origin.y + header.size.height
+                );
             }
         })
         .unwrap();
@@ -13898,6 +14104,319 @@ mod tests {
             window.render_frame(cx);
             window.press("escape", cx);
             assert!(!client.read(cx).unread.contains(&client.read(cx).active));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn zoom_ladder_bounds_and_reset_match_gtk() {
+        assert_eq!(super::stepped_zoom(1.0, 1), 1.1);
+        assert_eq!(super::stepped_zoom(1.0, -1), 0.9);
+        assert_eq!(super::stepped_zoom(1.0, 0), 1.0);
+        assert_eq!(super::stepped_zoom(1.75, 1), 1.75);
+        assert_eq!(super::stepped_zoom(0.7, -1), 0.7);
+        assert_eq!(super::stepped_zoom(1.37, 1), 1.5);
+        assert_eq!(super::stepped_zoom(1.37, -1), 1.3);
+        assert_eq!(super::normalized_zoom(f64::NAN), 1.0);
+        assert_eq!(super::normalized_zoom(f64::INFINITY), 1.0);
+        assert_eq!(super::normalized_zoom(3.0), 1.75);
+    }
+
+    #[gpui_kit::test]
+    fn zoom_shortcuts_scale_sidebar_text_and_invalidate_transcript(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(780.), px(791.)),
+            ))),
+            ..Default::default()
+        };
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless zoom window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let before = window.find("new-session").bounds().size.width;
+            let stamp = client.read(cx).row_heights[&client.read(cx).active]
+                .borrow()
+                .stamp
+                .unwrap();
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-=", cx);
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).settings.persisted.zoom_level, 1.1);
+            assert_eq!(window.rem_size(), px(17.6));
+            assert!(window.find("new-session").bounds().size.width > before);
+            let next = client.read(cx).row_heights[&client.read(cx).active]
+                .borrow()
+                .stamp
+                .unwrap();
+            assert_ne!(next.style_revision, stamp.style_revision);
+            window.press("ctrl-minus", cx);
+            assert_eq!(client.read(cx).settings.persisted.zoom_level, 1.0);
+            window.press("ctrl-0", cx);
+            assert_eq!(client.read(cx).settings.persisted.zoom_level, 1.0);
+            window.press("ctrl-comma", cx);
+            assert!(client.read(cx).modal == Some(Modal::Settings));
+            window.press("ctrl-=", cx);
+            assert_eq!(client.read(cx).settings.persisted.zoom_level, 1.1);
+            assert!(client.read(cx).modal == Some(Modal::Settings));
+            window.press("escape", cx);
+            window.press("ctrl-=", cx);
+            window.press("ctrl-=", cx);
+            window.render_frame(cx);
+            assert_eq!(client.read(cx).settings.persisted.zoom_level, 1.3);
+            assert!(!client.read(cx).sidebar_visible);
+            window.press("ctrl-0", cx);
+            window.render_frame(cx);
+            assert!(client.read(cx).sidebar_visible);
+            window.press("ctrl-=", cx);
+            window.press("ctrl-=", cx);
+            window.press("ctrl-=", cx);
+            window.render_frame(cx);
+            window.press("ctrl-b", cx);
+            assert!(
+                client.read(cx).sidebar_visible,
+                "manual sidebar toggle still works"
+            );
+        })
+        .unwrap();
+        cx.simulate_window_resize(handle, size(px(760.), px(791.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!client.read(cx).sidebar_visible);
+        })
+        .unwrap();
+        cx.simulate_window_resize(handle, size(px(1200.), px(791.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(client.read(cx).sidebar_visible);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn zoom_keeps_bottom_follow_and_a_pending_semantic_jump(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless zoom scroll window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..300)
+                        .map(|index| cache_row(&format!("zoom_{index}"), "A short answer."))
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| client.read(cx).scroll.base_handle().scroll_to_bottom());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.update(cx, |client, _| client.follow_bottom = None);
+            assert_eq!(
+                client.read(cx).scroll.offset().y,
+                -client.read(cx).scroll.max_offset().y
+            );
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-=", cx);
+            assert_eq!(client.read(cx).settings.persisted.zoom_level, 1.1);
+            for _ in 0..3 {
+                window.render_frame(cx);
+            }
+            assert_eq!(
+                client.read(cx).scroll.offset().y,
+                -client.read(cx).scroll.max_offset().y
+            );
+
+            let state = client.read(cx);
+            let stamp = state.row_heights[&state.active].borrow().stamp.unwrap();
+            let target = state.transcript[&state.active][140].key.clone();
+            let offset = state.scroll.offset();
+            client.update(cx, |client, cx| {
+                client.pending_jump = Some(super::PendingTranscriptJump {
+                    stamp,
+                    anchor: super::TranscriptAnchor {
+                        session: client.active.clone(),
+                        key: target.clone(),
+                        within: px(12.),
+                        offset,
+                    },
+                });
+                cx.notify();
+            });
+            window.press("ctrl-=", cx);
+            assert!(client.read(cx).pending_jump.is_none());
+            assert!(
+                client
+                    .read(cx)
+                    .preserve_scroll
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.key == target)
+            );
+            for _ in 0..4 {
+                window.render_frame(cx);
+            }
+            assert!(
+                client
+                    .read(cx)
+                    .transcript_anchor()
+                    .is_some_and(|anchor| anchor.key == target),
+                "zoom lost the pending semantic jump"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn zoom_scales_code_body_with_prose(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless code zoom window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    vec![cache_row("code", "```rust\nlet answer = 42;\n```")],
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let before = window.find("code-body-0-0").bounds().size.height;
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-=", cx);
+            window.render_frame(cx);
+            let after = window.find("code-body-0-0").bounds().size.height;
+            assert!(
+                after > before,
+                "code body did not grow: {before:?} -> {after:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn zoom_retains_the_offscreen_sticky_user_prompt(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless sticky zoom window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..300)
+                        .map(|index| {
+                            let mut row = cache_row(&format!("zoom_{index}"), "Short answer");
+                            if index == 170 {
+                                row.role = model::Role::User;
+                            }
+                            row
+                        })
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| client.read(cx).scroll.base_handle().scroll_to_bottom());
+        cx.update_window(handle, |_, window, cx| {
+            for _ in 0..3 {
+                window.render_frame(cx);
+            }
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            for _ in 0..3 {
+                window.press("ctrl-=", cx);
+            }
+            for _ in 0..3 {
+                window.render_frame(cx);
+            }
+            assert_eq!(
+                client
+                    .read(cx)
+                    .sticky_user_row(window)
+                    .map(|row| row.key.message_id.as_str()),
+                Some("zoom_170")
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn zoomed_picker_arrows_follow_their_composer_controls(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(780.), px(791.)),
+            ))),
+            ..Default::default()
+        };
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless picker zoom window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            for _ in 0..2 {
+                window.press("ctrl-=", cx);
+            }
+            window.render_frame(cx);
+            for (shortcut, button) in [("ctrl-m", "composer-model"), ("ctrl-/", "composer-level")] {
+                window.press(shortcut, cx);
+                window.render_frame(cx);
+                let arrow = window.find("picker-arrow").bounds().center().x.as_f32();
+                let control = window.find(button).bounds().center().x.as_f32();
+                assert!(
+                    (arrow - control).abs() < 32.,
+                    "{button}: arrow={arrow} control={control}"
+                );
+                window.press("escape", cx);
+            }
+            for _ in 0..3 {
+                window.press("ctrl-=", cx);
+            }
+            window.render_frame(cx);
+            assert!(!client.read(cx).sidebar_visible);
+            window.press("ctrl-m", cx);
+            window.render_frame(cx);
+            let arrow = window.find("picker-arrow").bounds().center().x.as_f32();
+            let control = window.find("composer-model").bounds().center().x.as_f32();
+            assert!(
+                (arrow - control).abs() < 32.,
+                "max zoom: arrow={arrow} control={control}"
+            );
         })
         .unwrap();
     }
