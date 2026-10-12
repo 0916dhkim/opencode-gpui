@@ -209,6 +209,8 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == drag-reorder ]]; then
   sleep 0.4
   import -window "$win" "${OUTPUT%.png}-cue.png"
   xdotool mouseup 1
+  sleep 0.06
+  import -window "$win" "${OUTPUT%.png}-shrinking.png"
 fi
 if [[ "${INTERACTION:-}" == permission || "${INTERACTION:-}" == permission-deny || "${INTERACTION:-}" == permission-once || "${INTERACTION:-}" == permission-tab-deny ]]; then
   if [[ "$CLIENT" == gpui ]]; then

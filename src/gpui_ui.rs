@@ -559,6 +559,8 @@ struct Client {
     tab_focus: HashMap<String, [FocusHandle; 3]>,
     tab_shortcut_hint: bool,
     tab_drop_target: Option<(String, bool)>,
+    tab_drop_outgoing: HashMap<(String, bool), u64>,
+    next_tab_drop_token: u64,
     tab_drop_anchor: Option<(String, Pixels)>,
     bootstrapped: bool,
     projects: Vec<Project>,
@@ -2564,6 +2566,8 @@ impl Client {
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
             tab_drop_target: None,
+            tab_drop_outgoing: HashMap::new(),
+            next_tab_drop_token: 0,
             tab_drop_anchor: None,
             bootstrapped: false,
             projects: Vec::new(),
@@ -3093,13 +3097,41 @@ impl Client {
         }
     }
 
+    fn set_tab_drop_target(&mut self, destination: Option<(String, bool)>, cx: &mut Context<Self>) {
+        if self.tab_drop_target == destination {
+            return;
+        }
+        if let Some(previous) = self.tab_drop_target.take() {
+            self.next_tab_drop_token = self.next_tab_drop_token.wrapping_add(1);
+            let token = self.next_tab_drop_token;
+            self.tab_drop_outgoing.insert(previous.clone(), token);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.tab_drop_outgoing.get(&previous) == Some(&token) {
+                        this.tab_drop_outgoing.remove(&previous);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        if let Some(destination) = &destination {
+            self.tab_drop_outgoing.remove(destination);
+        }
+        self.tab_drop_target = destination;
+        cx.notify();
+    }
+
     fn drop_tab(&mut self, source: &str, target: &str, cx: &mut Context<Self>) {
         self.tab_drop_anchor = None;
-        let Some((destination, after)) = self.tab_drop_target.take() else {
+        let Some((destination, after)) = self.tab_drop_target.clone() else {
             return;
         };
+        self.set_tab_drop_target(None, cx);
         if self.tab_shortcut_hint || destination != target {
-            cx.notify();
             return;
         }
         if reorder_tab_ids(&mut self.open_tabs, source, target, after) {
@@ -6186,6 +6218,8 @@ impl Client {
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
             tab_drop_target: None,
+            tab_drop_outgoing: HashMap::new(),
+            next_tab_drop_token: 0,
             tab_drop_anchor: None,
             bootstrapped: true,
             projects,
@@ -6566,8 +6600,7 @@ impl Client {
                                 .as_ref()
                                 .map(|(target, _)| (target.clone(), bounds.origin.y));
                         }
-                        this.tab_drop_target = destination;
-                        cx.notify();
+                        this.set_tab_drop_target(destination, cx);
                     }
                 }),
             )
@@ -6764,8 +6797,7 @@ impl Client {
                         event.event.position.y >= *origin + midpoint,
                     ));
                     if this.tab_drop_target != destination {
-                        this.tab_drop_target = destination;
-                        cx.notify();
+                        this.set_tab_drop_target(destination, cx);
                     }
                 }),
             )
@@ -6776,6 +6808,57 @@ impl Client {
                 animation_id,
                 Animation::new(Duration::from_millis(150)),
                 move |slot, progress| slot.h(px(slot_height.as_f32() * progress)),
+            )
+            .into_any_element()
+    }
+
+    fn tab_drop_closing_slot(
+        &self,
+        target: &str,
+        after: bool,
+        token: u64,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let target = target.to_owned();
+        let drag_target = target.clone();
+        let drop_target = target.clone();
+        let position = if after { "after" } else { "before" };
+        let slot_height = self.scaled(36.);
+        div()
+            .id(format!("tab-drop-slot-{target}-{position}"))
+            .test_support()
+            .w_full()
+            // An outgoing slot still occupies layout while shrinking. Let a
+            // rapid subsequent drag select it rather than swallowing the drop.
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
+                    if event.drag(cx).0 != drag_target {
+                        let side = this
+                            .tab_drop_anchor
+                            .as_ref()
+                            .filter(|(id, _)| id == &drag_target)
+                            .map_or(after, |(_, origin)| {
+                                event.event.position.y >= *origin + this.scaled(17.)
+                            });
+                        this.set_tab_drop_target(Some((drag_target.clone(), side)), cx);
+                    }
+                }),
+            )
+            .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
+                let side = this
+                    .tab_drop_anchor
+                    .as_ref()
+                    .filter(|(id, _)| id == &drop_target)
+                    .map_or(after, |(_, origin)| {
+                        window.mouse_position().y >= *origin + this.scaled(17.)
+                    });
+                this.set_tab_drop_target(Some((drop_target.clone(), side)), cx);
+                this.drop_tab(&drag.0, &drop_target, cx);
+            }))
+            .with_animation(
+                format!("tab-drop-slot-collapse-{target}-{position}-{token}"),
+                Animation::new(Duration::from_millis(150)),
+                move |slot, progress| slot.h(px(slot_height.as_f32() * (1. - progress))),
             )
             .into_any_element()
     }
@@ -6866,11 +6949,9 @@ impl Client {
             .p(self.scaled(8.))
             .gap(self.scaled(5.))
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                if !event.bounds.contains(&event.event.position)
-                    && this.tab_drop_target.take().is_some()
-                {
+                if !event.bounds.contains(&event.event.position) && this.tab_drop_target.is_some() {
                     this.tab_drop_anchor = None;
-                    cx.notify();
+                    this.set_tab_drop_target(None, cx);
                 }
             }))
             .on_drop(cx.listener(|this, drag: &TabDrag, _, cx| {
@@ -6882,9 +6963,7 @@ impl Client {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.tab_drop_anchor = None;
-                    if this.tab_drop_target.take().is_some() {
-                        cx.notify();
-                    }
+                    this.set_tab_drop_target(None, cx);
                 }),
             );
         let mut previous_inactive = false;
@@ -6893,10 +6972,14 @@ impl Client {
                 let active = session.id == self.active;
                 if self.tab_drop_target.as_ref() == Some(&(id.clone(), false)) {
                     tabs = tabs.child(self.tab_drop_slot(id, false, cx));
+                } else if let Some(&token) = self.tab_drop_outgoing.get(&(id.clone(), false)) {
+                    tabs = tabs.child(self.tab_drop_closing_slot(id, false, token, cx));
                 }
                 tabs = tabs.child(self.tab(session, index, !active && previous_inactive, cx));
                 if self.tab_drop_target.as_ref() == Some(&(id.clone(), true)) {
                     tabs = tabs.child(self.tab_drop_slot(id, true, cx));
+                } else if let Some(&token) = self.tab_drop_outgoing.get(&(id.clone(), true)) {
+                    tabs = tabs.child(self.tab_drop_closing_slot(id, true, token, cx));
                 }
                 previous_inactive = !active;
             }
@@ -10838,7 +10921,7 @@ pub fn run(args: Args) {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc};
+    use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc, time::Duration};
 
     use super::{
         ApiHandle, COMPLEX_MARKDOWN_PREVIEW, Client, ClipboardItem, Image, ImageFormat,
@@ -16409,6 +16492,11 @@ mod tests {
             assert_eq!(server.active.as_deref(), Some(first.as_str()));
         });
 
+        // The old slot is still shrinking immediately after drop. Finish its
+        // 150ms transition before measuring the next row for another drag.
+        cx.executor().advance_clock(Duration::from_millis(170));
+        cx.run_until_parked();
+
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             let from = window.find(format!("drag-tab-{first}")).bounds().center();
@@ -16484,8 +16572,7 @@ mod tests {
         });
         cx.update_window(handle, |_, window, cx| {
             client.update(cx, |client, cx| {
-                client.tab_drop_target = Some(("ses_other".into(), false));
-                cx.notify();
+                client.set_tab_drop_target(Some(("ses_other".into(), false)), cx);
             });
             window.render_frame(cx);
             let tab = window.find("tab-ses_other").bounds();
@@ -16494,21 +16581,36 @@ mod tests {
             assert!(window.try_find("tab-drop-slot-ses_other-after").is_none());
 
             client.update(cx, |client, cx| {
-                client.tab_drop_target = Some(("ses_other".into(), true));
-                cx.notify();
+                client.set_tab_drop_target(Some(("ses_other".into(), true)), cx);
             });
             window.render_frame(cx);
             let tab = window.find("tab-ses_other").bounds();
             let after = window.find("tab-drop-slot-ses_other-after").bounds();
             assert!(after.origin.y >= tab.origin.y + tab.size.height);
-            assert!(window.try_find("tab-drop-slot-ses_other-before").is_none());
+            assert!(window.try_find("tab-drop-slot-ses_other-before").is_some());
 
             client.update(cx, |client, cx| {
-                client.tab_drop_target = None;
-                cx.notify();
+                client.set_tab_drop_target(None, cx);
             });
             window.render_frame(cx);
+            assert!(window.try_find("tab-drop-slot-ses_other-after").is_some());
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(75));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            let shrinking = window.find("tab-drop-slot-ses_other-after").bounds();
+            assert!(shrinking.size.height > px(0.) && shrinking.size.height < px(36.));
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(90));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
             assert!(window.try_find("tab-drop-slot-ses_other-after").is_none());
+            assert!(window.try_find("tab-drop-slot-ses_other-before").is_none());
         })
         .unwrap();
     }
