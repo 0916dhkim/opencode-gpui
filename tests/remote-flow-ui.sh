@@ -120,7 +120,7 @@ gpui_click 400 76
 expect history.cursor "http and route == 'message.list' and p.get('sessionID') == '$main' and 'cursor' in q and 'order' not in q"
 
 # The pencil in the main tab opens the GPUI rename modal.
-gpui_click 229 110
+gpui_click 209 110
 if [[ -n "${FLOW_SHOTS:-}" ]]; then import -window "$window" "${FLOW_SHOTS%.png}-rename.png"; fi
 gpui_type 'Renamed integration session'
 gpui_click 510 490
