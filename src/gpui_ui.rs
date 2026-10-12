@@ -6102,6 +6102,7 @@ impl Client {
             _ => None,
         };
         let preview_long_jobs = overlay.as_deref() == Some("long-jobs");
+        let preview_working_pill = overlay.as_deref() == Some("working-pill");
         if let Some(preview_markdown) = preview_markdown
             && let Some(row) = transcript.get_mut(&active).and_then(|rows| {
                 rows.iter_mut().find(|row| {
@@ -6202,7 +6203,11 @@ impl Client {
             attachments_draft: Vec::new(),
             attachment_drafts: HashMap::new(),
             owned_pastes: HashMap::new(),
-            overlay: if modal.is_none() && preview_markdown.is_none() && !preview_long_jobs {
+            overlay: if modal.is_none()
+                && preview_markdown.is_none()
+                && !preview_long_jobs
+                && !preview_working_pill
+            {
                 overlay
             } else {
                 None
@@ -6285,6 +6290,15 @@ impl Client {
                 ),
                 started: wall_clock_millis() - 130_000,
             });
+        }
+        if preview_working_pill {
+            let active = client.active.clone();
+            client.forms.clear();
+            client.statuses.insert(active.clone(), RunStatus::Busy);
+            if let Some(conversation) = client.conversations.get_mut(&active) {
+                conversation.add_local_prompt("msg_working_preview", "continue", &[], None);
+            }
+            client.update_transcript(&active);
         }
         cx.subscribe(
             &client.search,
@@ -7807,6 +7821,7 @@ impl Client {
             .id("transcript-status")
             .test_support()
             .mx_auto()
+            .mt(px(10.))
             .mb(px(10.))
             .px(px(12.))
             .min_h(px(29.))
@@ -16264,6 +16279,12 @@ mod tests {
             });
             window.render_frame(cx);
             assert!(client.read(cx).is_running("ses_running"));
+            let viewport = client.read(cx).scroll.bounds();
+            let pill = window.find("transcript-status").bounds();
+            assert!(
+                pill.origin.y - (viewport.origin.y + viewport.size.height) >= px(10.),
+                "the working pill needs the same breathing room above as below"
+            );
             assert_eq!(
                 window.find("transcript-status-gear").bounds().size,
                 size(px(14.), px(14.))

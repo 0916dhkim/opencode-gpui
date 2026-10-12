@@ -187,6 +187,10 @@ fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == middle-close ]]; then
   xdotool mousemove --window "$win" 110 148 click 2
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == working-pill ]]; then
+  xdotool mousemove --window "$win" 100 227 click 1
+  sleep 0.5
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == transcript-autoscroll ]]; then
   xdotool mousemove --window "$win" 550 350 click 2
   sleep 0.2
