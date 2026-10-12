@@ -482,6 +482,25 @@ struct LinkMenu {
     position: Point<Pixels>,
 }
 
+#[derive(Clone)]
+struct TranscriptAutoscroll {
+    session: String,
+    origin: Point<Pixels>,
+    pointer: Point<Pixels>,
+    token: u64,
+}
+
+fn autoscroll_step(distance: Pixels, zoom: f32) -> Pixels {
+    let distance = distance.as_f32();
+    let beyond_dead_zone = (distance.abs() - 16. * zoom).max(0.);
+    if beyond_dead_zone == 0. {
+        px(0.)
+    } else {
+        let speed = (beyond_dead_zone / (8. * zoom)).powf(1.2).clamp(1., 40.) * zoom;
+        px(-speed.copysign(distance))
+    }
+}
+
 fn may_open_link(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto"))
 }
@@ -555,6 +574,8 @@ struct Client {
     overlay: Option<String>,
     link_menu: Option<LinkMenu>,
     link_menu_focus: [FocusHandle; 2],
+    autoscroll: Option<TranscriptAutoscroll>,
+    next_autoscroll_token: u64,
     scroll: VirtualListScrollHandle,
     transcript_content_width: Pixels,
     safe_scroll: HashMap<String, (RowLayoutStamp, Point<Pixels>)>,
@@ -2554,6 +2575,8 @@ impl Client {
             overlay: None,
             link_menu: None,
             link_menu_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            autoscroll: None,
+            next_autoscroll_token: 0,
             scroll,
             transcript_content_width: px(420.),
             safe_scroll: HashMap::new(),
@@ -2712,6 +2735,7 @@ impl Client {
 
     fn select_session(&mut self, id: String) {
         self.link_menu = None;
+        self.autoscroll = None;
         if !self.open_tabs.contains(&id) {
             self.open_tabs.push(id.clone());
         }
@@ -2766,6 +2790,77 @@ impl Client {
         if self.bootstrapped {
             self.persist_tabs();
         }
+    }
+
+    fn toggle_transcript_autoscroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.autoscroll.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.modal.is_some() || !self.scroll.bounds().contains(&position) {
+            return;
+        }
+        self.next_autoscroll_token = self.next_autoscroll_token.wrapping_add(1);
+        let token = self.next_autoscroll_token;
+        self.autoscroll = Some(TranscriptAutoscroll {
+            session: self.active.clone(),
+            origin: position,
+            pointer: position,
+            token,
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let still_active = this
+                    .update(cx, |this, cx| {
+                        if this
+                            .autoscroll
+                            .as_ref()
+                            .is_none_or(|state| state.token != token)
+                        {
+                            return false;
+                        }
+                        this.autoscroll_tick(cx)
+                    })
+                    .unwrap_or(false);
+                if !still_active {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.autoscroll.clone() else {
+            return false;
+        };
+        if state.session != self.active || self.modal.is_some() {
+            self.autoscroll = None;
+            cx.notify();
+            return false;
+        }
+        let delta = autoscroll_step(state.pointer.y - state.origin.y, self.zoom());
+        if delta == px(0.) {
+            return true;
+        }
+        let offset = self.scroll.offset();
+        let next_y = (offset.y + delta)
+            .max(-self.scroll.max_offset().y)
+            .min(px(0.));
+        if next_y != offset.y {
+            self.preserve_scroll = None;
+            self.pending_jump = None;
+            self.follow_bottom = None;
+            self.safe_scroll.remove(&self.active);
+            self.safe_anchors.remove(&self.active);
+            self.scroll.set_offset(point(offset.x, next_y));
+            cx.notify();
+        }
+        true
     }
 
     fn transcript_width(&self, window: &Window) -> Pixels {
@@ -3603,6 +3698,7 @@ impl Client {
 
     fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
         self.link_menu = None;
+        self.autoscroll = None;
         self.modal = Some(modal);
         self.picker_highlight = None;
         match modal {
@@ -3865,6 +3961,11 @@ impl Client {
             }
             if self.link_menu.take().is_some() {
                 self.composer.focus_handle(cx).focus(window, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if self.autoscroll.take().is_some() {
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -6065,6 +6166,8 @@ impl Client {
             },
             link_menu: None,
             link_menu_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            autoscroll: None,
+            next_autoscroll_token: 0,
             scroll,
             transcript_content_width: px(420.),
             safe_scroll: HashMap::new(),
@@ -8913,6 +9016,30 @@ impl Client {
         )
     }
 
+    fn autoscroll_marker(&self) -> Option<AnyElement> {
+        let origin = self.autoscroll.as_ref()?.origin;
+        let diameter = self.scaled(26.);
+        Some(
+            div()
+                .id("transcript-autoscroll-marker")
+                .test_support()
+                .absolute()
+                .left(origin.x - diameter / 2.)
+                .top(origin.y - diameter / 2.)
+                .size(diameter)
+                .rounded_full()
+                .border_1()
+                .border_color(self.tone(0x777f7e, 0x899097))
+                .bg(self.tone(0xfffdfa, 0x24282c))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(self.scaled(16.))
+                .child("↕")
+                .into_any_element(),
+        )
+    }
+
     fn modal_view(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal?;
         let picker_anchor = if matches!(modal, Modal::Model | Modal::Level) {
@@ -10406,6 +10533,28 @@ impl Render for Client {
             .relative()
             .capture_key_down(cx.listener(Self::handle_key_down))
             .capture_key_up(cx.listener(Self::handle_key_up))
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if event.button == MouseButton::Middle
+                    && this.modal.is_none()
+                    && this.link_menu.is_none()
+                    && this.scroll.bounds().contains(&event.position)
+                {
+                    this.toggle_transcript_autoscroll(event.position, cx);
+                    cx.stop_propagation();
+                } else if this.autoscroll.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                if let Some(state) = this.autoscroll.as_mut() {
+                    state.pointer = event.position;
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                if this.autoscroll.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .flex()
             .flex_col()
             .font_family("Noto Sans")
@@ -10545,6 +10694,7 @@ impl Render for Client {
                             .child(composer_slot),
                     ),
             )
+            .when_some(self.autoscroll_marker(), |view, marker| view.child(marker))
             .when_some(self.modal_view(window, cx), |view, modal| view.child(modal))
             .when_some(self.link_menu_view(window, cx), |view, menu| {
                 view.child(menu)
@@ -10626,8 +10776,8 @@ mod tests {
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
-        AppContext, Bounds, Focusable, Role, TestAppContext, WindowBounds, WindowOptions, point,
-        px, size,
+        AppContext, Bounds, Focusable, InputEvent as _, MouseButton, MouseDownEvent,
+        MouseMoveEvent, Role, TestAppContext, WindowBounds, WindowOptions, point, px, size,
     };
     use opencode_gpui::model::RunStatus;
     use opencode_gpui::persist::PersistedState;
@@ -14683,6 +14833,92 @@ mod tests {
             assert_eq!(client.read(cx).transcript_width(window), initial_width);
             assert!(window.try_find("new-session").is_some());
             assert!(window.try_find("session-header").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn middle_click_autoscrolls_only_the_transcript_and_cancels(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        assert_eq!(super::autoscroll_step(px(10.), 1.), px(0.));
+        assert!(super::autoscroll_step(px(100.), 1.) < px(0.));
+        assert!(super::autoscroll_step(px(-100.), 1.) > px(0.));
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        let origin = cx
+            .update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let scroll = &client.read(cx).scroll;
+                let bounds = scroll.bounds();
+                assert!(scroll.max_offset().y > px(0.));
+                scroll.set_offset(point(px(0.), -scroll.max_offset().y));
+                window.render_frame(cx);
+                bounds.origin + point(bounds.size.width / 2., bounds.size.height / 2.)
+            })
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Middle,
+                    position: origin,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(
+                client.read(cx).autoscroll.is_some(),
+                "middle-down must activate before redraw"
+            );
+            window.render_frame(cx);
+            assert!(window.try_find("transcript-autoscroll-marker").is_some());
+            let before = client.read(cx).scroll.offset().y;
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: origin - point(px(0.), px(110.)),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            client.update(cx, |client, cx| assert!(client.autoscroll_tick(cx)));
+            assert!(client.read(cx).scroll.offset().y > before);
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Middle,
+                    position: origin,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            assert!(window.try_find("transcript-autoscroll-marker").is_none());
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Middle,
+                    position: point(px(20.), px(70.)),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(client.read(cx).autoscroll.is_none());
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Middle,
+                    position: origin,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.press("escape", cx);
+            assert!(client.read(cx).autoscroll.is_none());
         })
         .unwrap();
     }

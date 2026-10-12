@@ -187,6 +187,13 @@ fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == middle-close ]]; then
   xdotool mousemove --window "$win" 110 148 click 2
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == transcript-autoscroll ]]; then
+  xdotool mousemove --window "$win" 550 350 click 2
+  sleep 0.2
+  import -window "$win" "${OUTPUT%.png}-marker.png"
+  xdotool mousemove --window "$win" 550 200
+  sleep 1.2
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == drag-reorder ]]; then
   xdotool mousemove --window "$win" 105 110 mousedown 1
   xdotool mousemove --window "$win" 105 135
