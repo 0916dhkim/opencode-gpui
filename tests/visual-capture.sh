@@ -238,7 +238,7 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == repair-server ]]; then
   sleep 0.4
   xdotool mousemove --window "$win" 390 222 click 1 key ctrl+a
   xdotool type --clearmodifiers --delay 25 'http://127.0.0.1:4096'
-  xdotool mousemove --window "$win" 760 727 click 1
+  xdotool key ctrl+Return
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == copy-code ]]; then
   xdotool mousemove --window "$win" 720 392 click 1
@@ -253,6 +253,9 @@ if [[ "${INTERACTION:-}" == running || "${INTERACTION:-}" == parked ]]; then
   else
     xdotool mousemove 92 "$row_y" click 1
   fi
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == idle ]]; then
+  xdotool mousemove --window "$win" 92 265 click 1
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == parked-type ]]; then
   xdotool mousemove --window "$win" 92 224 click 1
@@ -320,9 +323,12 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == apply-settings ]]; then
   xdotool mousemove --window "$win" 430 219 click 1
   xdotool key ctrl+a
   xdotool type --clearmodifiers --delay 30 'http://127.0.0.1:4555'
-  xdotool mousemove --window "$win" 758 726 click 1
+  xdotool key ctrl+Return
 fi
 xdotool mousemove 1100 850
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == hover-close ]]; then
+  xdotool mousemove --window "$win" 245 110
+fi
 sleep 6
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
   xdotool mousemove --window "$win" 710 350 click --repeat 30 --delay 20 5
@@ -330,6 +336,10 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
 fi
 if [[ "$CLIENT" == gpui ]]; then
   import -window "$win" "$OUTPUT"
+  if [[ -n "${SECOND_OUTPUT:-}" ]]; then
+    sleep 0.27
+    import -window "$win" "$SECOND_OUTPUT"
+  fi
 else
   import -window "$win" "$OUTPUT"
   if [[ "$case_name" == model || "$case_name" == level ]]; then

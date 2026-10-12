@@ -21,6 +21,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use gpui_kit::{Animation, Transformation, percentage};
 use opencode_gpui::{
     api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ServerEnvelope, UiEvent},
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
@@ -385,6 +386,23 @@ fn tab_indicator(busy: bool, unread: bool, has_jobs: bool) -> (bool, TabAttentio
         TabAttention::Read
     };
     (busy || has_jobs, attention)
+}
+
+fn status_gear(color: Rgba, id: String, spinning: bool) -> AnyElement {
+    let gear = Icon::default()
+        .data(include_bytes!("icons/settings.svg"))
+        .with_size(px(14.))
+        .text_color(color);
+    if spinning {
+        gear.with_animation(
+            id,
+            Animation::new(Duration::from_secs(1)).repeat(),
+            |gear, phase| gear.transform(Transformation::rotate(percentage(phase))),
+        )
+        .into_any_element()
+    } else {
+        gear.into_any_element()
+    }
 }
 
 #[derive(Clone)]
@@ -6039,11 +6057,7 @@ impl Client {
                 .child((index + 1).to_string())
                 .into_any_element()
         } else if gear {
-            Icon::default()
-                .data(include_bytes!("icons/settings.svg"))
-                .with_size(px(14.))
-                .text_color(rgb(dot_color))
-                .into_any_element()
+            status_gear(rgb(dot_color), format!("tab-gear-{}", session.id), busy)
         } else {
             div()
                 .w(px(9.))
@@ -6145,7 +6159,17 @@ impl Client {
                             })
                         })
                     })
-                    .child(indicator)
+                    .child(
+                        div()
+                            .id(format!("tab-status-{}", session.id))
+                            .test_support()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(indicator),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -6186,6 +6210,13 @@ impl Client {
                     } else {
                         self.tone(0xcfd0cc, 0x45494c)
                     })
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .hover(|style| style.bg(self.tone(0xe3e0da, 0x303a44)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
@@ -6223,6 +6254,17 @@ impl Client {
                     } else {
                         self.tone(0xcfd0cc, 0x45494c)
                     })
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .hover(|style| {
+                        style
+                            .bg(self.tone(0xb84b45, 0x8e3737))
+                            .text_color(rgb(0xffffff))
+                    })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
@@ -6232,12 +6274,7 @@ impl Client {
                     .child(
                         Icon::default()
                             .data(include_bytes!("icons/close.svg"))
-                            .with_size(px(16.))
-                            .text_color(if selected {
-                                self.tone(0x555b5c, 0xc8c4bd)
-                            } else {
-                                self.tone(0xcfd0cc, 0x45494c)
-                            }),
+                            .with_size(px(16.)),
                     ),
             )
             .when_some(drop_cue, |tab, after| {
@@ -6281,11 +6318,11 @@ impl Client {
             TabAttention::Read => self.tone(0x7c8682, 0x68736f),
         };
         let status: AnyElement = if gear {
-            Icon::default()
-                .data(include_bytes!("icons/settings.svg"))
-                .with_size(px(14.))
-                .text_color(dot_color)
-                .into_any_element()
+            status_gear(
+                dot_color,
+                format!("header-gear-{}", self.active),
+                self.is_running(&self.active),
+            )
         } else {
             div()
                 .w(px(9.))
@@ -6364,6 +6401,8 @@ impl Client {
             }
         }
         let mut jobs_panel = div()
+            .id("background-jobs")
+            .test_support()
             .flex()
             .flex_col()
             .px(px(12.))
@@ -6471,7 +6510,7 @@ impl Client {
             )
             .child(tabs)
             .child(div().flex_1())
-            .child(jobs_panel)
+            .when(!self.jobs.is_empty(), |sidebar| sidebar.child(jobs_panel))
             .child(
                 div()
                     .p(px(14.))
@@ -6500,7 +6539,18 @@ impl Client {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Settings, window, cx);
                             }))
-                            .child("⚙  Settings"),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.))
+                                    .child(
+                                        Icon::default()
+                                            .data(include_bytes!("icons/settings.svg"))
+                                            .with_size(px(14.)),
+                                    )
+                                    .child("Settings"),
+                            ),
                     ),
             )
             .into_any_element()
@@ -7210,36 +7260,36 @@ impl Client {
             .is_some_and(|rows| !rows.is_empty());
         let loading = self.loading_messages.get(&self.active);
         let failure = self.message_load_errors.get(&self.active);
-        let label = if let Some(RunStatus::Retry { message, .. }) = self.statuses.get(&self.active)
-        {
-            message.clone()
-        } else if let Some(cursor) = loading {
-            if cursor.is_some() {
-                "Loading earlier messages".into()
-            } else if conversation.is_some_and(|conversation| conversation.loaded) {
-                "Refreshing conversation".into()
+        let (label, spinning) =
+            if let Some(RunStatus::Retry { message, .. }) = self.statuses.get(&self.active) {
+                (message.clone(), true)
+            } else if let Some(cursor) = loading {
+                if cursor.is_some() {
+                    ("Loading earlier messages".into(), true)
+                } else if conversation.is_some_and(|conversation| conversation.loaded) {
+                    ("Refreshing conversation".into(), true)
+                } else {
+                    ("Loading conversation".into(), true)
+                }
+            } else if let Some(cursor) = failure {
+                if cursor.is_some() {
+                    ("Could not load earlier messages".into(), false)
+                } else if has_rows {
+                    ("Could not refresh conversation".into(), false)
+                } else {
+                    ("Could not load conversation".into(), false)
+                }
+            } else if self.active.is_empty() {
+                ("Open a session to begin".into(), false)
+            } else if self.is_running(&self.active) {
+                ("OpenCode is working".into(), true)
+            } else if !conversation.is_some_and(|conversation| conversation.loaded) {
+                ("Loading conversation".into(), true)
+            } else if !has_rows {
+                ("No messages yet".into(), false)
             } else {
-                "Loading conversation".into()
-            }
-        } else if let Some(cursor) = failure {
-            if cursor.is_some() {
-                "Could not load earlier messages".into()
-            } else if has_rows {
-                "Could not refresh conversation".into()
-            } else {
-                "Could not load conversation".into()
-            }
-        } else if self.active.is_empty() {
-            "Open a session to begin".into()
-        } else if self.is_running(&self.active) {
-            "OpenCode is working".into()
-        } else if !conversation.is_some_and(|conversation| conversation.loaded) {
-            "Loading conversation".into()
-        } else if !has_rows {
-            "No messages yet".into()
-        } else {
-            return None;
-        };
+                return None;
+            };
         let mut pill = div()
             .id("transcript-status")
             .test_support()
@@ -7257,6 +7307,21 @@ impl Client {
             .bg(self.tone(0xfffdfa, 0x171a1d))
             .text_size(px(12.))
             .text_color(self.tone(0x555b5c, 0xc4c8ca))
+            .when(spinning, |pill| {
+                pill.child(
+                    div()
+                        .id("transcript-status-gear")
+                        .test_support()
+                        .w(px(14.))
+                        .h(px(14.))
+                        .flex_shrink_0()
+                        .child(status_gear(
+                            self.tone(0xa46910, 0xe5b567),
+                            format!("transcript-status-gear-{}", self.active),
+                            true,
+                        )),
+                )
+            })
             .child(
                 div()
                     .min_w_0()
@@ -7981,7 +8046,7 @@ impl Client {
                     .px(px(14.))
                     .flex()
                     .items_center()
-                    .gap(px(18.))
+                    .gap(px(8.))
                     .child(
                         div()
                             .id("attach-file")
@@ -8002,6 +8067,11 @@ impl Client {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.choose_attachments(cx);
                             }))
+                            .w(px(32.))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .child(
                                 Icon::default()
                                     .data(include_bytes!("icons/paperclip.svg"))
@@ -8030,6 +8100,8 @@ impl Client {
                                 this.show_modal(Modal::Model, window, cx);
                             }))
                             .max_w(px(160.))
+                            .h(px(32.))
+                            .px(px(8.))
                             .flex()
                             .items_center()
                             .child(
@@ -8062,6 +8134,10 @@ impl Client {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_modal(Modal::Level, window, cx);
                             }))
+                            .h(px(32.))
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
                             .child(format!(
                                 "{}⌄",
                                 selected_model
@@ -8123,7 +8199,12 @@ impl Client {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child("■"),
+                                .child(
+                                    Icon::default()
+                                        .data(include_bytes!("icons/stop.svg"))
+                                        .with_size(px(22.))
+                                        .text_color(self.tone(0x555b5c, 0xc8c4bd)),
+                                ),
                         )
                     })
                     .child(
@@ -14778,6 +14859,70 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn empty_background_jobs_section_does_not_leave_a_sidebar_slot(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless sidebar window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("background-jobs").is_some());
+            client.update(cx, |client, cx| {
+                client.select_session("ses_idle".into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("background-jobs").is_none());
+            assert!(window.try_find("footer-settings").is_some());
+            client.update(cx, |client, cx| {
+                client.select_session("ses_running".into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("background-jobs").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn working_transcript_shows_a_gear_that_idle_transcripts_omit(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless activity window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.select_session("ses_running".into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(client.read(cx).is_running("ses_running"));
+            assert_eq!(
+                window.find("transcript-status-gear").bounds().size,
+                size(px(14.), px(14.))
+            );
+            assert_eq!(
+                window.find("tab-status-ses_running").bounds().size,
+                size(px(14.), px(14.))
+            );
+
+            client.update(cx, |client, cx| {
+                client.select_session("ses_idle".into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("transcript-status-gear").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn dragging_session_tabs_keeps_drafts_and_persists_order(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
@@ -16039,6 +16184,46 @@ mod tests {
                     .pending_prompts
                     .contains_key(&client.read(cx).active)
             );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn composer_footer_uses_even_control_gaps_and_centered_action_boxes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless composer window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let attach = window.find("attach-file").bounds();
+            let model = window.find("composer-model").bounds();
+            let level = window.find("composer-level").bounds();
+            let send = window.find("send-prompt").bounds();
+            assert_eq!(attach.size, size(px(32.), px(32.)));
+            assert_eq!(send.size, attach.size);
+            assert_eq!(
+                model.origin.x - (attach.origin.x + attach.size.width),
+                px(8.)
+            );
+            assert_eq!(level.origin.x - (model.origin.x + model.size.width), px(8.));
+            assert_eq!(model.size.height, attach.size.height);
+            assert_eq!(level.size.height, attach.size.height);
+            assert_eq!(attach.origin.y, send.origin.y);
+
+            client.update(cx, |client, cx| {
+                client.select_session("ses_running".into());
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let stop = window.find("stop-run").bounds();
+            let send = window.find("send-prompt").bounds();
+            assert_eq!(stop.size, send.size);
+            assert_eq!(stop.origin.y, send.origin.y);
+            assert_eq!(send.origin.x - (stop.origin.x + stop.size.width), px(8.));
         })
         .unwrap();
     }
