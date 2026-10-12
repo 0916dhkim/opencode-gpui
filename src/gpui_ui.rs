@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use gpui_kit::base::{
@@ -501,6 +501,15 @@ fn autoscroll_step(distance: Pixels, zoom: f32) -> Pixels {
     }
 }
 
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn may_open_link(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto"))
 }
@@ -539,6 +548,7 @@ struct Client {
     model_retry_count: HashMap<String, u8>,
     model_retry_scheduled: HashSet<String>,
     running_jobs: Jobs,
+    jobs_elapsed_refresh_active: bool,
     sessions: Vec<Session>,
     open_tabs: Vec<String>,
     sidebar_visible: bool,
@@ -2535,6 +2545,7 @@ impl Client {
             model_retry_count: HashMap::new(),
             model_retry_scheduled: HashSet::new(),
             running_jobs: Jobs::default(),
+            jobs_elapsed_refresh_active: false,
             sessions: Vec::new(),
             open_tabs: Vec::new(),
             sidebar_visible: true,
@@ -2861,6 +2872,37 @@ impl Client {
             cx.notify();
         }
         true
+    }
+
+    fn ensure_jobs_elapsed_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.jobs.is_empty() || self.jobs_elapsed_refresh_active {
+            return;
+        }
+        self.jobs_elapsed_refresh_active = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(u64::from(
+                        jobs::ELAPSED_REFRESH_SECONDS,
+                    )))
+                    .await;
+                let keep_refreshing = this
+                    .update(cx, |this, cx| {
+                        if this.jobs.is_empty() {
+                            this.jobs_elapsed_refresh_active = false;
+                            false
+                        } else {
+                            cx.notify();
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_refreshing {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn transcript_width(&self, window: &Window) -> Pixels {
@@ -6122,6 +6164,7 @@ impl Client {
             model_retry_count: HashMap::new(),
             model_retry_scheduled: HashSet::new(),
             running_jobs,
+            jobs_elapsed_refresh_active: false,
             sessions,
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
             sidebar_visible: true,
@@ -6240,7 +6283,7 @@ impl Client {
                 owner: Some(
                     "Audit rounded window surfaces and transcript pointer interactions".into(),
                 ),
-                started: 1_704_067_300_000,
+                started: wall_clock_millis() - 130_000,
             });
         }
         cx.subscribe(
@@ -6837,6 +6880,7 @@ impl Client {
             .border_t_1()
             .border_color(self.tone(0xc8c3ba, 0x24282c));
         if !self.jobs.is_empty() {
+            let now = wall_clock_millis();
             jobs_panel = jobs_panel.child(
                 div()
                     .flex()
@@ -6857,7 +6901,7 @@ impl Client {
             );
             for job in &self.jobs {
                 let shell = job.kind == JobKind::Shell;
-                let (label, elapsed) = job.subtitle_parts(1_704_067_320_000);
+                let (label, elapsed) = job.subtitle_parts(now);
                 jobs_panel = jobs_panel.child(
                     div()
                         .min_w_0()
@@ -6925,6 +6969,8 @@ impl Client {
                                                 div()
                                                     .id(format!("job-elapsed-{}", job.id))
                                                     .test_support()
+                                                    .role(Role::Label)
+                                                    .aria_label(format!("Elapsed {elapsed}"))
                                                     .flex_shrink_0()
                                                     .child(format!(" · {elapsed}")),
                                             )
@@ -10527,6 +10573,7 @@ impl Render for Client {
         let composer_slot = self
             .permission_card(cx)
             .unwrap_or_else(|| self.composer(window, cx));
+        self.ensure_jobs_elapsed_refresh(cx);
         let root = div()
             .id("app-root")
             .size_full()
@@ -16179,7 +16226,7 @@ mod tests {
                     kind: super::JobKind::Shell,
                     title: "printf 'CARGO_HOME=%s\\nHOME=%s' ...".repeat(5),
                     owner: Some("Audit very long nested agent session title".repeat(5)),
-                    started: 1_704_067_300_000,
+                    started: super::wall_clock_millis() - 130_000,
                 }];
                 cx.notify();
             });
@@ -16193,6 +16240,10 @@ mod tests {
             assert!(label.origin.x + label.size.width <= elapsed.origin.x);
             assert!(elapsed.origin.x + elapsed.size.width <= right);
             assert!(elapsed.size.width > px(0.));
+            assert_eq!(
+                window.find("job-elapsed-overflow").label(),
+                Some("Elapsed 2m")
+            );
         })
         .unwrap();
     }
