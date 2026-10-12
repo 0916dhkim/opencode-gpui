@@ -476,6 +476,16 @@ fn reorder_tab_ids(tabs: &mut Vec<String>, source: &str, target: &str, after: bo
     true
 }
 
+#[derive(Clone)]
+struct LinkMenu {
+    url: String,
+    position: Point<Pixels>,
+}
+
+fn may_open_link(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto"))
+}
+
 struct Client {
     dark: bool,
     api: Option<ApiHandle>,
@@ -543,6 +553,8 @@ struct Client {
     attachment_drafts: HashMap<String, Vec<PathBuf>>,
     owned_pastes: HashMap<PathBuf, Arc<tempfile::NamedTempFile>>,
     overlay: Option<String>,
+    link_menu: Option<LinkMenu>,
+    link_menu_focus: [FocusHandle; 2],
     scroll: VirtualListScrollHandle,
     transcript_content_width: Pixels,
     safe_scroll: HashMap<String, (RowLayoutStamp, Point<Pixels>)>,
@@ -2225,11 +2237,27 @@ impl Client {
             // The stateless markdown() helper identifies views by its caller
             // location. Repeated items at one call site then share parser
             // state and can remain stuck as blank loading placeholders.
+            let owner = cx.entity().downgrade();
             let markdown_view = |item_index, text| {
+                let owner = owner.clone();
                 TextView::markdown(
                     markdown_view_id(&self.active, &row.key, block_index, item_index),
                     text,
                 )
+                .on_link_click(move |url, event, window, app| {
+                    if event.is_secondary() {
+                        let position = event.position();
+                        let url = url.to_string();
+                        let _ = owner.update(app, |this, cx| {
+                            this.link_menu = Some(LinkMenu { url, position });
+                            let focus = this.link_menu_focus[0].clone();
+                            window.on_next_frame(move |window, cx| focus.focus(window, cx));
+                            cx.notify();
+                        });
+                    } else if !event.is_middle_click() && may_open_link(url) {
+                        app.open_url(url);
+                    }
+                })
             };
             let element: AnyElement = match block {
                 MarkdownBlock::Heading(level, title) => {
@@ -2524,6 +2552,8 @@ impl Client {
             attachment_drafts: HashMap::new(),
             owned_pastes: HashMap::new(),
             overlay: None,
+            link_menu: None,
+            link_menu_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             scroll,
             transcript_content_width: px(420.),
             safe_scroll: HashMap::new(),
@@ -2681,6 +2711,7 @@ impl Client {
     }
 
     fn select_session(&mut self, id: String) {
+        self.link_menu = None;
         if !self.open_tabs.contains(&id) {
             self.open_tabs.push(id.clone());
         }
@@ -3571,6 +3602,7 @@ impl Client {
     }
 
     fn show_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_menu = None;
         self.modal = Some(modal);
         self.picker_highlight = None;
         match modal {
@@ -3826,6 +3858,12 @@ impl Client {
                     self.settings.reset_draft(window, cx);
                 }
                 self.rename_target = None;
+                self.composer.focus_handle(cx).focus(window, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if self.link_menu.take().is_some() {
                 self.composer.focus_handle(cx).focus(window, cx);
                 cx.stop_propagation();
                 cx.notify();
@@ -6024,6 +6062,8 @@ impl Client {
             } else {
                 None
             },
+            link_menu: None,
+            link_menu_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             scroll,
             transcript_content_width: px(420.),
             safe_scroll: HashMap::new(),
@@ -8743,6 +8783,103 @@ impl Client {
             .into_any_element()
     }
 
+    fn activate_link_menu(&mut self, open: bool, cx: &mut Context<Self>) {
+        if let Some(menu) = self.link_menu.take() {
+            if open {
+                if may_open_link(&menu.url) {
+                    cx.open_url(&menu.url);
+                }
+            } else {
+                cx.write_to_clipboard(ClipboardItem::new_string(menu.url));
+            }
+            cx.notify();
+        }
+    }
+
+    fn link_menu_view(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.modal.is_some() {
+            return None;
+        }
+        let menu = self.link_menu.as_ref()?;
+        let width = self.scaled(164.);
+        let height = self.scaled(82.);
+        let margin = self.scaled(8.);
+        let left = menu
+            .position
+            .x
+            .min((window.viewport_size().width - width - margin).max(margin))
+            .max(margin);
+        let top = menu
+            .position
+            .y
+            .min((window.viewport_size().height - height - margin).max(margin))
+            .max(margin);
+        let mut popup = div()
+            .id("link-context-menu")
+            .test_support()
+            .absolute()
+            .left(left)
+            .top(top)
+            .w(width)
+            .h(height)
+            .p(self.scaled(5.))
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(self.tone(0xc8c3ba, 0x30353a))
+            .bg(self.tone(0xfffdfa, 0x191c1f))
+            .shadow_lg();
+        for (index, label, open) in [(0, "Open link", true), (1, "Copy link", false)] {
+            popup = popup.child(
+                div()
+                    .id(if open {
+                        "link-menu-open"
+                    } else {
+                        "link-menu-copy"
+                    })
+                    .role(Role::Button)
+                    .aria_label(label)
+                    .test_support()
+                    .track_focus(&self.link_menu_focus[index])
+                    .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .cursor_pointer()
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.activate_link_menu(open, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.activate_link_menu(open, cx);
+                        cx.stop_propagation();
+                    }))
+                    .h(self.scaled(35.))
+                    .px(self.scaled(10.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .hover(|style| style.bg(self.tone(0xece9e2, 0x303a44)))
+                    .child(label),
+            );
+        }
+        Some(
+            div()
+                .id("link-context-backdrop")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.link_menu = None;
+                    cx.notify();
+                }))
+                .child(popup)
+                .into_any_element(),
+        )
+    }
+
     fn modal_view(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal?;
         let picker_anchor = if matches!(modal, Modal::Model | Modal::Level) {
@@ -10375,7 +10512,10 @@ impl Render for Client {
                             .child(composer_slot),
                     ),
             )
-            .when_some(self.modal_view(window, cx), |view, modal| view.child(modal));
+            .when_some(self.modal_view(window, cx), |view, modal| view.child(modal))
+            .when_some(self.link_menu_view(window, cx), |view, menu| {
+                view.child(menu)
+            });
         WindowBorder::new()
             .shadow_size(px(0.))
             .child(root.when_some(row_probe, |view, probe| view.child(probe)))
@@ -14512,6 +14652,52 @@ mod tests {
             assert!(window.try_find("session-header").is_none());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn link_context_menu_copies_exact_url_opens_and_dismisses(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        assert!(super::may_open_link("https://example.com/path?x=1"));
+        assert!(!super::may_open_link("javascript:alert(1)"));
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless transcript window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.link_menu = Some(super::LinkMenu {
+                    url: "https://example.com/one?x=1".into(),
+                    position: point(px(700.), px(750.)),
+                });
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let popup = window.find("link-context-menu").bounds();
+            assert!(popup.origin.x + popup.size.width <= window.viewport_size().width);
+            assert!(popup.origin.y + popup.size.height <= window.viewport_size().height);
+            window.click("link-menu-copy", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("https://example.com/one?x=1".into())
+            );
+            assert!(client.read(cx).link_menu.is_none());
+
+            client.update(cx, |client, cx| {
+                client.link_menu = Some(super::LinkMenu {
+                    url: "https://example.com/two".into(),
+                    position: point(px(50.), px(80.)),
+                });
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("link-menu-open").label(), Some("Open link"));
+            window.click("link-menu-open", cx);
+            assert!(client.read(cx).link_menu.is_none());
+        })
+        .unwrap();
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/two"));
     }
 
     #[gpui_kit::test]
