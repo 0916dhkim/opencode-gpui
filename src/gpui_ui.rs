@@ -8188,6 +8188,7 @@ impl Client {
             .id("settings-sessions-list")
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .overflow_y_scroll()
             .track_scroll(&self.settings_sessions_scroll)
             .px(px(21.))
@@ -8225,6 +8226,7 @@ impl Client {
                     }))
                     .px(px(14.))
                     .py(px(8.))
+                    .min_w_0()
                     .rounded(px(7.))
                     .border_1()
                     .border_color(self.tone(
@@ -8241,6 +8243,10 @@ impl Client {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
                                     .font_weight(FontWeight::BOLD)
                                     .child(session.title.clone()),
                             )
@@ -8271,10 +8277,19 @@ impl Client {
                         div()
                             .mt(px(5.))
                             .flex()
+                            .min_w_0()
                             .text_size(px(11.))
                             .text_color(self.tone(0x858e8c, 0x7f878e))
-                            .child(div().flex_1().child(session.directory.clone()))
-                            .child(timestamp(session.time.updated)),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(session.directory.clone()),
+                            )
+                            .child(div().flex_shrink_0().child(timestamp(session.time.updated))),
                     ),
             );
         }
@@ -8284,6 +8299,7 @@ impl Client {
         div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .flex()
             .flex_col()
             .bg(self.tone(0xfffdfa, 0x15181b))
@@ -8783,6 +8799,9 @@ impl Client {
                 )
                 .into_any_element(),
             Modal::Settings => {
+                let card_width = (window.viewport_size().width - px(32.)).min(px(820.));
+                let card_height = (window.viewport_size().height - px(78.)).min(px(674.));
+                let rail_width = (card_width * 0.34).min(px(280.));
                 let fields = [
                     ("OpenCode server URL", &self.settings.server),
                     ("Username", &self.settings.username),
@@ -8794,6 +8813,7 @@ impl Client {
                     .id("settings-content")
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
@@ -8817,6 +8837,8 @@ impl Client {
                     content = content.child(div().child(label)).child(
                         div()
                             .h(px(32.))
+                            .min_w_0()
+                            .overflow_hidden()
                             .px(px(9.))
                             .flex()
                             .items_center()
@@ -8897,11 +8919,12 @@ impl Client {
                     div()
                         .flex_1()
                         .min_h_0()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .child(
                             div()
-                                .h(px(70.))
+                                .h(px(82.))
                                 .flex_shrink_0()
                                 .px(px(24.))
                                 .pt(px(18.))
@@ -8920,6 +8943,10 @@ impl Client {
                                 )
                                 .child(
                                     div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .text_size(px(11.))
                                         .text_color(self.tone(0x737c7a, 0x899097))
                                         .child("Configure server endpoint, credentials, and Cloudflare tokens"),
@@ -8931,8 +8958,10 @@ impl Client {
                     self.settings_sessions_body(window, cx)
                 };
                 div()
-                    .w(px(820.))
-                    .h(px(674.))
+                    .id("settings-card")
+                    .test_support()
+                    .w(card_width)
+                    .h(card_height)
                     .flex_shrink_0()
                     .flex()
                     .rounded(px(10.))
@@ -8940,9 +8969,13 @@ impl Client {
                     .border_color(self.tone(0xc8c3ba, 0x232930))
                     .bg(self.tone(0xf5f0e7, 0x111418))
                     .shadow_lg()
+                    .overflow_hidden()
                     .child(
                         div()
-                            .w(px(280.))
+                            .w(rail_width)
+                            .flex_shrink_0()
+                            .min_w_0()
+                            .overflow_hidden()
                             .flex()
                             .flex_col()
                             .px(px(8.))
@@ -9107,97 +9140,82 @@ impl Client {
                             .child(
                                 div()
                                     .pl(px(6.))
+                                    .min_w_0()
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.))
                                     .text_size(px(10.))
                                     .text_color(self.tone(0x929a9a, 0x6a7482))
                                     .child(
-                                        url::Url::parse(&self.settings.current.base_url)
-                                            .ok()
-                                            .and_then(|url| url.host_str().map(str::to_owned))
-                                            .unwrap_or_else(|| {
-                                                self.settings.current.base_url.clone()
-                                            }),
+                                        div()
+                                            .id("settings-host")
+                                            .test_support()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(
+                                                url::Url::parse(&self.settings.current.base_url)
+                                                    .ok()
+                                                    .and_then(|url| {
+                                                        url.host_str().map(str::to_owned)
+                                                    })
+                                                    .unwrap_or_else(|| {
+                                                        self.settings.current.base_url.clone()
+                                                    }),
+                                            ),
                                     )
                                     .child("opencode-gpui v0.1.0"),
                             ),
                     )
                     .child(
-                        div().w(px(540.)).flex().flex_col().child(content).child(
-                            div()
-                                .h(px(58.))
-                                .flex_shrink_0()
-                                .px(px(22.))
-                                .flex()
-                                .items_center()
-                                .border_t_1()
-                                .border_color(self.tone(0xded8cb, 0x232932))
-                                .bg(self.tone(0xf9f7f3, 0x14171d))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_size(px(11.))
-                                        .text_color(self.tone(0x818984, 0x899097))
-                                        .child(if self.settings.tab == SettingsTab::Connection {
-                                            "Secrets stay out of the state file"
-                                        } else {
-                                            "↑ ↓ to navigate · Enter to open in tab"
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .id("settings-cancel")
-                                        .role(Role::Button)
-                                        .aria_label(
-                                            if self.settings.tab == SettingsTab::Connection {
-                                                "Cancel settings"
-                                            } else {
-                                                "Close settings"
-                                            },
-                                        )
-                                        .test_support()
-                                        .track_focus(&self.settings_action_focus[0])
-                                        .focus_visible(|style| {
-                                            style.border_color(self.tone(0x2356a8, 0x78baff))
-                                        })
-                                        .cursor_pointer()
-                                        .on_key_down(cx.listener(
-                                            |this, event: &KeyDownEvent, window, cx| {
-                                                if matches!(
-                                                    event.keystroke.key.as_str(),
-                                                    "enter" | "space"
-                                                ) {
-                                                    this.cancel_settings(window, cx);
-                                                    cx.stop_propagation();
-                                                }
-                                            },
-                                        ))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.cancel_settings(window, cx);
-                                        }))
-                                        .px(px(14.))
-                                        .py(px(7.))
-                                        .mr(px(9.))
-                                        .border_1()
-                                        .border_color(self.tone(0xd3cec5, 0x30353a))
-                                        .rounded(px(5.))
-                                        .bg(self.tone(0xf1efec, 0x393939))
-                                        .text_color(self.tone(0x252829, 0xf8f7f7))
-                                        .child(if self.settings.tab == SettingsTab::Connection {
-                                            "Cancel"
-                                        } else {
-                                            "Close"
-                                        }),
-                                )
-                                .when(self.settings.tab == SettingsTab::Connection, |footer| {
-                                    footer.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .child(content)
+                            .child(
+                                div()
+                                    .h(px(58.))
+                                    .flex_shrink_0()
+                                    .px(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .border_t_1()
+                                    .border_color(self.tone(0xded8cb, 0x232932))
+                                    .bg(self.tone(0xf9f7f3, 0x14171d))
+                                    .child(
                                         div()
-                                            .id("settings-apply")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(11.))
+                                            .text_color(self.tone(0x818984, 0x899097))
+                                            .child(
+                                                if self.settings.tab == SettingsTab::Connection {
+                                                    "Secrets stay out of the state file"
+                                                } else {
+                                                    "↑ ↓ to navigate · Enter to open in tab"
+                                                },
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-cancel")
                                             .role(Role::Button)
-                                            .aria_label("Apply settings")
+                                            .aria_label(
+                                                if self.settings.tab == SettingsTab::Connection {
+                                                    "Cancel settings"
+                                                } else {
+                                                    "Close settings"
+                                                },
+                                            )
                                             .test_support()
-                                            .track_focus(&self.settings_action_focus[1])
+                                            .track_focus(&self.settings_action_focus[0])
                                             .focus_visible(|style| {
                                                 style.border_color(self.tone(0x2356a8, 0x78baff))
                                             })
@@ -9208,24 +9226,67 @@ impl Client {
                                                         event.keystroke.key.as_str(),
                                                         "enter" | "space"
                                                     ) {
-                                                        this.apply_settings(window, cx);
+                                                        this.cancel_settings(window, cx);
                                                         cx.stop_propagation();
                                                     }
                                                 },
                                             ))
                                             .on_click(cx.listener(|this, _, window, cx| {
-                                                this.apply_settings(window, cx);
+                                                this.cancel_settings(window, cx);
                                             }))
                                             .px(px(14.))
                                             .py(px(7.))
+                                            .mr(px(9.))
+                                            .border_1()
+                                            .border_color(self.tone(0xd3cec5, 0x30353a))
                                             .rounded(px(5.))
-                                            .bg(rgb(0xd29b52))
-                                            .text_color(rgb(0x17130e))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child("Apply"),
+                                            .bg(self.tone(0xf1efec, 0x393939))
+                                            .text_color(self.tone(0x252829, 0xf8f7f7))
+                                            .child(
+                                                if self.settings.tab == SettingsTab::Connection {
+                                                    "Cancel"
+                                                } else {
+                                                    "Close"
+                                                },
+                                            ),
                                     )
-                                }),
-                        ),
+                                    .when(self.settings.tab == SettingsTab::Connection, |footer| {
+                                        footer.child(
+                                            div()
+                                                .id("settings-apply")
+                                                .role(Role::Button)
+                                                .aria_label("Apply settings")
+                                                .test_support()
+                                                .track_focus(&self.settings_action_focus[1])
+                                                .focus_visible(|style| {
+                                                    style
+                                                        .border_color(self.tone(0x2356a8, 0x78baff))
+                                                })
+                                                .cursor_pointer()
+                                                .on_key_down(cx.listener(
+                                                    |this, event: &KeyDownEvent, window, cx| {
+                                                        if matches!(
+                                                            event.keystroke.key.as_str(),
+                                                            "enter" | "space"
+                                                        ) {
+                                                            this.apply_settings(window, cx);
+                                                            cx.stop_propagation();
+                                                        }
+                                                    },
+                                                ))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.apply_settings(window, cx);
+                                                }))
+                                                .px(px(14.))
+                                                .py(px(7.))
+                                                .rounded(px(5.))
+                                                .bg(rgb(0xd29b52))
+                                                .text_color(rgb(0x17130e))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child("Apply"),
+                                        )
+                                    }),
+                            ),
                     )
                     .into_any_element()
             }
@@ -9475,8 +9536,6 @@ impl Client {
                 .pl(px(if modal == Modal::Model { 220. } else { 374. }))
                 .pb(px(79.))
                 .bg(rgba(0x00000000))
-        } else if modal == Modal::Settings {
-            backdrop.items_start().justify_start().pt(px(36.))
         } else {
             backdrop
         };
@@ -13296,6 +13355,42 @@ mod tests {
             assert!(row.origin.x + row.size.width >= card.origin.x + card.size.width - px(3.));
             assert!(title.origin.x + title.size.width <= path.origin.x + px(1.));
             assert!(path.origin.x + path.size.width <= row.origin.x + row.size.width - px(12.));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_card_centers_and_clips_long_host_at_compact_and_wide_widths(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, Some("settings".into())))
+            })
+            .expect("headless settings window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.settings.current.base_url =
+                    format!("https://{}.example.com", "long-host-".repeat(40));
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            for width in [780., 1200.] {
+                window.resize(size(px(width), px(800.)));
+                window.bounds_changed(cx);
+                window.render_frame(cx);
+                let card = window.find("settings-card").bounds();
+                let host = window.find("settings-host").bounds();
+                let viewport = window.viewport_size();
+                assert!(card.size.width <= viewport.width - px(30.));
+                assert!((card.origin.x - (viewport.width - card.size.width) / 2.).abs() <= px(2.));
+                assert!(card.origin.y >= px(46.));
+                assert!(card.origin.y + card.size.height <= viewport.height);
+                assert!(host.origin.x + host.size.width <= card.origin.x + card.size.width / 2.);
+            }
         })
         .unwrap();
     }
