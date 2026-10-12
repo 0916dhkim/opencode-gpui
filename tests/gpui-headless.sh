@@ -31,6 +31,12 @@ gpui_start_display() {
   weston_pid=$!
   for _ in {1..80}; do [[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]] && break; sleep 0.1; done
   [[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]] || { cat "$temporary/weston.log" >&2; return 1; }
+  # The session bus was started before this function exported DISPLAY. Its
+  # D-Bus-activated portal/keyring prompter otherwise starts without a display
+  # on CI, so a new Secret Service collection can fail to initialize.
+  if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dbus-update-activation-environment >/dev/null; then
+    dbus-update-activation-environment DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR >/dev/null 2>&1 || true
+  fi
 }
 
 gpui_wait_window() {
