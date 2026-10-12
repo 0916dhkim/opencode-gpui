@@ -195,6 +195,14 @@ if [[ "$CLIENT" == gpui && "$case_name" == many-projects && "${INTERACTION:-}" =
   xdotool key --repeat 8 --delay 50 Down
   sleep 0.4
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == alt-hold ]]; then
+  xdotool mousemove --window "$win" 410 680 click 1
+  xdotool keydown Alt_L
+  sleep 0.3
+  import -window "$win" "${OUTPUT%.png}-held.png"
+  xdotool keyup Alt_L
+  sleep 0.3
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == transcript-autoscroll ]]; then
   xdotool mousemove --window "$win" 550 350 click 2
   sleep 0.2

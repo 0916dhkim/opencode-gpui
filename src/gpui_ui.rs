@@ -4392,10 +4392,11 @@ impl Client {
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if matches!(
-            event.keystroke.key.to_ascii_lowercase().as_str(),
-            "alt" | "alt_l" | "alt_r"
-        ) && self.tab_shortcut_hint
+        if self.tab_shortcut_hint
+            && (matches!(
+                event.keystroke.key.to_ascii_lowercase().as_str(),
+                "alt" | "alt_l" | "alt_r"
+            ) || !event.keystroke.modifiers.alt)
         {
             self.tab_shortcut_hint = false;
             cx.notify();
@@ -10692,6 +10693,13 @@ impl Render for Client {
             .relative()
             .capture_key_down(cx.listener(Self::handle_key_down))
             .capture_key_up(cx.listener(Self::handle_key_up))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                let show_numbers = event.modifiers.alt && !event.modifiers.control;
+                if this.tab_shortcut_hint != show_numbers {
+                    this.tab_shortcut_hint = show_numbers;
+                    cx.notify();
+                }
+            }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                 if event.button == MouseButton::Middle
                     && this.modal.is_none()
@@ -10936,8 +10944,9 @@ mod tests {
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
-        AppContext, Bounds, Focusable, InputEvent as _, MouseButton, MouseDownEvent,
-        MouseMoveEvent, Role, TestAppContext, WindowBounds, WindowOptions, point, px, size,
+        AppContext, Bounds, Focusable, InputEvent as _, Modifiers, ModifiersChangedEvent,
+        MouseButton, MouseDownEvent, MouseMoveEvent, Role, TestAppContext, WindowBounds,
+        WindowOptions, point, px, size,
     };
     use opencode_gpui::model::RunStatus;
     use opencode_gpui::persist::PersistedState;
@@ -14538,6 +14547,36 @@ mod tests {
             assert!(client.read(cx).modal == Some(Modal::Level));
             window.press("escape", cx);
             assert!(client.read(cx).modal.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn releasing_alt_clears_tab_number_hints_even_without_an_alt_keyup(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless sidebar window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.render_frame(cx);
+            client.update(cx, |client, cx| {
+                client.tab_shortcut_hint = true;
+                cx.notify();
+            });
+            window.set_modifiers(Modifiers {
+                alt: true,
+                ..Default::default()
+            });
+            window.render_frame(cx);
+            assert!(client.read(cx).tab_shortcut_hint);
+            window.dispatch_event(ModifiersChangedEvent::default().to_platform_input(), cx);
+            window.render_frame(cx);
+            assert!(!client.read(cx).tab_shortcut_hint);
         })
         .unwrap();
     }
