@@ -729,6 +729,11 @@ enum MarkdownBlock {
 const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 3;
 const TRANSCRIPT_MEASURE_BATCH: usize = 64;
 const TRANSCRIPT_PROGRESSIVE_MIN_ROWS: usize = 256;
+// A width change invalidates exact heights, but it should not build 64 natural
+// Markdown rows just to cover one viewport while the detached probe catches up.
+fn transcript_fallback_budget(viewport_height: Pixels) -> usize {
+    ((viewport_height.as_f32() / 48.).ceil() as usize + 4).clamp(8, TRANSCRIPT_MEASURE_BATCH)
+}
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
 const LONG_ORDERED_LIST_PREVIEW: &str = r#"A long answer with rich list items and linked source locations. The remaining differences are:
 
@@ -7748,16 +7753,17 @@ impl Client {
                     .conversations
                     .get(&self.active)
                     .is_some_and(|conversation| conversation.next_cursor.is_some());
+                let viewport_height = if self.scroll.bounds().size.height > px(0.) {
+                    self.scroll.bounds().size.height
+                } else {
+                    (window.viewport_size().height - px(220.)).max(px(160.))
+                };
+                let fallback_budget = transcript_fallback_budget(viewport_height);
                 let current_range = if pending_index.is_none()
                     && transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
                     && !tail_only
                 {
                     self.row_heights.get(&self.active).map(|cache| {
-                        let viewport_height = if self.scroll.bounds().size.height > px(0.) {
-                            self.scroll.bounds().size.height
-                        } else {
-                            (window.viewport_size().height - px(220.)).max(px(160.))
-                        };
                         cache.borrow().provisional_viewport(
                             transcript,
                             has_load,
@@ -7798,7 +7804,7 @@ impl Client {
                         // estimated spacer: their real heights would shift it.
                         index
                     } else {
-                        index.saturating_sub(TRANSCRIPT_MEASURE_BATCH)
+                        index.saturating_sub(fallback_budget)
                     }
                 } else if tail_only {
                     let measured_tail = self.row_heights.get(&self.active).map_or(0, |cache| {
@@ -7811,7 +7817,7 @@ impl Client {
                     });
                     transcript
                         .len()
-                        .saturating_sub(measured_tail + TRANSCRIPT_MEASURE_BATCH)
+                        .saturating_sub(measured_tail + fallback_budget)
                 } else {
                     0
                 };
@@ -7819,10 +7825,10 @@ impl Client {
                     target_index
                         .filter(|_| bounded_target)
                         .map_or(transcript.len(), |index| {
-                            (index + TRANSCRIPT_MEASURE_BATCH + 1)
+                            (index + fallback_budget + 1)
                                 .max(current_range.as_ref().map_or(0, |range| {
                                     range.end.saturating_sub(usize::from(has_load))
-                                        + TRANSCRIPT_MEASURE_BATCH
+                                        + fallback_budget
                                 }))
                                 .min(transcript.len())
                         });
@@ -12014,6 +12020,128 @@ mod tests {
             "rows={count} complex={complex} 50 streamed updates+headless frames: median={:?} p95={:?} max={:?}",
             samples[25], samples[47], samples[49]
         );
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "manual headless resize CPU profile; not a native GPU-present benchmark"]
+    fn profile_large_transcript_resize_frames(cx: &mut TestAppContext) {
+        use std::time::Instant;
+
+        cx.update(gpui_kit::init);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(780.), px(900.)),
+            ))),
+            ..Default::default()
+        };
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless resize window")
+        });
+        let count = std::env::var("TRANSCRIPT_PROFILE_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(320);
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..count)
+                        .map(|index| {
+                            let body = if index % 5 == 0 {
+                                "# Step\n\n- A **bold** explanation\n- Another line with `code`\n\n```rust\nfn main() {}\n```"
+                            } else {
+                                "A short answer."
+                            };
+                            cache_row(&format!("resize_{index}"), body)
+                        })
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                client.follow_bottom = Some((client.active.clone(), client.scroll.offset()));
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        let mut times = Vec::new();
+        let mut layouts = Vec::new();
+        for index in 0..50 {
+            let before = cx.update(|cx| {
+                let state = client.read(cx);
+                state.row_heights[&state.active].borrow().layouts
+            });
+            cx.simulate_window_resize(handle, size(px(780. + (index % 8) as f32 * 7.), px(900.)));
+            let start = Instant::now();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            times.push(start.elapsed());
+            layouts.push(cx.update(|cx| {
+                let state = client.read(cx);
+                state.row_heights[&state.active].borrow().layouts - before
+            }));
+        }
+        times.sort_unstable();
+        layouts.sort_unstable();
+        println!(
+            "rows={count} 50 resize+headless frames: median={:?} p95={:?} max={:?} layouts median={} p95={} max={}",
+            times[25], times[47], times[49], layouts[25], layouts[47], layouts[49]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn resize_mounts_only_a_viewport_sized_fallback_for_long_history(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(780.), px(900.)),
+            ))),
+            ..Default::default()
+        };
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless resize window")
+        });
+        cx.update(|cx| {
+            client.update(cx, |client, cx| {
+                client.transcript.insert(
+                    client.active.clone(),
+                    (0..320)
+                        .map(|index| cache_row(&format!("resize_{index}"), "A short answer."))
+                        .collect(),
+                );
+                client.row_heights.remove(&client.active);
+                client.follow_bottom = Some((client.active.clone(), client.scroll.offset()));
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+        cx.update(|cx| client.read(cx).rendered_rows.borrow_mut().clear());
+        cx.simulate_window_resize(handle, size(px(815.), px(900.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let current = client.read(cx);
+            let budget = super::transcript_fallback_budget(current.scroll.bounds().size.height);
+            let mounted = current.rendered_rows.borrow();
+            assert!(
+                mounted.len() <= budget * 2 + 3,
+                "resize mounted {} rows for a {budget}-row viewport budget",
+                mounted.len()
+            );
+            assert!(mounted.contains(&319), "the tail vanished during resize");
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
