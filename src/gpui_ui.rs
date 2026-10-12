@@ -13,7 +13,7 @@ use gpui_kit::base::{
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::text::markdown;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar, VirtualListScrollHandle, WindowBorder,
@@ -711,6 +711,12 @@ const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 3;
 const TRANSCRIPT_MEASURE_BATCH: usize = 64;
 const TRANSCRIPT_PROGRESSIVE_MIN_ROWS: usize = 256;
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
+const LONG_ORDERED_LIST_PREVIEW: &str = r#"A long answer with rich list items and linked source locations. The remaining differences are:
+
+1. **User-row entry edge is missing.** GTK gives every `.user-message` a 1px *top* border as well as its bottom border. See [GPUI row rendering](/test/worktrees/really-long-reproduction-project/source/tree/src/gpui_ui.rs#L6576) versus `reference:src/style.css`.
+2. **Sidebar footer has extra, full-width rules.** GPUI always renders a top border even without jobs, while GTK hides the section. See [GPUI sidebar](/test/worktrees/really-long-reproduction-project/source/tree/src/gpui_ui.rs#L6320).
+3. **Sticky user prompt is styled differently.** The reference applies `.message-row.user-message.sticky-message`; the GPUI row has a muted role color. See [sticky row](/test/worktrees/really-long-reproduction-project/source/tree/src/gpui_ui.rs#L7271).
+4. **Header and tab separators differ slightly.** Long lines use nearby but different theme colors. See [session header](/test/worktrees/really-long-reproduction-project/source/tree/src/gpui_ui.rs#L6251)."#;
 const SIDEBAR_WIDTH: f32 = 270.;
 const TRANSCRIPT_SCROLLBAR_GUTTER: f32 = 14.;
 
@@ -1903,6 +1909,18 @@ fn escape_markdown_literal(text: &str) -> String {
     escaped
 }
 
+fn markdown_view_id(
+    session: &str,
+    row: &TranscriptRowKey,
+    block_index: usize,
+    item_index: usize,
+) -> String {
+    format!(
+        "markdown-{session}-{}-{:?}-{block_index}-{item_index}",
+        row.message_id, row.slot
+    )
+}
+
 fn heading_is_block_marker(title: &str) -> bool {
     let title = title.trim_start();
     title.starts_with("- ")
@@ -2060,9 +2078,23 @@ impl Client {
             .into_any_element()
     }
 
-    fn markdown_body(&self, source: &str, row_index: usize, cx: &Context<Self>) -> AnyElement {
+    fn markdown_body(
+        &self,
+        row: &TranscriptRow,
+        row_index: usize,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let mut content = div().w_full().flex().flex_col().gap(px(10.));
-        for (block_index, block) in markdown_blocks(source).into_iter().enumerate() {
+        for (block_index, block) in markdown_blocks(&row.body).into_iter().enumerate() {
+            // The stateless markdown() helper identifies views by its caller
+            // location. Repeated items at one call site then share parser
+            // state and can remain stuck as blank loading placeholders.
+            let markdown_view = |item_index, text| {
+                TextView::markdown(
+                    markdown_view_id(&self.active, &row.key, block_index, item_index),
+                    text,
+                )
+            };
             let element: AnyElement = match block {
                 MarkdownBlock::Heading(level, title) => {
                     let heading = div()
@@ -2075,12 +2107,12 @@ impl Client {
                     if heading_is_block_marker(&title) || !title.contains(['*', '_', '`', '[']) {
                         heading.child(title).into_any_element()
                     } else {
-                        heading.child(markdown(title)).into_any_element()
+                        heading.child(markdown_view(0, title)).into_any_element()
                     }
                 }
                 MarkdownBlock::Paragraph(text) => div()
                     .line_height(px(22.))
-                    .child(markdown(text))
+                    .child(markdown_view(0, text))
                     .into_any_element(),
                 MarkdownBlock::Structured {
                     content,
@@ -2099,7 +2131,7 @@ impl Client {
                                 .child(marker),
                         );
                     }
-                    line = line.child(div().flex_1().min_w_0().child(markdown(content)));
+                    line = line.child(div().flex_1().min_w_0().child(markdown_view(0, content)));
                     let mut block = div()
                         .w_full()
                         .pl(px(16. * list_depth.saturating_sub(1) as f32))
@@ -2131,6 +2163,7 @@ impl Client {
                         .rounded(px(5.))
                         .border_1()
                         .border_color(self.tone(0xd2cdc5, 0x30353a));
+                    let mut cell_index = 0;
                     for (index, row) in std::iter::once(header).chain(rows).enumerate() {
                         let mut line = div().w_full().flex().when(index == 0, |line| {
                             line.font_weight(FontWeight::BOLD)
@@ -2144,8 +2177,9 @@ impl Client {
                                     .p(px(7.))
                                     .border_r_1()
                                     .border_color(self.tone(0xd2cdc5, 0x30353a))
-                                    .child(markdown(cell)),
+                                    .child(markdown_view(cell_index, cell)),
                             );
+                            cell_index += 1;
                         }
                         table = table.child(line);
                     }
@@ -2158,7 +2192,7 @@ impl Client {
                     .into_any_element(),
                 MarkdownBlock::List(items) => {
                     let mut list = div().flex().flex_col().gap(px(10.));
-                    for item in items {
+                    for (item_index, item) in items.into_iter().enumerate() {
                         list = list.child(
                             div()
                                 .flex()
@@ -2171,7 +2205,7 @@ impl Client {
                                         .text_color(self.tone(0x777e7d, 0xaeb4b9))
                                         .child("•"),
                                 )
-                                .child(markdown(item)),
+                                .child(markdown_view(item_index, item)),
                         );
                     }
                     list.into_any_element()
@@ -5642,15 +5676,19 @@ impl Client {
                 conversations.insert(session.id.clone(), conversation);
             }
         }
-        let complex_markdown = overlay.as_deref() == Some("complex-markdown");
-        if complex_markdown
+        let preview_markdown = match overlay.as_deref() {
+            Some("complex-markdown") => Some(COMPLEX_MARKDOWN_PREVIEW),
+            Some("long-ordered-list") => Some(LONG_ORDERED_LIST_PREVIEW),
+            _ => None,
+        };
+        if let Some(preview_markdown) = preview_markdown
             && let Some(row) = transcript.get_mut(&active).and_then(|rows| {
                 rows.iter_mut().find(|row| {
                     row.role == model::Role::Assistant && row.kind == TranscriptRowKind::Normal
                 })
             })
         {
-            row.body = COMPLEX_MARKDOWN_PREVIEW.into();
+            row.body = preview_markdown.into();
             row.render_revision += 1;
         }
         let catalog = match fixture.handle(Command::LoadModels {
@@ -5737,7 +5775,7 @@ impl Client {
             attachments_draft: Vec::new(),
             attachment_drafts: HashMap::new(),
             owned_pastes: HashMap::new(),
-            overlay: if modal.is_none() && !complex_markdown {
+            overlay: if modal.is_none() && preview_markdown.is_none() {
                 overlay
             } else {
                 None
@@ -6527,7 +6565,7 @@ impl Client {
                 )
             }
             TranscriptRowKind::Normal if !user => {
-                body = body.child(self.markdown_body(&row.body, index, cx))
+                body = body.child(self.markdown_body(row, index, cx))
             }
             _ => body = body.child(row.body.clone()),
         }
@@ -9845,13 +9883,13 @@ mod tests {
 
     use super::{
         ApiHandle, COMPLEX_MARKDOWN_PREVIEW, Client, ClipboardItem, Image, ImageFormat,
-        MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT,
-        TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode, UiEvent,
-        VirtualListScrollHandle, filter_all_sessions, filter_levels, filter_models,
-        filter_new_session_projects, filter_tab_sessions, fuzzy_score, markdown_blocks, model,
-        needs_new_connection, new_session_choice, picker_list_height, reorder_tab_ids,
-        safe_connection_error, splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
-        unread_on_server_switch, update_session_projection,
+        LONG_ORDERED_LIST_PREVIEW, MarkdownBlock, Modal, RowHeightCache, RowLayoutStamp,
+        SESSION_PICKER_LIMIT, TRANSCRIPT_ROW_STYLE_REVISION, TabAttention, Theme, ThemeMode,
+        UiEvent, VirtualListScrollHandle, filter_all_sessions, filter_levels, filter_models,
+        filter_new_session_projects, filter_tab_sessions, fuzzy_score, markdown_blocks,
+        markdown_view_id, model, needs_new_connection, new_session_choice, picker_list_height,
+        reorder_tab_ids, safe_connection_error, splice_transcript, sticky_user_index,
+        tab_indicator, tab_number_key, unread_on_server_switch, update_session_projection,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -16026,6 +16064,43 @@ mod tests {
         assert!(super::heading_is_block_marker("- item"));
         assert!(super::heading_is_block_marker("# Heading"));
         assert!(!super::heading_is_block_marker("**Important**"));
+    }
+
+    #[test]
+    fn linked_ordered_list_items_have_distinct_stable_markdown_views() {
+        let row = cache_row("long_list", LONG_ORDERED_LIST_PREVIEW);
+        let blocks = markdown_blocks(LONG_ORDERED_LIST_PREVIEW);
+        let list_items = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| {
+                if let MarkdownBlock::Structured {
+                    marker: Some(marker),
+                    content,
+                    ..
+                } = block
+                {
+                    Some((index, marker, content))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(list_items.len(), 4);
+        let ids = list_items
+            .iter()
+            .map(|(index, _, _)| markdown_view_id("ses_one", &row.key, *index, 0))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            list_items.len(),
+            "each list item needs its own parser state"
+        );
+        assert!(list_items.iter().all(|(_, _, content)| !content.is_empty()));
+        assert_ne!(
+            markdown_view_id("ses_one", &row.key, list_items[0].0, 0),
+            markdown_view_id("ses_two", &row.key, list_items[0].0, 0)
+        );
     }
 
     #[test]
