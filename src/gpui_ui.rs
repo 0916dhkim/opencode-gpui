@@ -7171,6 +7171,19 @@ impl Client {
                                 .child(summary.to_owned()),
                         )
                     })
+                    .when_some(self.measurement.report_path(), |footer, path| {
+                        footer.child(
+                            BaseButton::new("measurement-copy-path")
+                                .accessibility_label(format!("Copy frame trace path: {path}"))
+                                .h(self.scaled(21.))
+                                .line_height(self.scaled(16.))
+                                .justify_start()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                                })
+                                .child("Copy trace path"),
+                        )
+                    })
                     .child(
                         BaseButton::new("footer-tabs")
                             .accessibility_label("Open tabs")

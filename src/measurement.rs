@@ -1,18 +1,27 @@
-//! On-demand CPU frame costs from GPUI's built-in profiler.
+//! On-demand, content-free frame trace from GPUI's built-in CPU profiler.
 
-use std::time::Instant;
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
+use anyhow::{Context as _, Result};
 use gpui_kit::{
     FrameEvent, WindowId,
     profiler::{self, FrameTimingCollector},
 };
+use serde_json::json;
 
 #[derive(Default)]
 pub struct Measurement {
     collector: Option<FrameTimingCollector>,
     window_id: Option<WindowId>,
     started: Option<Instant>,
-    summary: Option<String>,
+    started_unix_ms: u128,
+    report: Option<PathBuf>,
+    status: Option<String>,
 }
 
 impl Measurement {
@@ -21,13 +30,21 @@ impl Measurement {
     }
 
     pub fn summary(&self) -> Option<&str> {
-        self.summary.as_deref()
+        self.status.as_deref()
+    }
+
+    pub fn report_path(&self) -> Option<String> {
+        self.report.as_ref().map(|path| path.display().to_string())
     }
 
     pub fn start(&mut self, window_id: WindowId) {
-        self.summary = None;
+        self.status = None;
+        self.report = None;
         self.window_id = Some(window_id);
         self.started = Some(Instant::now());
+        self.started_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
         profiler::set_trace_enabled(true);
         self.collector = Some(FrameTimingCollector::new());
     }
@@ -36,60 +53,86 @@ impl Measurement {
         let Some(mut collector) = self.collector.take() else {
             return;
         };
-        let window_id = self.window_id.expect("active measurement has a window");
-        let elapsed = self
+        let elapsed_ms = self
             .started
-            .take()
-            .expect("active measurement has a start")
-            .elapsed();
-        let mut draws = Vec::new();
-        let mut presents = Vec::new();
-        for event in collector.collect_unseen() {
-            match event {
+            .expect("measurement has a start")
+            .elapsed()
+            .as_secs_f64()
+            * 1000.;
+        let events = collector.collect_unseen();
+        profiler::set_trace_enabled(false);
+        match self.write_trace(&events, elapsed_ms) {
+            Ok((path, count)) => {
+                self.status = Some(format!("CPU frame trace saved · {count} draws"));
+                self.report = Some(path);
+            }
+            Err(error) => self.status = Some(format!("CPU frame trace failed: {error:#}")),
+        }
+        self.started = None;
+    }
+
+    fn write_trace(&self, events: &[FrameEvent], elapsed_ms: f64) -> Result<(PathBuf, usize)> {
+        let directory = dirs::data_dir()
+            .context("XDG data directory unavailable")?
+            .join("opencode-gpui/measurements");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!(
+            "frame-{}-{}.jsonl",
+            self.started_unix_ms,
+            std::process::id()
+        ));
+        let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+        let start = self.started_unix_ms;
+        let window_id = self.window_id.expect("measurement has a window");
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "capture",
+                "schema": 1,
+                "started_unix_ms": start,
+                "duration_ms": elapsed_ms,
+                "units": "milliseconds",
+                "notes": "CPU draw and platform present timing only. Present is not GPU execution or compositor time. No prompt, transcript, or pixel content is recorded."
+            })
+        )?;
+        let mut draws = 0;
+        let mut presents = 0;
+        for event in events {
+            let row = match event {
                 FrameEvent::Draw(frame) if frame.window_id == window_id => {
-                    draws.push(frame.draw_duration().as_secs_f64() * 1000.);
+                    draws += 1;
+                    json!({
+                        "type": "draw",
+                        "index": draws,
+                        "at_ms": frame.draw_start.duration_since(self.started.expect("start available during write")).as_secs_f64() * 1000.,
+                        "duration_ms": frame.draw_duration().as_secs_f64() * 1000.,
+                        "dirty_to_draw_ms": frame.dirty_to_draw_duration().map(|duration| duration.as_secs_f64() * 1000.),
+                        "invalidations": frame.invalidations,
+                    })
                 }
                 FrameEvent::Present(frame) if frame.window_id == window_id => {
-                    presents.push(frame.present_duration().as_secs_f64() * 1000.);
+                    presents += 1;
+                    json!({
+                        "type": "present",
+                        "index": presents,
+                        "at_ms": frame.present_start.duration_since(self.started.expect("start available during write")).as_secs_f64() * 1000.,
+                        "duration_ms": frame.present_duration().as_secs_f64() * 1000.,
+                        "animation_interval_ms": frame.animation_interval.map(|duration| duration.as_secs_f64() * 1000.),
+                    })
                 }
-                _ => {}
-            }
+                _ => continue,
+            };
+            writeln!(file, "{row}")?;
         }
-        profiler::set_trace_enabled(false);
-        self.summary = Some(summarize(&mut draws, &mut presents, elapsed.as_secs_f64()));
-    }
-}
-
-fn summarize(draws: &mut [f64], presents: &mut [f64], seconds: f64) -> String {
-    if draws.is_empty() && presents.is_empty() {
-        return "No frames recorded. Try measuring while scrolling or typing.".into();
-    }
-    let p95 = |durations: &mut [f64]| -> f64 {
-        if durations.is_empty() {
-            return 0.;
-        }
-        durations.sort_by(f64::total_cmp);
-        durations[((durations.len() - 1) as f64 * 0.95).ceil() as usize]
-    };
-    format!(
-        "CPU · {:.0}s · {} frames · draw p95 {:.1}ms · present p95 {:.1}ms",
-        seconds,
-        draws.len(),
-        p95(draws),
-        p95(presents),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::summarize;
-
-    #[test]
-    fn reports_cpu_frame_tail_and_empty_capture() {
-        let summary = summarize(&mut [1., 4., 2.], &mut [0.5, 3., 1.], 2.);
-        assert!(summary.contains("CPU · 2s · 3 frames"));
-        assert!(summary.contains("draw p95 4.0ms"));
-        assert!(summary.contains("present p95 3.0ms"));
-        assert!(summarize(&mut [], &mut [], 0.).contains("No frames recorded"));
+        writeln!(
+            file,
+            "{}",
+            json!({"type": "end", "draws": draws, "presents": presents})
+        )?;
+        file.flush()?;
+        file.persist(&path)
+            .with_context(|| format!("saving {}", path.display()))?;
+        Ok((path, draws))
     }
 }
