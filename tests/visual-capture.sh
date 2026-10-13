@@ -166,6 +166,15 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == complex-top ]]; then
   xdotool mousemove --window "$win" 550 350 click --repeat 30 --delay 20 4
   sleep 1
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == sticky-mid ]]; then
+  if (( ${STICKY_ZOOM_STEPS:-0} > 0 )); then
+    xdotool mousemove --window "$win" 410 680 click 1
+  fi
+  for ((i = 0; i < ${STICKY_ZOOM_STEPS:-0}; i++)); do xdotool key ctrl+equal; sleep 0.15; done
+  sleep 0.3
+  xdotool mousemove --window "$win" 550 350 click --repeat "${STICKY_SCROLL_TICKS:-2}" --delay 40 5
+  sleep 0.5
+fi
 if [[ "$CLIENT" == gpui && ( "${INTERACTION:-}" == send || "${INTERACTION:-}" == type ) ]]; then
   xdotool mousemove --window "$win" 410 680 click 1
   sleep 0.2

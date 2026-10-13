@@ -8574,6 +8574,8 @@ impl Client {
             .flex_1()
             .min_h_0()
             .relative()
+            // Clip scroll content at the chat edge, including subpixel glyphs above the sticky row.
+            .overflow_hidden()
             .child(content)
             .when_some(sticky, |view, sticky| view.child(sticky))
             .vertical_scrollbar(&self.scroll)
@@ -9473,6 +9475,8 @@ impl Client {
         };
         let backdrop = div()
             .id("modal-backdrop")
+            // A modal must also mask scroll hit testing, not just dim the transcript.
+            .occlude()
             .absolute()
             .top(self.scaled(46.))
             .bottom_0()
@@ -11403,8 +11407,9 @@ mod tests {
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AppContext, Bounds, Focusable, InputEvent as _, Modifiers, ModifiersChangedEvent,
-        MouseButton, MouseDownEvent, MouseMoveEvent, ResizeEdge, Role, TestAppContext, Tiling,
-        WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
+        MouseButton, MouseDownEvent, MouseMoveEvent, ResizeEdge, Role, ScrollDelta,
+        ScrollWheelEvent, TestAppContext, Tiling, WindowBackgroundAppearance, WindowBounds,
+        WindowOptions, point, px, size,
     };
     use opencode_gpui::model::RunStatus;
     use opencode_gpui::notifications::{DesktopNotifications, NotificationCommand};
@@ -17024,6 +17029,66 @@ mod tests {
         .unwrap();
     }
 
+    #[gpui_kit::test]
+    fn modal_wheel_scrolls_picker_without_scrolling_transcript(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless modal window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let (viewport, halfway) = {
+                let scroll = &client.read(cx).scroll;
+                assert!(scroll.max_offset().y > px(0.));
+                let halfway = -scroll.max_offset().y / 2.;
+                scroll.set_offset(point(px(0.), halfway));
+                (scroll.bounds(), halfway)
+            };
+            window.render_frame(cx);
+            let transcript_point =
+                viewport.origin + point(viewport.size.width - px(20.), viewport.size.height / 2.);
+            let wheel = |position| ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-80.))),
+                ..Default::default()
+            };
+            window.dispatch_event(wheel(transcript_point).to_platform_input(), cx);
+            assert!(
+                client.read(cx).scroll.offset().y < halfway,
+                "precondition: wheel over the transcript must scroll it"
+            );
+
+            client.update(cx, |client, cx| {
+                for index in 0..15 {
+                    let mut session = client.sessions[0].clone();
+                    session.id = format!("ses_wheel_extra_{index}");
+                    session.title = format!("Extra session {index}");
+                    client.open_tabs.push(session.id.clone());
+                    client.sessions.push(session);
+                }
+                client.show_modal(Modal::Sessions, window, cx);
+            });
+            window.render_frame(cx);
+            let transcript_before = client.read(cx).scroll.offset();
+            window.dispatch_event(wheel(transcript_point).to_platform_input(), cx);
+            assert_eq!(
+                client.read(cx).scroll.offset(),
+                transcript_before,
+                "wheel over modal backdrop must not reach the transcript"
+            );
+            let list = client.read(cx).sessions_picker_scroll.bounds();
+            assert!(client.read(cx).sessions_picker_scroll.max_offset().y > px(0.));
+            let list_point = list.origin + point(list.size.width / 2., list.size.height / 2.);
+            window.dispatch_event(wheel(list_point).to_platform_input(), cx);
+            assert!(client.read(cx).sessions_picker_scroll.offset().y < px(0.));
+            assert_eq!(client.read(cx).scroll.offset(), transcript_before);
+        })
+        .unwrap();
+    }
+
     #[test]
     fn tab_reorder_inserts_before_or_after_without_losing_tabs() {
         let mut tabs = vec!["a".into(), "b".into(), "c".into()];
@@ -18833,6 +18898,7 @@ mod tests {
             window.render_frame(cx);
             let sticky = window.find("sticky-user").bounds();
             let body = window.find("sticky-body").bounds();
+            assert_eq!(sticky.origin.y, client.read(cx).scroll.bounds().origin.y);
             assert!(sticky.size.height > px(106.), "long prompt did not grow");
             assert!(
                 sticky.size.height <= px(226.),
