@@ -33,7 +33,6 @@ tempfile = "3.14"
 url = "2.5"
 
 [dev-dependencies]
-gpui-kit = { version = "0.7.1", features = ["test-support"] }
 zbus = { version = "5.19", default-features = false, features = ["async-io"] }
 
 [patch.crates-io]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake OpenCode 2.0.8 server for opencode-cosmic UI flow tests.
+"""Fake OpenCode 2.0.8 server for protocol tests and manual GPUI previews.
 
 Python 3 stdlib only. Response shapes, status codes, error bodies, event
 sequences and SSE framing are copied from the real captures in

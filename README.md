@@ -41,3 +41,9 @@ cargo run -- --preview-api
 ```
 
 The headless visual harness in `tests/visual-capture.sh` captures a GPUI Wayland surface through nested Weston on Xvfb. `tests/stitch-visual.sh` places a GTK reference capture on the left and a GPUI capture on the right as a native 1568×791 comparison. Neither script touches the user's live desktop. The progress checklist and annotated screenshots live in the shared Obsidian note `opencode-gpui-rebuild.md`.
+
+### Validation policy
+
+Automated headless GUI cases and scenario runners have been removed. Do not add or run a headless regression suite on each UI iteration. `cargo test --all-targets --locked` retains core/API and pure logic tests without constructing GPUI test windows; the isolated notification-portal test and fake-server protocol tests also remain.
+
+For UI changes, agents should build once and use targeted visual checks for the affected states. Keep using `--preview`, `--preview-api`, `tests/visual-capture.sh`, and `tests/stitch-visual.sh`; `tests/gpui-headless.sh` retains reusable private-display and input helpers, and the fake server/file portal remain available for manual checks. These are inspection tools, not an automatically enumerated acceptance suite. Never use the user's live desktop for validation.

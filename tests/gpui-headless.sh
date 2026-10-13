@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Shared headless input harness. Source after setting temporary to a private directory.
+# Reusable display/input helpers for agent-directed visual checks, not a test suite.
+# Source after setting temporary to a private directory inside an isolated container.
 # The X11 target is Weston's kiosk window; GPUI itself runs on its Wayland socket.
 gpui_start_display() {
   local display ready=0

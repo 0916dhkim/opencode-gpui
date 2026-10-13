@@ -65,5 +65,5 @@ jobs:
       - name: Build GPUI client
         run: cargo build --locked
 
-# Headless GUI and Docker-backed E2E scripts remain in tests/ for development;
-# CI runs only source checks, unit tests, the isolated portal test, and a build.
+# Automated headless GUI cases are intentionally absent. Visual capture/input
+# tooling remains for agent-directed checks; CI runs non-GUI tests and a build.
