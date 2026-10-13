@@ -8662,7 +8662,8 @@ impl Client {
             .child(
                 Textarea::new(&self.composer)
                     .aria_label("Ask OpenCode anything…")
-                    .editor_padding_left(px(10.) + self.scaled(4.))
+                    .editor_padding_left(self.scaled(14.))
+                    .editor_padding_top(self.scaled(8.))
                     .on_paste(move |item, _, app| {
                         paste_owner.update(app, |this, cx| {
                             this.paste_attachments(&paste_session, item, cx)
@@ -8685,10 +8686,8 @@ impl Client {
                             .py(self.scaled(6.))
                             .flex_wrap()
                     })
-                    .when(!very_compact, |footer| {
-                        footer.pl(self.scaled(2.)).pr(self.scaled(14.))
-                    })
-                    .when(very_compact, |footer| footer.px(self.scaled(14.)))
+                    .pl(self.scaled(2.))
+                    .pr(self.scaled(14.))
                     .flex()
                     .items_center()
                     .gap(self.scaled(8.))
@@ -8721,7 +8720,7 @@ impl Client {
                             .child(
                                 div()
                                     .when(!very_compact, |artwork| {
-                                        artwork.relative().top(self.scaled(10.))
+                                        artwork.relative().top(self.scaled(9.))
                                     })
                                     .child(
                                         Icon::default()

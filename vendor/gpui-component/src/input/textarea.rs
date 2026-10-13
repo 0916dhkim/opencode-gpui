@@ -19,6 +19,7 @@ pub struct Textarea {
     style: StyleRefinement,
     size: Size,
     editor_padding_left: Option<Pixels>,
+    editor_padding_top: Option<Pixels>,
     height: Option<DefiniteLength>,
     appearance: bool,
     bordered: bool,
@@ -74,6 +75,7 @@ impl Textarea {
             style: StyleRefinement::default(),
             size: Size::default(),
             editor_padding_left: None,
+            editor_padding_top: None,
             height: None,
             appearance: true,
             bordered: true,
@@ -100,6 +102,12 @@ impl Textarea {
     /// other editor paddings keep their normal size-dependent behavior.
     pub fn editor_padding_left(mut self, padding: Pixels) -> Self {
         self.editor_padding_left = Some(padding);
+        self
+    }
+
+    /// Override only the editor text's top inset.
+    pub fn editor_padding_top(mut self, padding: Pixels) -> Self {
+        self.editor_padding_top = Some(padding);
         self
     }
 
@@ -214,6 +222,9 @@ impl Textarea {
             .with_size(self.size)
             .when_some(self.editor_padding_left, |this, padding| {
                 this.editor_padding_left(padding)
+            })
+            .when_some(self.editor_padding_top, |this, padding| {
+                this.editor_padding_top(padding)
             })
             .when_some(self.height, |this, height| this.h(height))
             .when_some(self.accessibility_id, |this, id| this.accessibility_id(id))

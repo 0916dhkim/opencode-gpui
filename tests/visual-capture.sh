@@ -138,11 +138,14 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == zoom-in ]]; then
   sleep 0.3
   xdotool key ctrl+equal
 fi
-if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == zoom-max ]]; then
+if [[ "$CLIENT" == gpui && ( "${INTERACTION:-}" == zoom-max || "${INTERACTION:-}" == zoom-max-type ) ]]; then
   if [[ "$case_name" != model && "$case_name" != level ]]; then
     xdotool mousemove --window "$win" 410 680 click 1
   fi
   for _ in {1..6}; do xdotool key ctrl+equal; sleep 0.15; done
+  if [[ "${INTERACTION:-}" == zoom-max-type ]]; then
+    xdotool type --clearmodifiers --delay 40 'Ping from the GPUI client'
+  fi
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == titlebar-maximize ]]; then
   xdotool mousemove --window "$win" "$((window_w - 51))" 22 click 1

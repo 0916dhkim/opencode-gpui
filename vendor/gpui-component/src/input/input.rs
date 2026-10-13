@@ -117,6 +117,7 @@ pub struct Input {
     style: StyleRefinement,
     size: Size,
     editor_padding_left: Option<Pixels>,
+    editor_padding_top: Option<Pixels>,
     prefix: Option<AnyElement>,
     suffix: Option<AnyElement>,
     height: Option<DefiniteLength>,
@@ -229,6 +230,7 @@ impl Input {
             state,
             size: Size::default(),
             editor_padding_left: None,
+            editor_padding_top: None,
             style: StyleRefinement::default(),
             prefix: None,
             suffix: None,
@@ -263,6 +265,11 @@ impl Input {
 
     pub(crate) fn editor_padding_left(mut self, padding: Pixels) -> Self {
         self.editor_padding_left = Some(padding);
+        self
+    }
+
+    pub(crate) fn editor_padding_top(mut self, padding: Pixels) -> Self {
+        self.editor_padding_top = Some(padding);
         self
     }
 
@@ -598,7 +605,9 @@ impl RenderOnce for Input {
         state.set_editor_paddings(
             if state.presentation(cx).is_multi_line() {
                 Edges {
-                    top: self.size.input_py(),
+                    top: self
+                        .editor_padding_top
+                        .unwrap_or_else(|| self.size.input_py()),
                     right: self.size.input_px(),
                     bottom: self.size.input_py(),
                     left: self.editor_padding_left.unwrap_or_else(|| {
