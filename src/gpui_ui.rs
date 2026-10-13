@@ -36,10 +36,7 @@ use opencode_gpui::{
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
-use crate::{
-    Args,
-    measurement::{Activity, Measurement},
-};
+use crate::Args;
 
 fn tab_number_key(key: &str) -> Option<usize> {
     match key {
@@ -551,7 +548,6 @@ struct Client {
     model_retry_scheduled: HashSet<String>,
     running_jobs: Jobs,
     jobs_elapsed_refresh_active: bool,
-    measurement: Measurement,
     sessions: Vec<Session>,
     open_tabs: Vec<String>,
     sidebar_visible: bool,
@@ -2559,7 +2555,6 @@ impl Client {
             model_retry_scheduled: HashSet::new(),
             running_jobs: Jobs::default(),
             jobs_elapsed_refresh_active: false,
-            measurement: Measurement::default(),
             sessions: Vec::new(),
             open_tabs: Vec::new(),
             sidebar_visible: true,
@@ -2919,58 +2914,6 @@ impl Client {
             }
         })
         .detach();
-    }
-
-    fn toggle_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.measurement.running() {
-            let activity = self.measurement_activity();
-            self.measurement.sample(activity);
-            self.measurement.stop();
-        } else {
-            self.measurement.start(window.window_handle().window_id());
-            let activity = self.measurement_activity();
-            self.measurement.sample(activity);
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(200))
-                        .await;
-                    let running = this
-                        .update(cx, |this, _| {
-                            if !this.measurement.running() {
-                                return false;
-                            }
-                            let activity = this.measurement_activity();
-                            this.measurement.sample(activity);
-                            true
-                        })
-                        .unwrap_or(false);
-                    if !running {
-                        break;
-                    }
-                }
-            })
-            .detach();
-        }
-        cx.notify();
-    }
-
-    fn measurement_activity(&self) -> Activity {
-        let is_busy = |id: &str| {
-            self.local_busy.contains(id) || self.statuses.get(id).is_some_and(RunStatus::is_busy)
-        };
-        Activity {
-            busy_tabs: self.open_tabs.iter().filter(|id| is_busy(id)).count(),
-            active_busy: is_busy(&self.active),
-            sidebar_visible: self.sidebar_visible,
-            scroll_y: self.scroll.offset().y.as_f32(),
-            draft_revision: self
-                .composer_edit_generation
-                .get(&self.active)
-                .copied()
-                .unwrap_or(0),
-            background_jobs: self.jobs.len(),
-        }
     }
 
     fn transcript_width(&self, window: &Window) -> Pixels {
@@ -6265,7 +6208,6 @@ impl Client {
             model_retry_scheduled: HashSet::new(),
             running_jobs,
             jobs_elapsed_refresh_active: false,
-            measurement: Measurement::default(),
             sessions,
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
             sidebar_visible: true,
@@ -7186,50 +7128,6 @@ impl Client {
                     .flex()
                     .flex_col()
                     .gap(self.scaled(12.))
-                    .child(
-                        BaseButton::new("footer-measurement")
-                            .accessibility_label(if self.measurement.running() {
-                                "Stop frame measurement"
-                            } else {
-                                "Start frame measurement"
-                            })
-                            .h(self.scaled(21.))
-                            .line_height(self.scaled(16.))
-                            .justify_start()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_measurement(window, cx);
-                            }))
-                            .child(if self.measurement.running() {
-                                "●  Stop measuring"
-                            } else {
-                                "◷  Measure frames"
-                            }),
-                    )
-                    .when_some(self.measurement.summary(), |footer, summary| {
-                        footer.child(
-                            div()
-                                .id("measurement-status")
-                                .test_support()
-                                .role(Role::Label)
-                                .aria_label(summary.to_owned())
-                                .text_size(self.scaled(10.))
-                                .text_color(self.tone(0x667078, 0x92999f))
-                                .child(summary.to_owned()),
-                        )
-                    })
-                    .when_some(self.measurement.report_path(), |footer, path| {
-                        footer.child(
-                            BaseButton::new("measurement-copy-path")
-                                .accessibility_label(format!("Copy frame trace path: {path}"))
-                                .h(self.scaled(21.))
-                                .line_height(self.scaled(16.))
-                                .justify_start()
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                                })
-                                .child("Copy trace path"),
-                        )
-                    })
                     .child(
                         BaseButton::new("footer-tabs")
                             .accessibility_label("Open tabs")
@@ -15299,7 +15197,6 @@ mod tests {
             window.render_frame(cx);
             for (id, name) in [
                 ("new-session", "New session"),
-                ("footer-measurement", "Start frame measurement"),
                 ("footer-tabs", "Open tabs"),
                 ("footer-settings", "Open settings"),
             ] {
@@ -15307,27 +15204,6 @@ mod tests {
                 assert_eq!(control.role(), Some(Role::Button));
                 assert_eq!(control.label(), Some(name));
             }
-            assert!(
-                window.find("footer-measurement").bounds().bottom()
-                    <= window.find("footer-tabs").bounds().top()
-            );
-            window.click("footer-measurement", cx);
-            window.render_frame(cx);
-            assert!(client.read(cx).measurement.running());
-            assert_eq!(
-                window.find("footer-measurement").label(),
-                Some("Stop frame measurement")
-            );
-            window.click("footer-measurement", cx);
-            window.render_frame(cx);
-            assert!(!client.read(cx).measurement.running());
-            assert!(
-                client
-                    .read(cx)
-                    .measurement
-                    .summary()
-                    .is_some_and(|summary| summary.contains("CPU"))
-            );
             window.click("footer-tabs", cx);
             assert!(client.read(cx).modal == Some(Modal::Sessions));
             window.press("escape", cx);
