@@ -414,21 +414,18 @@ fn tab_indicator(busy: bool, unread: bool, has_jobs: bool) -> (bool, TabAttentio
     (busy || has_jobs, attention)
 }
 
-fn status_gear(color: Rgba, id: String, spinning: bool) -> AnyElement {
-    let gear = Icon::default()
+/// Foreground work and background jobs both rotate, regardless of attention color.
+fn status_gear(color: Rgba, id: String) -> AnyElement {
+    Icon::default()
         .data(include_bytes!("icons/settings.svg"))
         .with_size(px(14.))
-        .text_color(color);
-    if spinning {
-        gear.with_animation(
+        .text_color(color)
+        .with_animation(
             id,
             Animation::new(Duration::from_secs(1)).repeat(),
             |gear, phase| gear.transform(Transformation::rotate(percentage(phase))),
         )
         .into_any_element()
-    } else {
-        gear.into_any_element()
-    }
 }
 
 #[derive(Clone)]
@@ -6770,7 +6767,7 @@ impl Client {
                 .child((index + 1).to_string())
                 .into_any_element()
         } else if gear {
-            status_gear(rgb(dot_color), format!("tab-gear-{}", session.id), busy)
+            status_gear(rgb(dot_color), format!("tab-gear-{}", session.id))
         } else {
             div()
                 .w(self.scaled(9.))
@@ -7125,11 +7122,7 @@ impl Client {
             TabAttention::Read => self.tone(0x7c8682, 0x68736f),
         };
         let status: AnyElement = if gear {
-            status_gear(
-                dot_color,
-                format!("header-gear-{}", self.active),
-                self.is_running(&self.active),
-            )
+            status_gear(dot_color, format!("header-gear-{}", self.active))
         } else {
             div()
                 .w(self.scaled(9.))
@@ -8184,7 +8177,6 @@ impl Client {
                         .child(status_gear(
                             self.tone(0xa46910, 0xe5b567),
                             format!("transcript-status-gear-{}", self.active),
-                            true,
                         )),
                 )
             })
