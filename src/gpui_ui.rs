@@ -583,6 +583,8 @@ struct Client {
     attachment_drafts: HashMap<String, Vec<PathBuf>>,
     owned_pastes: HashMap<PathBuf, Arc<tempfile::NamedTempFile>>,
     overlay: Option<String>,
+    copy_feedback: Option<CopyFeedback>,
+    next_copy_feedback_token: u64,
     link_menu: Option<LinkMenu>,
     link_menu_focus: [FocusHandle; 2],
     autoscroll: Option<TranscriptAutoscroll>,
@@ -649,6 +651,12 @@ struct Client {
 struct PendingPermission {
     request: protocol::PermissionRequest,
     directory: Option<String>,
+}
+
+struct CopyFeedback {
+    key: String,
+    label: &'static str,
+    token: u64,
 }
 
 struct SettingsFields {
@@ -2202,15 +2210,52 @@ impl Client {
         rgb(if self.dark { dark } else { light })
     }
 
+    fn copy_with_feedback(
+        &mut self,
+        key: String,
+        label: &'static str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.next_copy_feedback_token = self.next_copy_feedback_token.wrapping_add(1);
+        let token = self.next_copy_feedback_token;
+        self.copy_feedback = Some(CopyFeedback { key, label, token });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .copy_feedback
+                    .as_ref()
+                    .is_some_and(|state| state.token == token)
+                {
+                    this.copy_feedback = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn copied(&self, key: &str) -> bool {
+        self.copy_feedback
+            .as_ref()
+            .is_some_and(|state| state.key == key)
+    }
+
     fn markdown_code_block(
         &self,
         language: String,
         code: String,
         row_index: usize,
         block_index: usize,
+        row_key: &TranscriptRowKey,
         cx: &Context<Self>,
     ) -> AnyElement {
         let copy = code.clone();
+        let feedback_key = format!("code:{}:{row_key:?}:{block_index}", self.active);
+        let copied = self.copied(&feedback_key);
         div()
             .w_full()
             .rounded(px(7.))
@@ -2234,16 +2279,28 @@ impl Client {
                     .child(div().flex_1())
                     .child(
                         BaseButton::new(format!("copy-code-{row_index}-{block_index}"))
-                            .accessibility_label("Copy code")
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                            .accessibility_label(if copied { "Code copied" } else { "Copy code" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_with_feedback(
+                                    feedback_key.clone(),
+                                    "Code copied",
+                                    copy.clone(),
+                                    cx,
+                                );
                             }))
-                            .child(
+                            .child(if copied {
+                                div()
+                                    .text_size(self.scaled(13.))
+                                    .text_color(self.tone(0x347453, 0x8fcba2))
+                                    .child("✓")
+                                    .into_any_element()
+                            } else {
                                 Icon::default()
                                     .data(include_bytes!("icons/copy.svg"))
                                     .with_size(self.scaled(12.))
-                                    .text_color(self.tone(0x777e7d, 0x899198)),
-                            ),
+                                    .text_color(self.tone(0x777e7d, 0x899198))
+                                    .into_any_element()
+                            }),
                     ),
             )
             .child(
@@ -2415,7 +2472,7 @@ impl Client {
                     list.into_any_element()
                 }
                 MarkdownBlock::Code(language, code) => {
-                    self.markdown_code_block(language, code, row_index, block_index, cx)
+                    self.markdown_code_block(language, code, row_index, block_index, &row.key, cx)
                 }
                 MarkdownBlock::NestedCode {
                     language,
@@ -2440,6 +2497,7 @@ impl Client {
                             content,
                             row_index,
                             block_index,
+                            &row.key,
                             cx,
                         ))
                         .into_any_element()
@@ -2595,6 +2653,8 @@ impl Client {
             attachment_drafts: HashMap::new(),
             owned_pastes: HashMap::new(),
             overlay: None,
+            copy_feedback: None,
+            next_copy_feedback_token: 0,
             link_menu: None,
             link_menu_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             autoscroll: None,
@@ -6256,6 +6316,8 @@ impl Client {
             } else {
                 None
             },
+            copy_feedback: None,
+            next_copy_feedback_token: 0,
             link_menu: None,
             link_menu_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             autoscroll: None,
@@ -7087,7 +7149,7 @@ impl Client {
                                                     .role(Role::Label)
                                                     .aria_label(format!("Elapsed {elapsed}"))
                                                     .flex_shrink_0()
-                                                    .child(format!(" · {elapsed}")),
+                                                    .child(format!(" {elapsed}")),
                                             )
                                         }),
                                 ),
@@ -9100,7 +9162,7 @@ impl Client {
                     cx.open_url(&menu.url);
                 }
             } else {
-                cx.write_to_clipboard(ClipboardItem::new_string(menu.url));
+                self.copy_with_feedback("link".into(), "Link copied", menu.url, cx);
             }
             cx.notify();
         }
@@ -9277,6 +9339,9 @@ impl Client {
             .clone()
             .unwrap_or_else(|| self.active.clone());
         let rename_key_id = rename_id.clone();
+        let rename_feedback_key = format!("session-id:{rename_id}");
+        let rename_key_feedback = rename_feedback_key.clone();
+        let rename_copied = self.copied(&rename_feedback_key);
         let panel: AnyElement = match modal {
             Modal::Sessions | Modal::NewSession => {
                 let sessions = modal == Modal::Sessions;
@@ -9601,35 +9666,55 @@ impl Client {
                             div()
                                 .id("rename-copy-id")
                                 .role(Role::Button)
-                                .aria_label("Copy session ID")
+                                .aria_label(if rename_copied {
+                                    "Session ID copied"
+                                } else {
+                                    "Copy session ID"
+                                })
                                 .test_support()
                                 .track_focus(&self.rename_action_focus[0])
                                 .focus_visible(|style| style.bg(self.tone(0xe3e0da, 0x303a44)))
                                 .cursor_pointer()
-                                .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
-                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            rename_key_id.clone(),
-                                        ));
-                                        cx.stop_propagation();
-                                    }
-                                }))
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                .on_key_down(cx.listener(
+                                    move |this, event: &KeyDownEvent, _, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            this.copy_with_feedback(
+                                                rename_key_feedback.clone(),
+                                                "Session ID copied",
+                                                rename_key_id.clone(),
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_with_feedback(
+                                        rename_feedback_key.clone(),
+                                        "Session ID copied",
                                         rename_id.clone(),
-                                    ));
+                                        cx,
+                                    );
                                 }))
                                 .w(self.scaled(24.))
                                 .h(self.scaled(24.))
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(
+                                .child(if rename_copied {
+                                    div()
+                                        .text_size(self.scaled(15.))
+                                        .text_color(self.tone(0x347453, 0x8fcba2))
+                                        .child("✓")
+                                        .into_any_element()
+                                } else {
                                     Icon::default()
                                         .data(include_bytes!("icons/copy.svg"))
                                         .with_size(self.scaled(14.))
-                                        .text_color(self.tone(0x454b4b, 0xc9ced2)),
-                                ),
+                                        .text_color(self.tone(0x454b4b, 0xc9ced2))
+                                        .into_any_element()
+                                }),
                         ),
                 )
                 .child(div().flex_1())
@@ -10901,6 +10986,25 @@ impl Render for Client {
             .when_some(self.modal_view(window, cx), |view, modal| view.child(modal))
             .when_some(self.link_menu_view(window, cx), |view, menu| {
                 view.child(menu)
+            })
+            .when_some(self.copy_feedback.as_ref(), |view, feedback| {
+                view.child(
+                    div()
+                        .id("copy-feedback")
+                        .test_support()
+                        .role(Role::Label)
+                        .aria_label(feedback.label)
+                        .absolute()
+                        .right(self.scaled(18.))
+                        .bottom(self.scaled(18.))
+                        .px(self.scaled(12.))
+                        .py(self.scaled(7.))
+                        .rounded(self.scaled(6.))
+                        .bg(self.tone(0x252829, 0xe8e5df))
+                        .text_color(self.tone(0xffffff, 0x252829))
+                        .text_size(self.scaled(11.))
+                        .child(feedback.label),
+                )
             });
         client_frame(
             root.when_some(row_probe, |view, probe| view.child(probe))
@@ -15382,6 +15486,8 @@ mod tests {
                 Some("https://example.com/one?x=1".into())
             );
             assert!(client.read(cx).link_menu.is_none());
+            window.render_frame(cx);
+            assert_eq!(window.find("copy-feedback").label(), Some("Link copied"));
 
             client.update(cx, |client, cx| {
                 client.link_menu = Some(super::LinkMenu {
@@ -15428,6 +15534,15 @@ mod tests {
             assert_eq!(
                 cx.read_from_clipboard().and_then(|item| item.text()),
                 Some(client.read(cx).active.clone())
+            );
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("rename-copy-id").label(),
+                Some("Session ID copied")
+            );
+            assert_eq!(
+                window.find("copy-feedback").label(),
+                Some("Session ID copied")
             );
             cx.write_to_clipboard(ClipboardItem::new_string("cleared".into()));
             window.click("rename-copy-id", cx);
@@ -17936,13 +18051,62 @@ mod tests {
             let control = window.find(id.clone());
             assert_eq!(control.role(), Some(Role::Button));
             assert_eq!(control.label(), Some("Copy code"));
-            window.click(id, cx);
+            window.click(id.clone(), cx);
             let copied = cx.read_from_clipboard().and_then(|item| item.text());
             assert!(copied.is_some_and(|text| text.contains("paperclip_icon")));
+            window.render_frame(cx);
+            assert_eq!(window.find(id.clone()).label(), Some("Code copied"));
+            assert_eq!(window.find("copy-feedback").label(), Some("Code copied"));
             cx.write_to_clipboard(super::ClipboardItem::new_string("cleared".to_owned()));
             window.press("space", cx);
             let copied = cx.read_from_clipboard().and_then(|item| item.text());
             assert!(copied.is_some_and(|text| text.contains("paperclip_icon")));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn copy_feedback_expires_only_after_the_latest_copy(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.copy_with_feedback("first".into(), "Code copied", "one".into(), cx)
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("copy-feedback").label(), Some("Code copied"));
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            client.update(cx, |client, cx| {
+                client.copy_with_feedback("second".into(), "Link copied", "two".into(), cx)
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("copy-feedback").label(), Some("Link copied"));
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(1_100));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| client
+                .read(cx)
+                .copy_feedback
+                .as_ref()
+                .map(|state| state.key.clone())),
+            Some("second".to_owned())
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("copy-feedback").is_none());
         })
         .unwrap();
     }

@@ -159,12 +159,12 @@ pub struct JobRow {
 }
 
 impl JobRow {
-    /// `<kind> · <owner> · <elapsed>`; the owner is shown only for a job a
+    /// `<kind> · <owner> <elapsed>`; the owner is shown only for a job a
     /// descendant started, and an unknown start time is left out.
     pub fn subtitle(&self, now: u64) -> String {
         let (label, elapsed) = self.subtitle_parts(now);
         match elapsed {
-            Some(elapsed) => format!("{label} · {elapsed}"),
+            Some(elapsed) => format!("{label} {elapsed}"),
             None => label,
         }
     }
@@ -699,10 +699,10 @@ mod tests {
         assert_eq!(
             subtitles,
             [
-                "shell · 22m",
-                "subagent · 4m",
-                "subagent · Audit v1 call sites · 2m",
-                "shell · Nested audit · 1m",
+                "shell 22m",
+                "subagent 4m",
+                "subagent · Audit v1 call sites 2m",
+                "shell · Nested audit 1m",
             ],
             "the owner shows only when a descendant started the job"
         );
