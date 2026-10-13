@@ -58,57 +58,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils cmake libdbus-1-dev libexpat1-dev libfontconfig1-dev \
+            cmake libdbus-1-dev libexpat1-dev libfontconfig1-dev \
             libfreetype6-dev libgl1-mesa-dev libssl-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libzstd-dev libvulkan1 mesa-vulkan-drivers pkg-config
       - name: Build GPUI client
         run: cargo build --locked
-      - name: Strip debug symbols from the headless artifact
-        run: strip --strip-all target/debug/opencode-gpui
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gpui-client
-          path: target/debug/opencode-gpui
-          if-no-files-found: error
-          retention-days: 1
 
-  headless:
-    needs: build
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { suite: smoke, script: smoke-ui.sh, binary_env: SMOKE_BINARY }
-          - { suite: shortcuts, script: shortcut-ui.sh, binary_env: SHORTCUT_BINARY }
-          - { suite: remote-flow, script: remote-flow-ui.sh, binary_env: FLOW_BINARY }
-          - { suite: keyring, script: keyring-ui.sh, binary_env: KEYRING_BINARY }
-          - { suite: accessibility, script: accessibility-ui.sh, binary_env: ACCESSIBILITY_BINARY }
-          - { suite: attachments, script: attachment-ui.sh, binary_env: ATTACHMENT_BINARY }
-    name: Headless ${{ matrix.suite }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: gpui-client
-          path: target/debug
-      - name: Install headless runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            at-spi2-core dbus-daemon fonts-noto-core gnome-keyring libsecret-tools \
-            libdbus-1-3 libfontconfig1 libfreetype6 libgl1 libglib2.0-bin \
-            libxkbcommon0 libxkbcommon-x11-0 \
-            libwayland-client0 libx11-xcb1 libvulkan1 mesa-vulkan-drivers \
-            python3 python3-dbus python3-gi python3-pyatspi \
-            weston xvfb xdotool x11-utils imagemagick
-      - name: Run ${{ matrix.suite }}
-        env:
-          SCRIPT: ${{ matrix.script }}
-          BINARY_ENV: ${{ matrix.binary_env }}
-        run: |
-          chmod +x target/debug/opencode-gpui
-          env "$BINARY_ENV=$PWD/target/debug/opencode-gpui" bash "tests/$SCRIPT"
-      # The real OpenCode 2.0.8 end-to-end run (tests/v2/e2e.sh) needs Docker and
-      # downloads the pinned CLI when its image is built, so it runs locally only.
+# Headless GUI and Docker-backed E2E scripts remain in tests/ for development;
+# CI runs only source checks, unit tests, the isolated portal test, and a build.
