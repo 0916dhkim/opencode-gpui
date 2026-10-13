@@ -5082,6 +5082,12 @@ impl Client {
             paste_lifetime,
             delivery,
         });
+        // The next run replaces the previous completion notification. Remove
+        // it now so a later Busy → Idle shows a fresh desktop banner.
+        if self.unread.remove(&session) {
+            self.withdraw_session_notification(&session);
+            self.persist_tabs();
+        }
         self.pending_prompts
             .insert(self.active.clone(), pending.clone());
         if delivery.is_none() {
@@ -11574,6 +11580,57 @@ mod tests {
             });
             assert!(matches!(requests.try_recv(), Ok(NotificationCommand::Show { title, .. }) if title == "OpenCode"));
             window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn next_prompt_withdraws_completion_before_a_new_run_notifies(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let active = client.read(cx).active.clone();
+            let (notifier, requests) = DesktopNotifications::channel();
+            client.update(cx, |client, cx| {
+                client.desktop_notifications = Some(notifier);
+                let (api, _receiver, _) = ApiHandle::preview();
+                client.api = Some(api);
+                client.update_tab_status(active.clone(), RunStatus::Busy);
+                client.handle_live_event(UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                    directory: Some("/repo".into()),
+                    payload: json!({ "id": "evt_first_done", "type": "session.execution.succeeded",
+                        "data": { "sessionID": active } }),
+                }), cx);
+            });
+            let NotificationCommand::Show { id, .. } = requests.try_recv().unwrap() else {
+                panic!("expected the first completion notice");
+            };
+            client.update(cx, |client, cx| client.send_prompt(false, cx));
+            assert!(requests.try_recv().is_err(), "invalid send must retain the notice");
+            assert!(client.read(cx).unread.contains(&active));
+            client.update(cx, |client, cx| {
+                client
+                    .composer
+                    .update(cx, |input, cx| input.set_value("one more", window, cx));
+                client.send_prompt(false, cx);
+            });
+            assert_eq!(requests.try_recv().unwrap(), NotificationCommand::Withdraw(id.clone()));
+            assert!(!client.read(cx).unread.contains(&active));
+            client.update(cx, |client, cx| {
+                client.update_tab_status(active.clone(), RunStatus::Busy);
+                client.handle_live_event(UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                    directory: Some("/repo".into()),
+                    payload: json!({ "id": "evt_second_done", "type": "session.execution.succeeded",
+                        "data": { "sessionID": active } }),
+                }), cx);
+            });
+            assert!(matches!(requests.try_recv(), Ok(NotificationCommand::Show { id: next, .. }) if next == id));
         })
         .unwrap();
     }

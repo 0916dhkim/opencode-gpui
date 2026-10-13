@@ -257,6 +257,14 @@ mod tests {
             records_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             NotificationCommand::Withdraw("notice-1".into())
         );
+        notifier.show("notice-1".into(), "OpenCode".into());
+        assert_eq!(
+            records_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            NotificationCommand::Show {
+                id: "notice-1".into(),
+                title: "OpenCode".into(),
+            }
+        );
         drop(emit_tx);
         service.join().unwrap();
     }
