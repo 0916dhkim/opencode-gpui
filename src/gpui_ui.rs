@@ -3264,10 +3264,15 @@ impl Client {
         let Some(notifier) = &self.desktop_notifications else {
             return;
         };
-        if !self
-            .sessions
-            .iter()
-            .any(|session| session.id == session_id && session.parent_id.is_none())
+        // Restored root tabs may precede a complete session-list snapshot.
+        // A generic title needs no metadata, while known child sessions must
+        // never generate their own desktop notifications.
+        if !self.open_tabs.iter().any(|id| id == session_id)
+            || self.child_parents.contains_key(session_id)
+            || self
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id && session.parent_id.is_some())
         {
             return;
         }
@@ -3291,8 +3296,7 @@ impl Client {
         let Some(session_id) = self.notification_targets.remove(id) else {
             return false;
         };
-        if id != self.session_notification_id(&session_id)
-            || !self.sessions.iter().any(|session| session.id == session_id)
+        if id != self.session_notification_id(&session_id) || !self.open_tabs.contains(&session_id)
         {
             if let Some(notifier) = &self.desktop_notifications {
                 notifier.withdraw(id.into());
@@ -11557,6 +11561,18 @@ mod tests {
                 }), cx);
             });
             assert!(requests.try_recv().is_err(), "child turn must not notify");
+            // A restored root tab can receive its idle event before the
+            // session-list retry supplies its metadata.
+            client.update(cx, |client, cx| {
+                client.open_tabs.push("ses_restored".into());
+                client.statuses.insert("ses_restored".into(), RunStatus::Busy);
+                client.handle_live_event(UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                    directory: Some("/repo".into()),
+                    payload: json!({ "id": "evt_restored_done", "type": "session.execution.succeeded",
+                        "data": { "sessionID": "ses_restored" } }),
+                }), cx);
+            });
+            assert!(matches!(requests.try_recv(), Ok(NotificationCommand::Show { title, .. }) if title == "OpenCode"));
             window.render_frame(cx);
         })
         .unwrap();
