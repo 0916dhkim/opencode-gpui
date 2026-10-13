@@ -29,7 +29,7 @@ use opencode_gpui::{
         self, Conversation, ModelCatalog, ModelSelection, Project, RunStatus, Session,
         SessionModel, TranscriptRow, TranscriptRowKey, TranscriptRowKind,
     },
-    notifications::{DesktopNotifications, notification_id},
+    notifications::{DesktopNotifications, notification_id, play_session_ready_sound},
     pending::{self, Forms, PendingRequest},
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
     preview, protocol, tray,
@@ -3279,9 +3279,15 @@ impl Client {
         let id = self.session_notification_id(session_id);
         self.notification_targets
             .insert(id.clone(), session_id.into());
-        // A session title may contain prompts or customer data; desktop
-        // notifications can be shown outside the application and on lock screens.
-        notifier.show(id, "OpenCode".into());
+        let title = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.title.clone())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "OpenCode".into());
+        notifier.show(id, title);
+        play_session_ready_sound();
     }
 
     fn withdraw_session_notification(&mut self, session_id: &str) {
@@ -11513,6 +11519,12 @@ mod tests {
             let (notifier, requests) = DesktopNotifications::channel();
             client.update(cx, |client, _| {
                 client.desktop_notifications = Some(notifier);
+                client
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == active)
+                    .unwrap()
+                    .title = "Plan tomorrow".into();
                 client.statuses.insert(active.clone(), RunStatus::Busy);
             });
             let event = |id| {
@@ -11529,7 +11541,7 @@ mod tests {
             let NotificationCommand::Show { id, title } = notification else {
                 panic!("expected a notification");
             };
-            assert_eq!(title, "OpenCode");
+            assert_eq!(title, "Plan tomorrow");
             assert_eq!(client.read(cx).notification_targets[&id], active);
             assert!(client.read(cx).unread.contains(&active));
             client.update(cx, |client, cx| {

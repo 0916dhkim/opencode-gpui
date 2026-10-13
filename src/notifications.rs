@@ -28,6 +28,34 @@ pub fn notification_id(server: &str, session: &str) -> String {
     format!("opencode-gpui:{:016x}", hash.finish())
 }
 
+fn session_ready_sound_command() -> std::process::Command {
+    let mut command = std::process::Command::new("canberra-gtk-play");
+    command
+        .args(["-i", "message-new-instant", "-d", "Session ready"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+
+pub fn play_session_ready_sound() {
+    std::thread::spawn(|| match session_ready_sound_command().spawn() {
+        Ok(mut child) => match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => warn_sound_failure(format!("canberra-gtk-play exited with {status}")),
+            Err(error) => warn_sound_failure(error),
+        },
+        Err(error) => warn_sound_failure(error),
+    });
+}
+
+fn warn_sound_failure(error: impl std::fmt::Display) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!("session-ready sound unavailable: {error}; install canberra-gtk-play");
+    });
+}
+
 impl DesktopNotifications {
     /// An in-memory sink for headless tests; the live app uses `start`.
     pub fn channel() -> (Self, Receiver<NotificationCommand>) {
@@ -139,7 +167,9 @@ mod tests {
         time::Duration,
     };
 
-    use super::{DesktopNotifications, NotificationCommand, notification_id};
+    use super::{
+        DesktopNotifications, NotificationCommand, notification_id, session_ready_sound_command,
+    };
 
     struct TestPortal {
         records: mpsc::Sender<NotificationCommand>,
@@ -190,6 +220,16 @@ mod tests {
         assert_ne!(first, notification_id("https://two.example", "ses_1"));
         assert_ne!(first, notification_id("https://one.example", "ses_2"));
         assert!(!first.contains("https://"));
+    }
+
+    #[test]
+    fn session_ready_sound_uses_the_gtk_event() {
+        let command = session_ready_sound_command();
+        assert_eq!(command.get_program(), "canberra-gtk-play");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-i", "message-new-instant", "-d", "Session ready"]
+        );
     }
 
     /// Run only on an isolated session bus:

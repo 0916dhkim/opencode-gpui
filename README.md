@@ -10,6 +10,8 @@ The prototype currently renders a session sidebar, transcript, composer, model a
 
 Requires Rust 1.93+ (Rust 2024 edition) and Linux graphics development libraries for GPUI Kit (Wayland/X11, Vulkan and fontconfig). The repository Dockerfile contains an amd64 development/test environment; it is not a minimal runtime image.
 
+Completion sounds use the optional `canberra-gtk-play` executable (provided by `libcanberra` on Arch Linux, with its optional `gtk3` runtime for this command). Notifications still work without it, but the sound will not play.
+
 Build for Linux:
 
 ```bash
