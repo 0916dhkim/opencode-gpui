@@ -734,6 +734,7 @@ fn canned_shells() -> ShellSnapshot {
             shell("sh_preview_test", "cargo test api::", RUNNING_ID, 1),
             shell("sh_preview_tail", "tail -f tunnel.log", OTHER_ID, 9),
         ],
+        terminal: Vec::new(),
         queried: [DIRECTORY.to_owned()].into(),
         covered: HashSet::from([DIRECTORY.to_owned()]),
         warnings: Vec::new(),
@@ -995,7 +996,8 @@ fn running_messages() -> Vec<protocol::SessionMessage> {
                 "name": "shell",
                 "state": {
                     "status": "running",
-                    "input": { "command": "cargo test api::", "description": "Run the API tests" }
+                    "input": { "command": "cargo test api::", "description": "Run the API tests" },
+                    "metadata": { "shellID": "sh_preview_test" }
                 },
                 "time": { "created": RUNNING_CREATED + 21_000, "ran": RUNNING_CREATED + 21_100 }
             }]

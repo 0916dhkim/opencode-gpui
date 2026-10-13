@@ -1075,10 +1075,12 @@ impl Conversation {
                 })
             }
             Kind::ToolProgress(data) => {
-                // Metadata (e.g. a subagent's child session) is not rendered.
                 self.update_tool(&data.assistant_message_id, &data.id, |tool| {
                     if let protocol::ToolState::Running { metadata, .. } = &mut tool.state {
+                        let status_changed = metadata.get("status") != data.metadata.get("status")
+                            || metadata.get("shellID") != data.metadata.get("shellID");
                         metadata.clone_from(&data.metadata);
+                        return tool.name == "shell" && status_changed;
                     }
                     false
                 })
@@ -1589,6 +1591,68 @@ impl Conversation {
         true
     }
 
+    /// The shell tool can finish launching a background process before that
+    /// process exits. Reconcile the tool row with the separate shell lifecycle.
+    pub fn shell_exited(&mut self, exit: &protocol::ShellExited) -> bool {
+        self.reconcile_shell_exits(&HashMap::from([(exit.id.clone(), exit.clone())]))
+    }
+
+    /// Also used after history replacement, since the shell exit may have
+    /// arrived before the tool success or while messages were being loaded.
+    pub fn reconcile_shell_exits(
+        &mut self,
+        exits: &HashMap<String, protocol::ShellExited>,
+    ) -> bool {
+        let mut changed = false;
+        for message in &mut self.messages {
+            let mut message_changed = false;
+            for segment in &mut message.segments {
+                let Some(tool) = segment.tool.as_mut() else {
+                    continue;
+                };
+                let protocol::ToolState::Completed {
+                    metadata: Some(metadata),
+                    ..
+                } = &mut tool.state
+                else {
+                    continue;
+                };
+                let Some(exit) = metadata
+                    .get("shellID")
+                    .and_then(Value::as_str)
+                    .and_then(|id| exits.get(id))
+                else {
+                    continue;
+                };
+                if tool.name != "shell"
+                    || metadata.get("status").and_then(Value::as_str) != Some("running")
+                {
+                    continue;
+                }
+                let status = match exit.status {
+                    protocol::ShellStatus::Exited => "exited",
+                    protocol::ShellStatus::Timeout => "timeout",
+                    protocol::ShellStatus::Killed => "killed",
+                    _ => continue,
+                };
+                metadata.insert("status".into(), Value::String(status.into()));
+                if let Some(code) = exit.exit.and_then(serde_json::Number::from_f64) {
+                    metadata.insert("exit".into(), Value::Number(code));
+                }
+                let rendered = tool_segment(tool);
+                if rendered.text != segment.text {
+                    message_changed = true;
+                }
+                *segment = rendered;
+            }
+            if message_changed {
+                message.bump_render_revision();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// A failed execution normally repeats the error of its failed step,
     /// which is already on that assistant message. Otherwise (a failure
     /// outside any step) it becomes an error row keyed like the `idle` entry
@@ -1965,10 +2029,28 @@ fn tool_segment(tool: &protocol::ToolCall) -> Segment {
     let (status, input, error) = match &tool.state {
         ToolState::Streaming { input } => {
             streamed = serde_json::from_str(input).unwrap_or_default();
-            ("running", &streamed, None)
+            ("pending", &streamed, None)
         }
-        ToolState::Running { input, .. } => ("running", input, None),
-        ToolState::Completed { input, .. } => ("completed", input, None),
+        ToolState::Running { input, metadata } => (
+            if tool.name == "shell" && !metadata.contains_key("shellID") {
+                "pending"
+            } else {
+                "running"
+            },
+            input,
+            None,
+        ),
+        ToolState::Completed {
+            input, metadata, ..
+        } => (
+            if tool.name == "shell" {
+                shell_completion_label(metadata.as_ref())
+            } else {
+                "completed"
+            },
+            input,
+            None,
+        ),
         ToolState::Error { input, error, .. } => {
             ("error", input, Some(structured_error_text(error)))
         }
@@ -1987,6 +2069,23 @@ fn tool_segment(tool: &protocol::ToolCall) -> Segment {
         image_url: None,
         created: millis(tool.time.created),
         tool: Some(tool.clone()),
+    }
+}
+
+fn shell_completion_label(metadata: Option<&protocol::JsonMap>) -> &'static str {
+    let Some(metadata) = metadata else {
+        return "completed";
+    };
+    match metadata.get("status").and_then(Value::as_str) {
+        // The tool returned after launching the process. A history snapshot
+        // may be older than a missed shell exit, so do not claim it is still
+        // running until the separate shell lifecycle has been reconciled.
+        Some("running") => "backgrounded",
+        Some("timeout") => "timed out",
+        Some("killed") => "killed",
+        Some("exited") if metadata.get("exit").and_then(Value::as_f64) == Some(0.) => "completed",
+        Some("exited") => "exited",
+        _ => "completed",
     }
 }
 
@@ -3198,7 +3297,7 @@ mod tests {
             [
                 ("reasoning:0", "r0"),
                 ("text:0", "t0"),
-                ("tool:call_1", "shell · running — ls -la"),
+                ("tool:call_1", "shell · pending — ls -la"),
                 ("reasoning:1", "r1"),
                 ("text:1", "t1"),
                 ("tool:call_2", "subagent · error — Dig in: child failed"),
@@ -3692,7 +3791,7 @@ mod tests {
         }
         assert_eq!(
             tool_rows(&conversation),
-            ["shell · running — ls", "read · running — a.rs"]
+            ["shell · pending — ls", "read · pending — a.rs"]
         );
         for (kind, data) in [
             (
@@ -3756,7 +3855,7 @@ mod tests {
         ));
         assert_eq!(
             tool_rows(&conversation),
-            ["read · running", "read · running — b"]
+            ["read · pending", "read · running — b"]
         );
         // A tool this conversation never saw start is ignored, like the server does.
         assert!(!conversation.apply_event(&live(
@@ -4661,7 +4760,7 @@ mod tests {
                     "command": "pnpm exec playwright test\n  e2e/tests/desktop/apps20-ad-resizer.spec.ts",
                     "description": "Run the resizer spec"
                 },
-                "metadata": {}
+                "metadata": { "shellID": "sh_1" }
             }
         }))
         .unwrap();
@@ -4671,6 +4770,82 @@ mod tests {
             "shell · running — pnpm exec playwright test e2e/tests/desktop/apps20-ad-resizer.spec.ts"
         );
         assert_eq!((segment.key.as_str(), segment.created), ("tool:call_1", 5));
+    }
+
+    #[test]
+    fn background_shell_tool_stays_running_until_its_process_exits() {
+        let mut conversation = Conversation::default();
+        let message = "msg_shell";
+        let call = "call_shell";
+        conversation.apply_event(&live(
+            "session.tool.input.started",
+            json!({ "assistantMessageID": message, "id": call, "name": "shell" }),
+        ));
+        conversation.apply_event(&live(
+            "session.tool.input.ended",
+            json!({ "assistantMessageID": message, "id": call, "text": "{\"command\":\"cargo build\"}" }),
+        ));
+        assert_eq!(tool_rows(&conversation), ["shell · pending — cargo build"]);
+        conversation.apply_event(&live(
+            "session.tool.called",
+            json!({ "assistantMessageID": message, "id": call,
+                "input": { "command": "cargo build", "background": false } }),
+        ));
+        assert_eq!(tool_rows(&conversation), ["shell · pending — cargo build"]);
+        assert!(conversation.apply_event(&live(
+            "session.tool.progress",
+            json!({ "assistantMessageID": message, "id": call,
+                "metadata": { "shellID": "sh_1" } }),
+        )));
+        assert_eq!(tool_rows(&conversation), ["shell · running — cargo build"]);
+        conversation.apply_event(&live(
+            "session.tool.success",
+            json!({ "assistantMessageID": message, "id": call,
+                "metadata": { "shellID": "sh_1", "status": "running" }, "content": [] }),
+        ));
+        assert_eq!(
+            tool_rows(&conversation),
+            ["shell · backgrounded — cargo build"]
+        );
+        assert!(!conversation.shell_exited(&protocol::ShellExited {
+            id: "another_shell".into(),
+            exit: Some(0.),
+            status: protocol::ShellStatus::Exited,
+        }));
+        assert!(conversation.shell_exited(&protocol::ShellExited {
+            id: "sh_1".into(),
+            exit: Some(0.),
+            status: protocol::ShellStatus::Exited,
+        }));
+        assert_eq!(
+            tool_rows(&conversation),
+            ["shell · completed — cargo build"]
+        );
+    }
+
+    #[test]
+    fn background_shell_failure_is_not_reported_as_a_successful_tool() {
+        let mut conversation = Conversation::default();
+        conversation.replace_from_api(
+            &entries(vec![json!({
+                "id": "msg_1", "type": "assistant", "time": { "created": 5 }, "agent": "build",
+                "content": [{ "type": "tool", "id": "call_1", "name": "shell",
+                    "time": { "created": 5 },
+                    "state": { "status": "completed", "input": { "command": "false" },
+                        "metadata": { "shellID": "sh_1", "status": "running" } } }]
+            })]),
+            None,
+        );
+        assert_eq!(tool_rows(&conversation), ["shell · backgrounded — false"]);
+        assert!(conversation.shell_exited(&protocol::ShellExited {
+            id: "sh_1".into(),
+            exit: Some(1.),
+            status: protocol::ShellStatus::Exited,
+        }));
+        assert_eq!(tool_rows(&conversation), ["shell · exited — false"]);
+        let unknown_exit: protocol::JsonMap =
+            serde_json::from_value(json!({ "status": "exited" })).unwrap();
+        assert_eq!(shell_completion_label(Some(&unknown_exit)), "exited");
     }
 
     #[test]

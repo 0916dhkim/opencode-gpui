@@ -725,7 +725,20 @@ impl Api {
                     }
                     for info in &list.data {
                         if seen.insert(info.id.clone()) {
-                            snapshot.shells.extend(ShellJob::running(info, directory));
+                            if let Some(shell) = ShellJob::running(info, directory) {
+                                snapshot.shells.push(shell);
+                            } else if matches!(
+                                info.status,
+                                protocol::ShellStatus::Exited
+                                    | protocol::ShellStatus::Timeout
+                                    | protocol::ShellStatus::Killed
+                            ) {
+                                snapshot.terminal.push(protocol::ShellExited {
+                                    id: info.id.clone(),
+                                    status: info.status,
+                                    exit: info.exit,
+                                });
+                            }
                         }
                     }
                 }

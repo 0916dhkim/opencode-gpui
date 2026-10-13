@@ -606,6 +606,7 @@ struct Client {
     offline_busy: HashSet<String>,
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
+    terminal_shells: HashMap<String, protocol::ShellExited>,
     forms: Forms,
     form_cancel_focus: FocusHandle,
     form_cancel_presented: Option<String>,
@@ -2674,6 +2675,7 @@ impl Client {
             offline_busy: HashSet::new(),
             statuses: HashMap::new(),
             jobs: Vec::new(),
+            terminal_shells: HashMap::new(),
             forms: Forms::default(),
             form_cancel_focus: cx.focus_handle().tab_stop(true),
             form_cancel_presented: None,
@@ -3792,6 +3794,7 @@ impl Client {
         self.safe_anchors.clear();
         self.pending_jump = None;
         self.conversations.clear();
+        self.terminal_shells.clear();
         self.loading_messages.clear();
         self.message_load_errors.clear();
         self.skip_prune_for_load.clear();
@@ -5491,6 +5494,21 @@ impl Client {
                     self.tray_in_flight.clear();
                 }
                 self.reconcile_pending(data.pending, &data.pending_covered);
+                for exit in &data.shells.terminal {
+                    self.terminal_shells.insert(exit.id.clone(), exit.clone());
+                }
+                let updated: Vec<String> = self
+                    .conversations
+                    .iter_mut()
+                    .filter_map(|(id, conversation)| {
+                        conversation
+                            .reconcile_shell_exits(&self.terminal_shells)
+                            .then(|| id.clone())
+                    })
+                    .collect();
+                for id in updated {
+                    self.update_transcript(&id);
+                }
                 let directories = self.active_directories();
                 let context = jobs::Context {
                     roots: &self.sessions,
@@ -5654,6 +5672,7 @@ impl Client {
                                 } else if !reload {
                                     self.message_events_during_load.remove(&session_id);
                                 }
+                                conversation.reconcile_shell_exits(&self.terminal_shells);
                                 self.update_transcript(&session_id);
                                 self.maybe_dispatch_deferred_abort(&session_id);
                                 self.resolve_late_prompt_confirmation(&session_id);
@@ -6023,22 +6042,39 @@ impl Client {
                             .or_default()
                             .push(event.clone());
                     }
-                    if let Some(id) = kind.session_id()
-                        && self
+                    if let Some(id) = kind.session_id() {
+                        let conversation = self.conversations.entry(id.to_owned()).or_default();
+                        let changed = conversation.apply(&event, &kind);
+                        let reconciled = matches!(
+                            kind,
+                            protocol::EventKind::ToolSuccess(_)
+                                | protocol::EventKind::MessageContentUpdated(_)
+                        ) && conversation
+                            .reconcile_shell_exits(&self.terminal_shells);
+                        if changed || reconciled {
+                            let tail_delta = match &kind {
+                                protocol::EventKind::TextDelta(data)
+                                | protocol::EventKind::ReasoningDelta(data) => {
+                                    Some(data.assistant_message_id.as_str())
+                                }
+                                _ => None,
+                            };
+                            self.update_transcript_with_tail_hint(id, tail_delta);
+                            self.maybe_dispatch_deferred_abort(id);
+                        }
+                    }
+                    if let protocol::EventKind::ShellExited(exit) = &kind {
+                        self.terminal_shells.insert(exit.id.clone(), exit.clone());
+                        let updated: Vec<String> = self
                             .conversations
-                            .entry(id.to_owned())
-                            .or_default()
-                            .apply(&event, &kind)
-                    {
-                        let tail_delta = match &kind {
-                            protocol::EventKind::TextDelta(data)
-                            | protocol::EventKind::ReasoningDelta(data) => {
-                                Some(data.assistant_message_id.as_str())
-                            }
-                            _ => None,
-                        };
-                        self.update_transcript_with_tail_hint(id, tail_delta);
-                        self.maybe_dispatch_deferred_abort(id);
+                            .iter_mut()
+                            .filter_map(|(id, conversation)| {
+                                conversation.shell_exited(exit).then(|| id.clone())
+                            })
+                            .collect();
+                        for id in updated {
+                            self.update_transcript(&id);
+                        }
                     }
                     if matches!(
                         kind,
@@ -6337,6 +6373,7 @@ impl Client {
             offline_busy: HashSet::new(),
             statuses: bootstrap.statuses,
             jobs,
+            terminal_shells: HashMap::new(),
             forms,
             form_cancel_focus: cx.focus_handle().tab_stop(true),
             form_cancel_presented: None,
@@ -11266,6 +11303,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             None,
         );
+    }
+
+    #[gpui_kit::test]
+    fn shell_exit_reconciles_background_tool_before_and_after_success(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let active = client.read(cx).active.clone();
+            let message = |state: &str| {
+                json!({
+                    "id": "msg_shell", "type": "assistant", "time": { "created": 1 },
+                    "agent": "build", "content": [{
+                        "type": "tool", "id": "call_shell", "name": "shell",
+                        "time": { "created": 2 },
+                        "state": { "status": state, "input": { "command": "sleep 1" },
+                            "metadata": { "shellID": "sh_background", "status": "running" } }
+                    }]
+                })
+            };
+            client.update(cx, |client, _| {
+                snapshot(
+                    client.conversations.entry(active.clone()).or_default(),
+                    vec![message("completed")],
+                );
+                client.update_transcript(&active);
+            });
+            assert_eq!(
+                client.read(cx).conversations[&active].messages[0].segments()[0].text,
+                "shell · backgrounded — sleep 1"
+            );
+            let exit = UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                directory: Some("/repo".into()),
+                payload: json!({ "id": "evt_shell_exit", "type": "shell.exited",
+                    "data": { "id": "sh_background", "exit": 0, "status": "exited" } }),
+            });
+            client.update(cx, |client, cx| client.handle_live_event(exit, cx));
+            assert_eq!(
+                client.read(cx).conversations[&active].messages[0].segments()[0].text,
+                "shell · completed — sleep 1"
+            );
+
+            // An older history snapshot can still say the launch is running.
+            // Reconciliation after a load must not regress the displayed row.
+            client.update(cx, |client, _| {
+                let conversation = client.conversations.get_mut(&active).unwrap();
+                snapshot(conversation, vec![message("completed")]);
+                assert!(conversation.reconcile_shell_exits(&client.terminal_shells));
+            });
+            assert_eq!(
+                client.read(cx).conversations[&active].messages[0].segments()[0].text,
+                "shell · completed — sleep 1"
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
     }
 
     fn full_rows(conversation: &model::Conversation) -> Vec<model::TranscriptRow> {

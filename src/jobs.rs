@@ -65,6 +65,9 @@ impl ShellJob {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShellSnapshot {
     pub shells: Vec<ShellJob>,
+    /// Terminal commands are not sidebar jobs, but reconcile background
+    /// shell-tool transcript rows after reconnect or history replacement.
+    pub terminal: Vec<protocol::ShellExited>,
     /// Every location that was listed…
     pub queried: BTreeSet<String>,
     /// …and those whose list loaded, plus the directories the server
@@ -570,6 +573,7 @@ mod tests {
     fn snapshot(shells: Vec<ShellJob>, queried: &[&str], covered: &[&str]) -> ShellSnapshot {
         ShellSnapshot {
             shells,
+            terminal: Vec::new(),
             queried: queried.iter().map(|d| d.to_string()).collect(),
             covered: covered.iter().map(|d| d.to_string()).collect(),
             warnings: Vec::new(),
