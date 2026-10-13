@@ -1,4 +1,5 @@
 mod gpui_ui;
+mod measurement;
 
 use clap::Parser;
 

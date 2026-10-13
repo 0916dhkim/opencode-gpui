@@ -17,7 +17,7 @@ dirs = "6.0"
 env_logger = "0.11"
 jiff = "0.2"
 keyring = { version = "3.6", features = ["crypto-rust", "sync-secret-service"] }
-gpui-kit = "0.7.1"
+gpui-kit = { version = "0.7.1", features = ["profiler"] }
 imagesize = "0.14"
 log = "0.4"
 mime_guess = "2.0"
