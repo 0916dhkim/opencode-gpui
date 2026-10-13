@@ -36,7 +36,10 @@ use opencode_gpui::{
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
-use crate::{Args, measurement::Measurement};
+use crate::{
+    Args,
+    measurement::{Activity, Measurement},
+};
 
 fn tab_number_key(key: &str) -> Option<usize> {
     match key {
@@ -2920,11 +2923,54 @@ impl Client {
 
     fn toggle_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.measurement.running() {
+            let activity = self.measurement_activity();
+            self.measurement.sample(activity);
             self.measurement.stop();
         } else {
             self.measurement.start(window.window_handle().window_id());
+            let activity = self.measurement_activity();
+            self.measurement.sample(activity);
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let running = this
+                        .update(cx, |this, _| {
+                            if !this.measurement.running() {
+                                return false;
+                            }
+                            let activity = this.measurement_activity();
+                            this.measurement.sample(activity);
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !running {
+                        break;
+                    }
+                }
+            })
+            .detach();
         }
         cx.notify();
+    }
+
+    fn measurement_activity(&self) -> Activity {
+        let is_busy = |id: &str| {
+            self.local_busy.contains(id) || self.statuses.get(id).is_some_and(RunStatus::is_busy)
+        };
+        Activity {
+            busy_tabs: self.open_tabs.iter().filter(|id| is_busy(id)).count(),
+            active_busy: is_busy(&self.active),
+            sidebar_visible: self.sidebar_visible,
+            scroll_y: self.scroll.offset().y.as_f32(),
+            draft_revision: self
+                .composer_edit_generation
+                .get(&self.active)
+                .copied()
+                .unwrap_or(0),
+            background_jobs: self.jobs.len(),
+        }
     }
 
     fn transcript_width(&self, window: &Window) -> Pixels {
