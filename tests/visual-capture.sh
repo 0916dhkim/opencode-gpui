@@ -12,7 +12,7 @@ window_w="${WINDOW_W:-790}"
 window_h="${WINDOW_H:-800}"
 case_name="${CASE:-main}"
 export DISPLAY=:98
-Xvfb :98 -screen 0 1280x900x24 -nolisten tcp >/dev/null 2>&1 &
+Xvfb :98 -screen 0 "${SCREEN_W:-1280}x${SCREEN_H:-900}x24" -nolisten tcp >/dev/null 2>&1 &
 xvfb_pid=$!
 app_pid=""
 compositor_pid=""

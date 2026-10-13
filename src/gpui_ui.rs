@@ -16,8 +16,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
-    Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar, VirtualListScrollHandle, WindowBorder,
-    v_virtual_list,
+    Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar, VirtualListScrollHandle, v_virtual_list,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -6943,7 +6942,7 @@ impl Client {
         )
     }
 
-    fn sidebar(&self, cx: &Context<Self>) -> AnyElement {
+    fn sidebar(&self, floating: bool, cx: &Context<Self>) -> AnyElement {
         let mut tabs = div()
             .flex()
             .flex_col()
@@ -7102,6 +7101,7 @@ impl Client {
             .flex()
             .flex_col()
             .bg(self.tone(0xf4f1eb, 0x0d0f11))
+            .when(floating, |view| view.rounded_bl(px(FLOATING_CORNER_RADIUS)))
             .border_r_1()
             .border_color(self.tone(0xc8c3ba, 0x24282c))
             .child(
@@ -9244,6 +9244,11 @@ impl Client {
             .items_center()
             .justify_center()
             .bg(rgba(if self.dark { 0x000000a6 } else { 0x00000066 }))
+            .when(
+                matches!(window.window_decorations(), Decorations::Client { tiling } if !tiling.is_tiled())
+                    && !window.is_maximized() && !window.is_fullscreen(),
+                |view| view.rounded_bl(px(FLOATING_CORNER_RADIUS)).rounded_br(px(FLOATING_CORNER_RADIUS)),
+            )
             .on_click(cx.listener(|this, _, window, cx| {
                 if !(this.modal == Some(Modal::Rename) && this.rename_pending.is_some()) {
                     if this.modal == Some(Modal::Settings) {
@@ -10454,6 +10459,9 @@ impl Render for Client {
         }
         window.set_rem_size(self.scaled(16.));
         let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        let floating = matches!(window.window_decorations(), Decorations::Client { tiling } if !tiling.is_tiled())
+            && !window.is_maximized()
+            && !window.is_fullscreen();
         let controls = window.window_controls();
         let title_offset = if client_decorated {
             TITLE_BAR_HEIGHT
@@ -10727,11 +10735,17 @@ impl Render for Client {
             .font_family("Noto Sans")
             .text_size(rems(13. / 16.))
             .text_color(self.tone(0x252829, 0xe8e5df))
-            .bg(self.tone(0xf4f1eb, 0x101214))
+            .when(!floating, |view| view.bg(self.tone(0xf4f1eb, 0x101214)))
             .child(
                 TitleBar::new()
                     .h(self.scaled(46.))
                     .pl(px(0.))
+                    .when(floating, |bar| {
+                        // Keep the close-button hover ink away from the rounded corner.
+                        bar.pr(px(FLOATING_CORNER_RADIUS))
+                            .rounded_tl(px(FLOATING_CORNER_RADIUS))
+                            .rounded_tr(px(FLOATING_CORNER_RADIUS))
+                    })
                     .border_color(self.tone(0xc8c3ba, 0x2a2e32))
                     .bg(self.tone(0xf4f1eb, 0x14171a))
                     .child(
@@ -10833,13 +10847,24 @@ impl Render for Client {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .when(self.sidebar_visible, |view| view.child(self.sidebar(cx)))
+                    .when(self.sidebar_visible, |view| {
+                        view.child(self.sidebar(floating, cx))
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
+                            .bg(self.tone(0xf4f1eb, 0x101214))
+                            .when(floating, |view| {
+                                let view = view.rounded_br(px(FLOATING_CORNER_RADIUS));
+                                if self.sidebar_visible {
+                                    view
+                                } else {
+                                    view.rounded_bl(px(FLOATING_CORNER_RADIUS))
+                                }
+                            })
                             .when_some(self.session_header(cx), |view, header| view.child(header))
                             .child(self.chat(window, cx))
                             .when_some(self.overlay.as_ref(), |view, overlay| {
@@ -10866,9 +10891,12 @@ impl Render for Client {
             .when_some(self.link_menu_view(window, cx), |view, menu| {
                 view.child(menu)
             });
-        WindowBorder::new()
-            .shadow_size(px(0.))
-            .child(root.when_some(row_probe, |view, probe| view.child(probe)))
+        client_frame(
+            root.when_some(row_probe, |view, probe| view.child(probe))
+                .into_any_element(),
+            window,
+            self.dark,
+        )
     }
 }
 
@@ -10879,8 +10907,148 @@ fn client_window_options() -> WindowOptions {
             ..TitleBar::title_bar_options()
         }),
         window_decorations: Some(WindowDecorations::Client),
+        window_background: WindowBackgroundAppearance::Transparent,
         ..TitleBar::window_options()
     }
+}
+
+const FLOATING_CORNER_RADIUS: f32 = 9.;
+
+fn frame_resize_edge(
+    position: Point<Pixels>,
+    size: Size<Pixels>,
+    tiling: Tiling,
+) -> Option<ResizeEdge> {
+    let hit = px(8.);
+    let left = !tiling.left && position.x <= hit;
+    let right = !tiling.right && position.x >= size.width - hit;
+    let top = !tiling.top && position.y <= hit;
+    let bottom = !tiling.bottom && position.y >= size.height - hit;
+    match (top, bottom, left, right) {
+        (true, _, true, _) => Some(ResizeEdge::TopLeft),
+        (true, _, _, true) => Some(ResizeEdge::TopRight),
+        (_, true, true, _) => Some(ResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(ResizeEdge::BottomRight),
+        (true, _, _, _) => Some(ResizeEdge::Top),
+        (_, true, _, _) => Some(ResizeEdge::Bottom),
+        (_, _, true, _) => Some(ResizeEdge::Left),
+        (_, _, _, true) => Some(ResizeEdge::Right),
+        _ => None,
+    }
+}
+
+fn client_frame(root: AnyElement, window: &mut Window, dark: bool) -> AnyElement {
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        return root;
+    };
+    // A transparent window and independently rounded painted surfaces leave
+    // genuine alpha outside the floating frame. WindowBorder's opaque backdrop
+    // painted those corners square even when its inner child was rounded.
+    window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+    window.set_client_inset(px(0.));
+    let tiling = if window.is_maximized() || window.is_fullscreen() {
+        Tiling::tiled()
+    } else {
+        tiling
+    };
+    let floating = !tiling.is_tiled();
+    let frame_color = rgb(if dark { 0x34393d } else { 0xb7b2aa });
+    let size = window.viewport_size();
+    let band = px(8.);
+    let mut frame = div()
+        .id("client-frame")
+        .size_full()
+        .relative()
+        .when(floating, |frame| frame.rounded(px(FLOATING_CORNER_RADIUS)))
+        .border_color(frame_color)
+        .when(!tiling.top, |frame| frame.border_t_1())
+        .when(!tiling.bottom, |frame| frame.border_b_1())
+        .when(!tiling.left, |frame| frame.border_l_1())
+        .when(!tiling.right, |frame| frame.border_r_1())
+        .capture_any_mouse_down(move |event: &MouseDownEvent, window, cx| {
+            if event.button == MouseButton::Left
+                && let Some(edge) = frame_resize_edge(event.position, size, tiling)
+            {
+                window.start_window_resize(edge);
+                cx.stop_propagation();
+            }
+        })
+        .child(root);
+    // Cursor hitboxes follow the narrow client-edge resize bands. Corner zones
+    // are added last so they take precedence where two edge bands overlap.
+    let mut zones = Vec::new();
+    if !tiling.top {
+        zones.push((ResizeEdge::Top, px(0.), px(0.), size.width, band));
+    }
+    if !tiling.bottom {
+        zones.push((
+            ResizeEdge::Bottom,
+            px(0.),
+            size.height - band,
+            size.width,
+            band,
+        ));
+    }
+    if !tiling.left {
+        zones.push((ResizeEdge::Left, px(0.), px(0.), band, size.height));
+    }
+    if !tiling.right {
+        zones.push((
+            ResizeEdge::Right,
+            size.width - band,
+            px(0.),
+            band,
+            size.height,
+        ));
+    }
+    for (edge, disabled, left, top) in [
+        (
+            ResizeEdge::TopLeft,
+            tiling.top || tiling.left,
+            px(0.),
+            px(0.),
+        ),
+        (
+            ResizeEdge::TopRight,
+            tiling.top || tiling.right,
+            size.width - band,
+            px(0.),
+        ),
+        (
+            ResizeEdge::BottomLeft,
+            tiling.bottom || tiling.left,
+            px(0.),
+            size.height - band,
+        ),
+        (
+            ResizeEdge::BottomRight,
+            tiling.bottom || tiling.right,
+            size.width - band,
+            size.height - band,
+        ),
+    ] {
+        if !disabled {
+            zones.push((edge, left, top, band, band));
+        }
+    }
+    for (edge, left, top, width, height) in zones {
+        let cursor = match edge {
+            ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+            ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
+            ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+            ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+        };
+        frame = frame.child(
+            div()
+                .absolute()
+                .left(left)
+                .top(top)
+                .w(width)
+                .h(height)
+                .cursor(cursor),
+        );
+    }
+    frame.into_any_element()
 }
 
 fn follow_system_appearance(window: &mut Window, cx: &mut App) {
@@ -10909,7 +11077,7 @@ pub fn run(args: Args) {
             } else {
                 Theme::sync_system_appearance(None, cx);
             }
-            gpui_kit::open_window(client_window_options(), cx, |window, cx| {
+            let (handle, _) = gpui_kit::open_window(client_window_options(), cx, |window, cx| {
                 if theme_override.is_none() {
                     follow_system_appearance(window, cx);
                 }
@@ -10924,6 +11092,11 @@ pub fn run(args: Args) {
                 })
             })
             .expect("open GPUI window");
+            handle
+                .update(cx, |_, window, cx| {
+                    gpui_kit::component::use_client_frame(window, cx);
+                })
+                .expect("configure GPUI client frame");
         });
 }
 
@@ -10937,16 +11110,16 @@ mod tests {
         RowHeightCache, RowLayoutStamp, SESSION_PICKER_LIMIT, TRANSCRIPT_ROW_STYLE_REVISION,
         TabAttention, Theme, ThemeMode, UiEvent, VirtualListScrollHandle, filter_all_sessions,
         filter_levels, filter_models, filter_new_session_projects, filter_tab_sessions,
-        fuzzy_score, markdown_blocks, markdown_view_id, model, needs_new_connection,
-        new_session_choice, picker_list_height, reorder_tab_ids, safe_connection_error,
-        splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
+        frame_resize_edge, fuzzy_score, markdown_blocks, markdown_view_id, model,
+        needs_new_connection, new_session_choice, picker_list_height, reorder_tab_ids,
+        safe_connection_error, splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
         unread_on_server_switch, update_session_projection,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AppContext, Bounds, Focusable, InputEvent as _, Modifiers, ModifiersChangedEvent,
-        MouseButton, MouseDownEvent, MouseMoveEvent, Role, TestAppContext, WindowBounds,
-        WindowOptions, point, px, size,
+        MouseButton, MouseDownEvent, MouseMoveEvent, ResizeEdge, Role, TestAppContext, Tiling,
+        WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
     };
     use opencode_gpui::model::RunStatus;
     use opencode_gpui::persist::PersistedState;
@@ -10995,6 +11168,44 @@ mod tests {
         let titlebar = options.titlebar.expect("titlebar options");
         assert_eq!(titlebar.title.as_deref(), Some("OpenCode"));
         assert!(titlebar.appears_transparent);
+        assert_eq!(
+            options.window_background,
+            WindowBackgroundAppearance::Transparent
+        );
+    }
+
+    #[test]
+    fn floating_frame_retains_resize_edges_but_tiled_edges_do_not_resize() {
+        let viewport = size(px(780.), px(800.));
+        let floating = Tiling::default();
+        assert_eq!(
+            frame_resize_edge(point(px(2.), px(2.)), viewport, floating),
+            Some(ResizeEdge::TopLeft)
+        );
+        assert_eq!(
+            frame_resize_edge(point(px(777.), px(400.)), viewport, floating),
+            Some(ResizeEdge::Right)
+        );
+        assert_eq!(
+            frame_resize_edge(point(px(7.), px(400.)), viewport, floating),
+            Some(ResizeEdge::Left)
+        );
+        assert_eq!(
+            frame_resize_edge(point(px(9.), px(400.)), viewport, floating),
+            None
+        );
+        assert_eq!(
+            frame_resize_edge(point(px(390.), px(797.)), viewport, floating),
+            Some(ResizeEdge::Bottom)
+        );
+        assert_eq!(
+            frame_resize_edge(point(px(390.), px(400.)), viewport, floating),
+            None
+        );
+        assert_eq!(
+            frame_resize_edge(point(px(2.), px(2.)), viewport, Tiling::tiled()),
+            None
+        );
     }
 
     #[gpui_kit::test]

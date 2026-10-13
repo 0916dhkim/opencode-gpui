@@ -33,6 +33,12 @@ url = "2.5"
 [dev-dependencies]
 gpui-kit = { version = "0.7.1", features = ["test-support"] }
 
+[patch.crates-io]
+# Component's stock Root paints an opaque surface and adds a 20px window
+# border outside every Client window. Keep its plugins, but allow this app to
+# provide the transparent, rounded client frame instead.
+gpui-component = { path = "vendor/gpui-component" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
