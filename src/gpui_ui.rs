@@ -29,6 +29,7 @@ use opencode_gpui::{
         self, Conversation, ModelCatalog, ModelSelection, Project, RunStatus, Session,
         SessionModel, TranscriptRow, TranscriptRowKey, TranscriptRowKind,
     },
+    notifications::{DesktopNotifications, notification_id},
     pending::{self, Forms, PendingRequest},
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
     preview, protocol, tray,
@@ -607,6 +608,8 @@ struct Client {
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
     terminal_shells: HashMap<String, protocol::ShellExited>,
+    desktop_notifications: Option<DesktopNotifications>,
+    notification_targets: HashMap<String, String>,
     forms: Forms,
     form_cancel_focus: FocusHandle,
     form_cancel_presented: Option<String>,
@@ -2676,6 +2679,8 @@ impl Client {
             statuses: HashMap::new(),
             jobs: Vec::new(),
             terminal_shells: HashMap::new(),
+            desktop_notifications: None,
+            notification_targets: HashMap::new(),
             forms: Forms::default(),
             form_cancel_focus: cx.focus_handle().tab_stop(true),
             form_cancel_presented: None,
@@ -2773,6 +2778,24 @@ impl Client {
                 }
             },
         )
+        .detach();
+        let (notifications, actions) = DesktopNotifications::start();
+        client.desktop_notifications = Some(notifications);
+        let notification_window = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            while let Ok(notification_id) = actions.recv().await {
+                match this.update(cx, |this, cx| {
+                    this.activate_session_notification(&notification_id, cx)
+                }) {
+                    Ok(true) => {
+                        let _ =
+                            notification_window.update(cx, |_, window, _| window.activate_window());
+                    }
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        })
         .detach();
         match ApiHandle::start(config) {
             Ok((api, receiver, key)) => {
@@ -3231,6 +3254,62 @@ impl Client {
         }
     }
 
+    fn session_notification_id(&self, session: &str) -> String {
+        let server = opencode_gpui::api::server_key(&self.settings.current.base_url)
+            .unwrap_or_else(|_| self.settings.current.base_url.clone());
+        notification_id(&server, session)
+    }
+
+    fn notify_session_ready(&mut self, session_id: &str) {
+        let Some(notifier) = &self.desktop_notifications else {
+            return;
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id && session.parent_id.is_none())
+        {
+            return;
+        }
+        let id = self.session_notification_id(session_id);
+        self.notification_targets
+            .insert(id.clone(), session_id.into());
+        // A session title may contain prompts or customer data; desktop
+        // notifications can be shown outside the application and on lock screens.
+        notifier.show(id, "OpenCode".into());
+    }
+
+    fn withdraw_session_notification(&mut self, session_id: &str) {
+        let id = self.session_notification_id(session_id);
+        self.notification_targets.remove(&id);
+        if let Some(notifier) = &self.desktop_notifications {
+            notifier.withdraw(id);
+        }
+    }
+
+    fn activate_session_notification(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.notification_targets.remove(id) else {
+            return false;
+        };
+        if id != self.session_notification_id(&session_id)
+            || !self.sessions.iter().any(|session| session.id == session_id)
+        {
+            if let Some(notifier) = &self.desktop_notifications {
+                notifier.withdraw(id.into());
+            }
+            return false;
+        }
+        self.select_session(session_id.clone());
+        if self.unread.remove(&session_id) {
+            self.persist_tabs();
+        }
+        if let Some(notifier) = &self.desktop_notifications {
+            notifier.withdraw(id.into());
+        }
+        cx.notify();
+        true
+    }
+
     fn local_prompt_delivered(&self, session: &str) -> bool {
         self.local_run_message_ids
             .get(session)
@@ -3355,6 +3434,7 @@ impl Client {
         self.row_heights.remove(id);
         self.virtual_scrolls.remove(id);
         self.unread.remove(id);
+        self.withdraw_session_notification(id);
         if self.active == id {
             let next = index
                 .and_then(|index| {
@@ -3795,6 +3875,12 @@ impl Client {
         self.pending_jump = None;
         self.conversations.clear();
         self.terminal_shells.clear();
+        if let Some(notifier) = &self.desktop_notifications {
+            for id in self.notification_targets.keys() {
+                notifier.withdraw(id.clone());
+            }
+        }
+        self.notification_targets.clear();
         self.loading_messages.clear();
         self.message_load_errors.clear();
         self.skip_prune_for_load.clear();
@@ -4121,6 +4207,8 @@ impl Client {
                 return;
             }
             if self.unread.remove(&self.active) {
+                let active = self.active.clone();
+                self.withdraw_session_notification(&active);
                 self.persist_tabs();
                 cx.stop_propagation();
                 cx.notify();
@@ -5441,6 +5529,15 @@ impl Client {
                 }
                 if data.sessions_complete {
                     self.sessions = data.sessions;
+                    let removed: Vec<String> = self
+                        .open_tabs
+                        .iter()
+                        .filter(|id| !self.sessions.iter().any(|session| &session.id == *id))
+                        .cloned()
+                        .collect();
+                    for id in removed {
+                        self.withdraw_session_notification(&id);
+                    }
                     self.open_tabs
                         .retain(|id| self.sessions.iter().any(|session| &session.id == id));
                     self.bootstrap_directories = self.active_directories();
@@ -5597,13 +5694,28 @@ impl Client {
                     }
                 }
                 self.replay_bootstrap_events(cx);
-                apply_missed_idle(
-                    &mut self.offline_busy,
-                    &self.statuses,
-                    &self.open_tabs,
-                    &mut self.unread,
-                    statuses_complete,
-                );
+                let unread_before = self.unread.clone();
+                // A status can be known before its session metadata arrives.
+                // Keep the offline Busy marker until the session list is
+                // complete, or the notification would be consumed with no
+                // eligible parent session to notify.
+                if data.sessions_complete {
+                    apply_missed_idle(
+                        &mut self.offline_busy,
+                        &self.statuses,
+                        &self.open_tabs,
+                        &mut self.unread,
+                        statuses_complete,
+                    );
+                }
+                for id in self
+                    .unread
+                    .difference(&unread_before)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    self.notify_session_ready(&id);
+                }
                 if statuses_complete && data.sessions_complete && self.api.is_some() {
                     self.persist_tabs();
                 }
@@ -5971,7 +6083,13 @@ impl Client {
                         self.child_parents.insert(child, parent);
                     }
                     if let Some((id, status)) = model::run_status_change(&kind) {
-                        self.update_tab_status(id, status);
+                        let completed = self.statuses.get(&id).is_some_and(RunStatus::is_busy)
+                            && status.is_idle()
+                            && self.open_tabs.contains(&id);
+                        self.update_tab_status(id.clone(), status);
+                        if completed {
+                            self.notify_session_ready(&id);
+                        }
                     }
                     if let Some(change) = model::SessionChange::from_kind(&event, &kind) {
                         let id = change.session_id().to_owned();
@@ -6031,6 +6149,7 @@ impl Client {
                             });
                             self.composer_edit_generation.remove(&id);
                             self.unread.remove(&id);
+                            self.withdraw_session_notification(&id);
                             self.prune_owned_pastes();
                         }
                     }
@@ -6374,6 +6493,8 @@ impl Client {
             statuses: bootstrap.statuses,
             jobs,
             terminal_shells: HashMap::new(),
+            desktop_notifications: None,
+            notification_targets: HashMap::new(),
             forms,
             form_cancel_focus: cx.focus_handle().tab_stop(true),
             form_cancel_presented: None,
@@ -11278,6 +11399,7 @@ mod tests {
         WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
     };
     use opencode_gpui::model::RunStatus;
+    use opencode_gpui::notifications::{DesktopNotifications, NotificationCommand};
     use opencode_gpui::persist::PersistedState;
     use opencode_gpui::protocol;
     use serde_json::json;
@@ -11360,6 +11482,81 @@ mod tests {
                 client.read(cx).conversations[&active].messages[0].segments()[0].text,
                 "shell · completed — sleep 1"
             );
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn completed_parent_turn_notifies_once_and_click_opens_and_acknowledges_it(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless client window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let active = client.read(cx).active.clone();
+            let (notifier, requests) = DesktopNotifications::channel();
+            client.update(cx, |client, _| {
+                client.desktop_notifications = Some(notifier);
+                client.statuses.insert(active.clone(), RunStatus::Busy);
+            });
+            let event = |id| {
+                UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                    directory: Some("/repo".into()),
+                    payload: json!({ "id": id, "type": "session.execution.succeeded",
+                    "data": { "sessionID": active } }),
+                })
+            };
+            client.update(cx, |client, cx| {
+                client.handle_live_event(event("evt_done"), cx)
+            });
+            let notification = requests.try_recv().expect("completed turn notification");
+            let NotificationCommand::Show { id, title } = notification else {
+                panic!("expected a notification");
+            };
+            assert_eq!(title, "OpenCode");
+            assert_eq!(client.read(cx).notification_targets[&id], active);
+            assert!(client.read(cx).unread.contains(&active));
+            client.update(cx, |client, cx| {
+                client.handle_live_event(event("evt_duplicate"), cx)
+            });
+            assert!(
+                requests.try_recv().is_err(),
+                "replayed idle must not notify"
+            );
+            client.update(cx, |client, cx| {
+                client.activate_session_notification(&id, cx);
+            });
+            assert_eq!(client.read(cx).active, active);
+            assert!(!client.read(cx).unread.contains(&active));
+            assert_eq!(
+                requests.try_recv().unwrap(),
+                NotificationCommand::Withdraw(id)
+            );
+            client.update(cx, |client, cx| {
+                let mut child = client
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == active)
+                    .unwrap()
+                    .clone();
+                child.id = "ses_child".into();
+                child.parent_id = Some(active.clone());
+                client.sessions.push(child);
+                client.open_tabs.push("ses_child".into());
+                client.statuses.insert("ses_child".into(), RunStatus::Busy);
+                client.handle_live_event(UiEvent::ServerEvent(opencode_gpui::api::ServerEnvelope {
+                    directory: Some("/repo".into()),
+                    payload: json!({ "id": "evt_child_done", "type": "session.execution.succeeded",
+                        "data": { "sessionID": "ses_child" } }),
+                }), cx);
+            });
+            assert!(requests.try_recv().is_err(), "child turn must not notify");
             window.render_frame(cx);
         })
         .unwrap();

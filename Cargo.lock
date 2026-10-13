@@ -5004,11 +5004,14 @@ name = "opencode-gpui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ashpd 0.13.13",
  "async-channel",
  "base64",
  "clap",
  "dirs 6.0.0",
  "env_logger",
+ "futures-lite",
+ "futures-util",
  "gpui-kit",
  "imagesize 0.14.0",
  "jiff",
@@ -5021,8 +5024,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
  "url",
+ "zbus 5.19.0",
 ]
 
 [[package]]

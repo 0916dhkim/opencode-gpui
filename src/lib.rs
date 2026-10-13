@@ -3,6 +3,7 @@ pub mod api;
 pub mod credentials;
 pub mod jobs;
 pub mod model;
+pub mod notifications;
 pub mod pending;
 pub mod persist;
 pub mod preview;
