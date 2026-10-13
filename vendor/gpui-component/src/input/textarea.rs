@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, DefiniteLength, Entity, IntoElement, RenderOnce, SharedString, StyleRefinement, Styled,
-    Window, prelude::FluentBuilder as _,
+    App, DefiniteLength, Entity, IntoElement, Pixels, RenderOnce, SharedString, StyleRefinement,
+    Styled, Window, prelude::FluentBuilder as _,
 };
 
 use super::{Input, TextareaState};
@@ -18,6 +18,7 @@ pub struct Textarea {
     state: Entity<TextareaState>,
     style: StyleRefinement,
     size: Size,
+    editor_padding_left: Option<Pixels>,
     height: Option<DefiniteLength>,
     appearance: bool,
     bordered: bool,
@@ -72,6 +73,7 @@ impl Textarea {
             state: state.clone(),
             style: StyleRefinement::default(),
             size: Size::default(),
+            editor_padding_left: None,
             height: None,
             appearance: true,
             bordered: true,
@@ -91,6 +93,13 @@ impl Textarea {
 
     pub fn h(mut self, height: impl Into<DefiniteLength>) -> Self {
         self.height = Some(height.into());
+        self
+    }
+
+    /// Override only the editor text's left inset; the input's frame and
+    /// other editor paddings keep their normal size-dependent behavior.
+    pub fn editor_padding_left(mut self, padding: Pixels) -> Self {
+        self.editor_padding_left = Some(padding);
         self
     }
 
@@ -203,6 +212,9 @@ impl Textarea {
             .tab_index(self.tab_index)
             .role(self.role)
             .with_size(self.size)
+            .when_some(self.editor_padding_left, |this, padding| {
+                this.editor_padding_left(padding)
+            })
             .when_some(self.height, |this, height| this.h(height))
             .when_some(self.accessibility_id, |this, id| this.accessibility_id(id))
             .when_some(self.aria_label, |this, label| this.aria_label(label))

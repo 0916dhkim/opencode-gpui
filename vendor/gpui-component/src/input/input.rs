@@ -3,9 +3,9 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AccessibleAction, AnyElement, App, DefiniteLength, Edges, ElementId, Entity, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Rems, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, TouchPhase, Window, div,
-    px, relative,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Rems, RenderOnce, Role,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, TouchPhase,
+    Window, div, px, relative,
 };
 
 use crate::button::{Button, ButtonRounded, ButtonVariants as _};
@@ -116,6 +116,7 @@ pub struct Input {
     state: TextInputState,
     style: StyleRefinement,
     size: Size,
+    editor_padding_left: Option<Pixels>,
     prefix: Option<AnyElement>,
     suffix: Option<AnyElement>,
     height: Option<DefiniteLength>,
@@ -227,6 +228,7 @@ impl Input {
             id: None,
             state,
             size: Size::default(),
+            editor_padding_left: None,
             style: StyleRefinement::default(),
             prefix: None,
             suffix: None,
@@ -257,6 +259,11 @@ impl Input {
     /// presentation from it.
     pub(crate) fn state(&self) -> &TextInputState {
         &self.state
+    }
+
+    pub(crate) fn editor_padding_left(mut self, padding: Pixels) -> Self {
+        self.editor_padding_left = Some(padding);
+        self
     }
 
     pub(crate) fn is_disabled(&self) -> bool {
@@ -594,11 +601,13 @@ impl RenderOnce for Input {
                     top: self.size.input_py(),
                     right: self.size.input_px(),
                     bottom: self.size.input_py(),
-                    left: if state.presentation(cx).is_code_editor() {
-                        self.size.input_px().min(px(6.))
-                    } else {
-                        self.size.input_px()
-                    },
+                    left: self.editor_padding_left.unwrap_or_else(|| {
+                        if state.presentation(cx).is_code_editor() {
+                            self.size.input_px().min(px(6.))
+                        } else {
+                            self.size.input_px()
+                        }
+                    }),
                 }
             } else {
                 Edges::default()

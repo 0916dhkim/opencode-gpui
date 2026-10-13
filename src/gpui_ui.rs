@@ -6858,7 +6858,7 @@ impl Client {
             .with_animation(
                 format!("tab-drop-slot-collapse-{target}-{position}-{token}"),
                 Animation::new(Duration::from_millis(150)),
-                move |slot, progress| slot.h(px(slot_height.as_f32() * (1. - progress))),
+                move |slot, progress| slot.h(collapsing_slot_height(slot_height, progress)),
             )
             .into_any_element()
     }
@@ -8662,6 +8662,7 @@ impl Client {
             .child(
                 Textarea::new(&self.composer)
                     .aria_label("Ask OpenCode anything…")
+                    .editor_padding_left(px(10.) + self.scaled(4.))
                     .on_paste(move |item, _, app| {
                         paste_owner.update(app, |this, cx| {
                             this.paste_attachments(&paste_session, item, cx)
@@ -8675,14 +8676,19 @@ impl Client {
             })
             .child(
                 div()
-                    .when(!very_compact, |footer| footer.h(self.scaled(46.)))
+                    .when(!very_compact, |footer| {
+                        footer.h(self.scaled(46.)).pb(self.scaled(12.))
+                    })
                     .when(very_compact, |footer| {
                         footer
                             .min_h(self.scaled(46.))
                             .py(self.scaled(6.))
                             .flex_wrap()
                     })
-                    .px(self.scaled(14.))
+                    .when(!very_compact, |footer| {
+                        footer.pl(self.scaled(2.)).pr(self.scaled(14.))
+                    })
+                    .when(very_compact, |footer| footer.px(self.scaled(14.)))
                     .flex()
                     .items_center()
                     .gap(self.scaled(8.))
@@ -8713,10 +8719,16 @@ impl Client {
                             .items_center()
                             .justify_center()
                             .child(
-                                Icon::default()
-                                    .data(include_bytes!("icons/paperclip.svg"))
-                                    .with_size(self.scaled(22.))
-                                    .text_color(self.tone(0x555b5c, 0xc8c4bd)),
+                                div()
+                                    .when(!very_compact, |artwork| {
+                                        artwork.relative().top(self.scaled(10.))
+                                    })
+                                    .child(
+                                        Icon::default()
+                                            .data(include_bytes!("icons/paperclip.svg"))
+                                            .with_size(self.scaled(22.))
+                                            .text_color(self.tone(0x555b5c, 0xc8c4bd)),
+                                    ),
                             ),
                     )
                     .child(
@@ -10913,6 +10925,10 @@ fn client_window_options() -> WindowOptions {
 }
 
 const FLOATING_CORNER_RADIUS: f32 = 9.;
+
+fn collapsing_slot_height(slot_height: Pixels, progress: f32) -> Pixels {
+    px(slot_height.as_f32() * (1. - progress))
+}
 
 fn frame_resize_edge(
     position: Point<Pixels>,
@@ -16813,6 +16829,9 @@ mod tests {
 
     #[gpui_kit::test]
     fn dragging_tabs_opens_a_drop_slot_on_the_requested_side(cx: &mut TestAppContext) {
+        assert_eq!(super::collapsing_slot_height(px(36.), 0.), px(36.));
+        assert_eq!(super::collapsing_slot_height(px(36.), 0.5), px(18.));
+        assert_eq!(super::collapsing_slot_height(px(36.), 1.), px(0.));
         cx.update(gpui_kit::init);
         let (handle, client) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -16846,16 +16865,9 @@ mod tests {
             assert!(window.try_find("tab-drop-slot-ses_other-after").is_some());
         })
         .unwrap();
-        cx.executor().advance_clock(Duration::from_millis(75));
-        cx.run_until_parked();
-        cx.update_window(handle, |_, window, cx| {
-            window.simulate_next_frame(cx);
-            window.render_frame(cx);
-            let shrinking = window.find("tab-drop-slot-ses_other-after").bounds();
-            assert!(shrinking.size.height > px(0.) && shrinking.size.height < px(36.));
-        })
-        .unwrap();
-        cx.executor().advance_clock(Duration::from_millis(90));
+        // The render clock may advance beyond the midpoint under a slow CI
+        // runner, so verify interpolation above and the final removal here.
+        cx.executor().advance_clock(Duration::from_millis(165));
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
