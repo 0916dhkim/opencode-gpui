@@ -185,6 +185,17 @@ if [[ "$CLIENT" == gpui && ( "${INTERACTION:-}" == send || "${INTERACTION:-}" ==
     xdotool mousemove 710 350 click --repeat 20 --delay 20 5
   fi
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == composer-lines ]]; then
+  # Agent-directed multiline/overflow inspection, not an assertion suite.
+  xdotool mousemove --window "$win" "$((window_w / 2))" "$((window_h - 120))" click 1
+  for ((i = 0; i < ${COMPOSER_ZOOM_STEPS:-0}; i++)); do xdotool key ctrl+equal; sleep 0.15; done
+  for ((i = 1; i <= ${COMPOSER_LINES:-6}; i++)); do
+    if (( i > 1 )); then xdotool key shift+Return; fi
+    xdotool type --clearmodifiers --delay 20 "$i"
+  done
+  sleep 0.5
+  if [[ "${COMPOSER_POSITION:-end}" == start ]]; then xdotool key ctrl+Home; fi
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == open-settings ]]; then
   xdotool mousemove --window "$win" 72 764 click 1
 fi
@@ -381,6 +392,25 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == hover-close ]]; then
   xdotool mousemove --window "$win" 245 110
 fi
 sleep 6
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == composer-lines ]]; then
+  # Scroll after settling so a transient native scrollbar is visible in the
+  # capture. Optional coordinates also allow a targeted thumb-drag inspection.
+  if (( ${COMPOSER_SCROLL_TICKS:-0} > 0 )); then
+    xdotool mousemove --window "$win" "$((window_w - 90))" "$((window_h - 130))" \
+      click --repeat "$COMPOSER_SCROLL_TICKS" --delay 50 4
+    sleep 0.3
+  fi
+  if [[ -n "${COMPOSER_THUMB_FROM_Y:-}" ]]; then
+    xdotool mousemove --window "$win" "${COMPOSER_THUMB_X:?thumb x required}" "$COMPOSER_THUMB_FROM_Y"
+    sleep 0.1
+    xdotool mousedown 1
+    sleep 0.1
+    xdotool mousemove --window "$win" "$COMPOSER_THUMB_X" "${COMPOSER_THUMB_TO_Y:?thumb destination required}"
+    sleep 0.1
+    xdotool mouseup 1
+    sleep 0.3
+  fi
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
   xdotool mousemove --window "$win" 710 350 click --repeat 30 --delay 20 5
   sleep 1

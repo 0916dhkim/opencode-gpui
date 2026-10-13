@@ -2618,7 +2618,7 @@ impl Client {
             catalog: ModelCatalog::default(),
             composer: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .auto_grow(2, 8)
+                    .rows(1)
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
@@ -3470,7 +3470,7 @@ impl Client {
         if self.active.is_empty() {
             self.composer = cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .auto_grow(2, 8)
+                    .rows(1)
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             });
@@ -3479,7 +3479,7 @@ impl Client {
         } else {
             let composer = cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .auto_grow(2, 8)
+                    .rows(1)
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             });
@@ -6446,7 +6446,7 @@ impl Client {
             catalog,
             composer: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .auto_grow(2, 8)
+                    .rows(1)
                     .submit_on_enter(true)
                     .placeholder("Ask OpenCode anything…")
             }),
@@ -8869,14 +8869,22 @@ impl Client {
                 Textarea::new(&self.composer)
                     .aria_label("Ask OpenCode anything…")
                     .editor_padding_left(self.scaled(14.))
-                    .editor_padding_top(self.scaled(8.))
+                    // Base's scrollbar includes editor padding in its viewport
+                    // but not its content extent. Put vertical insets on the
+                    // frame instead so thumb and text share the same viewport.
+                    .editor_padding_top(px(0.))
+                    .editor_padding_bottom(px(0.))
+                    .py(self.scaled(8.))
                     .on_paste(move |item, _, app| {
                         paste_owner.update(app, |this, cx| {
                             this.paste_attachments(&paste_session, item, cx)
                         })
                     })
                     .bordered(false)
-                    .h(self.scaled(89.)),
+                    // Keep the editor's viewport separate from the toolbar;
+                    // content overflow uses the input engine's own scrollbar.
+                    .h(self.scaled(89.))
+                    .overflow_hidden(),
             )
             .when(!self.attachments_draft.is_empty(), |composer| {
                 composer.child(files)
@@ -10496,8 +10504,6 @@ impl Client {
                         ))
                     .relative()
                     .rounded(px(8.))
-                    .border_1()
-                    .border_color(self.tone(0xc8c3ba, 0x30353a))
                     .bg(self.tone(0xfffdfa, 0x191c1f))
                     .shadow_lg()
                     .p(self.scaled(14.))
