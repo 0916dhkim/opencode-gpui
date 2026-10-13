@@ -638,6 +638,7 @@ struct Client {
     abort_timeout_tokens: HashMap<String, u64>,
     next_abort_timeout_token: u64,
     modal: Option<Modal>,
+    picker_control_centers: Rc<RefCell<[Option<Pixels>; 2]>>,
     modal_container_focus: FocusHandle,
     rename_target: Option<String>,
     rename_action_focus: [FocusHandle; 3],
@@ -2709,6 +2710,7 @@ impl Client {
             abort_timeout_tokens: HashMap::new(),
             next_abort_timeout_token: 0,
             modal: None,
+            picker_control_centers: Rc::new(RefCell::new([None, None])),
             modal_container_focus: cx.focus_handle(),
             rename_target: None,
             rename_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
@@ -3079,7 +3081,16 @@ impl Client {
         self.sidebar_zoom_width = window.viewport_size().width;
     }
 
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    fn can_open_sidebar(&self, window: &Window) -> bool {
+        // A manual reopen must not consume the space reserved for the separate
+        // composer selectors and pinned Send/Stop controls at high zoom.
+        window.viewport_size().width >= self.scaled(SIDEBAR_WIDTH + 260.)
+    }
+
+    fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.sidebar_visible && !self.can_open_sidebar(window) {
+            return;
+        }
         let offset = self.scroll.offset();
         if self.pending_jump.is_none() && offset.y + self.scroll.max_offset().y <= px(16.) {
             self.preserve_scroll = None;
@@ -4489,7 +4500,7 @@ impl Client {
             return;
         }
         if key == "b" && !modifiers.shift {
-            self.toggle_sidebar(cx);
+            self.toggle_sidebar(window, cx);
             cx.stop_propagation();
             return;
         }
@@ -6539,6 +6550,7 @@ impl Client {
             abort_timeout_tokens: HashMap::new(),
             next_abort_timeout_token: 0,
             modal,
+            picker_control_centers: Rc::new(RefCell::new([None, None])),
             modal_container_focus: cx.focus_handle(),
             rename_target: None,
             rename_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
@@ -8818,6 +8830,32 @@ impl Client {
         Some(card.into_any_element())
     }
 
+    fn picker_control_probe(&self, model: bool) -> impl IntoElement {
+        let centers = self.picker_control_centers.clone();
+        let index = usize::from(!model);
+        let open = self.modal == Some(if model { Modal::Model } else { Modal::Level });
+        // The selector's flex width depends on its label and available room;
+        // measure its actual painted bounds instead of estimating a fixed x.
+        canvas(
+            move |bounds, window, cx| {
+                let center = bounds.center().x;
+                let mut centers = centers.borrow_mut();
+                if centers[index].is_none_or(|previous| (previous - center).abs() > px(0.5)) {
+                    centers[index] = Some(center);
+                    if open {
+                        window.defer(cx, |window, _| window.refresh());
+                    }
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .right_0()
+    }
+
     fn composer(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let can_send = self.can_send(cx);
         let selected_model = self.selected_model();
@@ -8839,7 +8877,6 @@ impl Client {
             .unwrap_or_default();
         let running = self.is_running(&self.active);
         let compact = self.transcript_width(window) < self.scaled(400.);
-        let very_compact = self.transcript_width(window) < self.scaled(300.);
         let mut files = div().px(self.scaled(13.)).flex().gap(self.scaled(7.));
         for (index, path) in self.attachments_draft.iter().enumerate() {
             let target = path.clone();
@@ -8907,15 +8944,10 @@ impl Client {
             })
             .child(
                 div()
-                    .when(!very_compact, |footer| {
-                        footer.h(self.scaled(46.)).pb(self.scaled(12.))
-                    })
-                    .when(very_compact, |footer| {
-                        footer
-                            .min_h(self.scaled(46.))
-                            .py(self.scaled(6.))
-                            .flex_wrap()
-                    })
+                    .id("composer-toolbar")
+                    .test_support()
+                    .h(self.scaled(46.))
+                    .py(self.scaled(7.))
                     .pl(self.scaled(2.))
                     .pr(self.scaled(14.))
                     .flex()
@@ -8923,185 +8955,20 @@ impl Client {
                     .gap(self.scaled(8.))
                     .child(
                         div()
-                            .id("attach-file")
-                            .role(Role::Button)
-                            .aria_label("Attach file")
+                            .id("composer-leading-actions")
                             .test_support()
-                            .track_focus(&self.composer_action_focus[0])
-                            .focus_visible(|style| {
-                                style.border_color(self.tone(0x2356a8, 0x78baff))
-                            })
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                    this.choose_attachments(cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.choose_attachments(cx);
-                            }))
-                            .w(self.scaled(32.))
-                            .h(self.scaled(32.))
-                            .flex_shrink_0()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .items_center()
-                            .justify_center()
+                            .gap(self.scaled(8.))
                             .child(
                                 div()
-                                    .when(!very_compact, |artwork| {
-                                        artwork.relative().top(self.scaled(9.))
-                                    })
-                                    .child(
-                                        Icon::default()
-                                            .data(include_bytes!("icons/paperclip.svg"))
-                                            .with_size(self.scaled(22.))
-                                            .text_color(self.tone(0x555b5c, 0xc8c4bd)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("composer-model")
-                            .role(Role::Button)
-                            .aria_label("Choose model")
-                            .test_support()
-                            .track_focus(&self.composer_action_focus[1])
-                            .focus_visible(|style| {
-                                style.border_color(self.tone(0x2356a8, 0x78baff))
-                            })
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                    this.show_modal(Modal::Model, window, cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_modal(Modal::Model, window, cx);
-                            }))
-                            .max_w(self.scaled(160.))
-                            .min_w_0()
-                            .h(self.scaled(32.))
-                            .min_w_0()
-                            .px(self.scaled(8.))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(model),
-                            )
-                            .child("⌄"),
-                    )
-                    .child(
-                        div()
-                            .id("composer-level")
-                            .role(Role::Button)
-                            .aria_label("Choose reasoning level")
-                            .test_support()
-                            .track_focus(&self.composer_action_focus[2])
-                            .focus_visible(|style| {
-                                style.border_color(self.tone(0x2356a8, 0x78baff))
-                            })
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                    this.show_modal(Modal::Level, window, cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_modal(Modal::Level, window, cx);
-                            }))
-                            .h(self.scaled(32.))
-                            .px(self.scaled(8.))
-                            .flex()
-                            .items_center()
-                            .child(format!(
-                                "{}⌄",
-                                selected_model
-                                    .and_then(|selection| selection.variant)
-                                    .unwrap_or_else(|| "Default".into())
-                            )),
-                    )
-                    .when(!very_compact, |footer| footer.child(div().flex_1()))
-                    .when(!compact, |footer| {
-                        footer.child(
-                            div()
-                                .whitespace_nowrap()
-                                .text_size(self.scaled(11.))
-                                .text_color(self.tone(0x858e8c, 0x899097))
-                                .child(context),
-                        )
-                    })
-                    .when(
-                        running && window.viewport_size().width >= px(900.),
-                        |footer| {
-                            footer.child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_size(self.scaled(10.))
-                                    .text_color(self.tone(0x858e8c, 0x899097))
-                                    .child("Ctrl+Enter to queue"),
-                            )
-                        },
-                    )
-                    .when(running, |footer| {
-                        footer.child(
-                            div()
-                                .id("stop-run")
-                                .role(Role::Button)
-                                .aria_label("Stop current run")
-                                .test_support()
-                                .track_focus(&self.composer_action_focus[3])
-                                .focus_visible(|style| {
-                                    style.border_color(self.tone(0x2356a8, 0x78baff))
-                                })
-                                .on_key_down(cx.listener(
-                                    |this, event: &KeyDownEvent, window, cx| {
-                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
-                                        {
-                                            this.stop_active(cx);
-                                            this.composer.focus_handle(cx).focus(window, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.stop_active(cx);
-                                    this.composer.focus_handle(cx).focus(window, cx);
-                                }))
-                                .w(self.scaled(32.))
-                                .h(self.scaled(32.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .border_1()
-                                .border_color(self.tone(0x555b5c, 0x6b7176))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::default()
-                                        .data(include_bytes!("icons/stop.svg"))
-                                        .with_size(self.scaled(22.))
-                                        .text_color(self.tone(0x555b5c, 0xc8c4bd)),
-                                ),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id("send-prompt")
-                            .role(Role::Button)
-                            .aria_label("Send prompt")
-                            .test_support()
-                            .when(can_send, |button| {
-                                button
-                                    .track_focus(&self.composer_action_focus[4])
+                                    .id("attach-file")
+                                    .role(Role::Button)
+                                    .aria_label("Attach file")
+                                    .test_support()
+                                    .track_focus(&self.composer_action_focus[0])
                                     .focus_visible(|style| {
                                         style.border_color(self.tone(0x2356a8, 0x78baff))
                                     })
@@ -9111,32 +8978,244 @@ impl Client {
                                                 event.keystroke.key.as_str(),
                                                 "enter" | "space"
                                             ) {
-                                                this.send_prompt(false, cx);
+                                                this.choose_attachments(cx);
                                                 cx.stop_propagation();
                                             }
                                         },
                                     ))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.send_prompt(false, cx);
+                                        this.choose_attachments(cx);
                                     }))
-                            })
-                            .w(self.scaled(32.))
-                            .h(self.scaled(32.))
+                                    .w(self.scaled(32.))
+                                    .h(self.scaled(32.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div().id("composer-attach-artwork").test_support().child(
+                                            Icon::default()
+                                                .data(include_bytes!("icons/paperclip.svg"))
+                                                .with_size(self.scaled(22.))
+                                                .text_color(self.tone(0x555b5c, 0xc8c4bd)),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("composer-model")
+                                    .role(Role::Button)
+                                    .aria_label("Choose model")
+                                    .test_support()
+                                    .relative()
+                                    .track_focus(&self.composer_action_focus[1])
+                                    .focus_visible(|style| {
+                                        style.border_color(self.tone(0x2356a8, 0x78baff))
+                                    })
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, window, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.show_modal(Modal::Model, window, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_modal(Modal::Model, window, cx);
+                                    }))
+                                    .max_w(self.scaled(160.))
+                                    .min_w(self.scaled(42.))
+                                    .h(self.scaled(32.))
+                                    .px(self.scaled(8.))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(model),
+                                    )
+                                    .child(self.picker_control_probe(true))
+                                    .child(div().flex_shrink_0().child("⌄")),
+                            )
+                            .child(
+                                div()
+                                    .id("composer-level")
+                                    .role(Role::Button)
+                                    .aria_label("Choose reasoning level")
+                                    .test_support()
+                                    .relative()
+                                    .track_focus(&self.composer_action_focus[2])
+                                    .focus_visible(|style| {
+                                        style.border_color(self.tone(0x2356a8, 0x78baff))
+                                    })
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, window, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.show_modal(Modal::Level, window, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_modal(Modal::Level, window, cx);
+                                    }))
+                                    .h(self.scaled(32.))
+                                    .max_w(self.scaled(112.))
+                                    .min_w(self.scaled(44.))
+                                    .px(self.scaled(8.))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(
+                                                selected_model
+                                                    .and_then(|selection| selection.variant)
+                                                    .unwrap_or_else(|| "Default".into()),
+                                            ),
+                                    )
+                                    .child(self.picker_control_probe(false))
+                                    .child(div().flex_shrink_0().child("⌄")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("composer-trailing-actions")
+                            .test_support()
                             .flex_shrink_0()
-                            .rounded_full()
-                            .bg(self.tone(0xc59535, 0xd29b52))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .text_color(self.tone(
-                                if can_send { 0x17130e } else { 0x7a5d29 },
-                                if can_send { 0x17130e } else { 0x815f35 },
-                            ))
+                            .gap(self.scaled(8.))
+                            .when(!compact, |footer| {
+                                footer.child(
+                                    div()
+                                        .id("composer-context-usage")
+                                        .test_support()
+                                        .whitespace_nowrap()
+                                        .text_size(self.scaled(11.))
+                                        .text_color(self.tone(0x858e8c, 0x899097))
+                                        .child(context),
+                                )
+                            })
+                            .when(
+                                running && window.viewport_size().width >= px(900.),
+                                |footer| {
+                                    footer.child(
+                                        div()
+                                            .whitespace_nowrap()
+                                            .text_size(self.scaled(10.))
+                                            .text_color(self.tone(0x858e8c, 0x899097))
+                                            .child("Ctrl+Enter to queue"),
+                                    )
+                                },
+                            )
+                            .when(running, |footer| {
+                                footer.child(
+                                    div()
+                                        .id("stop-run")
+                                        .role(Role::Button)
+                                        .aria_label("Stop current run")
+                                        .test_support()
+                                        .track_focus(&self.composer_action_focus[3])
+                                        .focus_visible(|style| {
+                                            style.border_color(self.tone(0x2356a8, 0x78baff))
+                                        })
+                                        .on_key_down(cx.listener(
+                                            |this, event: &KeyDownEvent, window, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.stop_active(cx);
+                                                    this.composer
+                                                        .focus_handle(cx)
+                                                        .focus(window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.stop_active(cx);
+                                            this.composer.focus_handle(cx).focus(window, cx);
+                                        }))
+                                        .w(self.scaled(32.))
+                                        .h(self.scaled(32.))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(self.tone(0x555b5c, 0x6b7176))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::default()
+                                                .data(include_bytes!("icons/stop.svg"))
+                                                .with_size(self.scaled(22.))
+                                                .text_color(self.tone(0x555b5c, 0xc8c4bd)),
+                                        ),
+                                )
+                            })
                             .child(
-                                Icon::default()
-                                    .data(include_bytes!("icons/send.svg"))
-                                    .with_size(self.scaled(22.)),
+                                div()
+                                    .id("send-prompt")
+                                    .role(Role::Button)
+                                    .aria_label("Send prompt")
+                                    .test_support()
+                                    .when(can_send, |button| {
+                                        button
+                                            .track_focus(&self.composer_action_focus[4])
+                                            .focus_visible(|style| {
+                                                style.border_color(self.tone(0x2356a8, 0x78baff))
+                                            })
+                                            .on_key_down(cx.listener(
+                                                |this, event: &KeyDownEvent, _, cx| {
+                                                    if matches!(
+                                                        event.keystroke.key.as_str(),
+                                                        "enter" | "space"
+                                                    ) {
+                                                        this.send_prompt(false, cx);
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.send_prompt(false, cx);
+                                            }))
+                                    })
+                                    .w(self.scaled(32.))
+                                    .h(self.scaled(32.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(self.tone(0xc59535, 0xd29b52))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(self.tone(
+                                        if can_send { 0x17130e } else { 0x7a5d29 },
+                                        if can_send { 0x17130e } else { 0x815f35 },
+                                    ))
+                                    .child(
+                                        Icon::default()
+                                            .data(include_bytes!("icons/send.svg"))
+                                            .with_size(self.scaled(22.)),
+                                    ),
                             ),
                     ),
             )
@@ -9446,6 +9525,9 @@ impl Client {
 
     fn modal_view(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal?;
+        let picker_panel_width = self
+            .scaled(if modal == Modal::Model { 368. } else { 268. })
+            .min((window.viewport_size().width - self.scaled(16.)).max(self.scaled(180.)));
         let picker_anchor = if matches!(modal, Modal::Model | Modal::Level) {
             let model = modal == Modal::Model;
             let sidebar = if self.sidebar_visible {
@@ -9453,16 +9535,17 @@ impl Client {
             } else {
                 0.
             };
-            let (button_center, panel_width) = if model {
-                (134., 368.)
+            let button_center = if model {
+                134.
             } else {
                 let compact = self.transcript_width(window) < self.scaled(400.);
-                (233. + if compact { 30. } else { 0. }, 268.)
+                233. + if compact { 30. } else { 0. }
             };
-            let panel_width = self.scaled(panel_width);
+            let panel_width = picker_panel_width;
             let margin = self.scaled(8.);
-            let target = self.scaled(sidebar + button_center);
-            let left = (target - px(if model { 184. } else { 129. }))
+            let target = self.picker_control_centers.borrow()[usize::from(!model)]
+                .unwrap_or_else(|| self.scaled(sidebar + button_center));
+            let left = (target - panel_width / 2.)
                 .max(margin)
                 .min((window.viewport_size().width - panel_width - margin).max(margin));
             let arrow = self.scaled(20.);
@@ -10461,7 +10544,7 @@ impl Client {
                     filter_levels(variants, &query).len()
                 };
                 let list = div()
-                    .w(self.scaled(if model { 368. } else { 268. }))
+                    .w(picker_panel_width)
                     // The GTK popup's external frame is 2px shorter for
                     // models and 4px taller for levels than the natural list.
                     .h(self
@@ -11078,6 +11161,8 @@ impl Render for Client {
                                             .role(Role::Button)
                                             .aria_label(if self.sidebar_visible {
                                                 "Hide sidebar"
+                                            } else if !self.can_open_sidebar(window) {
+                                                "Expand window to show sidebar"
                                             } else {
                                                 "Show sidebar"
                                             })
@@ -11088,21 +11173,19 @@ impl Render for Client {
                                             })
                                             .cursor_pointer()
                                             .on_key_down(cx.listener(
-                                                |this, event: &KeyDownEvent, _, cx| {
+                                                |this, event: &KeyDownEvent, window, cx| {
                                                     if matches!(
                                                         event.keystroke.key.as_str(),
                                                         "enter" | "space"
                                                     ) {
-                                                        this.toggle_sidebar(cx);
+                                                        this.toggle_sidebar(window, cx);
                                                         cx.stop_propagation();
                                                     }
                                                 },
                                             ))
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.toggle_sidebar(cx)
-                                                }),
-                                            )
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.toggle_sidebar(window, cx)
+                                            }))
                                             .child("◫"),
                                     ),
                             ),
@@ -11193,6 +11276,9 @@ fn client_window_options() -> WindowOptions {
         }),
         window_decorations: Some(WindowDecorations::Client),
         window_background: WindowBackgroundAppearance::Transparent,
+        // Keep separate model/level controls and pinned Send/Stop usable at
+        // maximum zoom; the height also leaves room for the zoomed picker.
+        window_min_size: Some(size(px(480.), px(480.))),
         ..TitleBar::window_options()
     }
 }
@@ -18613,9 +18699,11 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             let attach = window.find("attach-file").bounds();
+            let artwork = window.find("composer-attach-artwork").bounds();
             let model = window.find("composer-model").bounds();
             let level = window.find("composer-level").bounds();
             let send = window.find("send-prompt").bounds();
+            let toolbar = window.find("composer-toolbar").bounds();
             assert_eq!(attach.size, size(px(32.), px(32.)));
             assert_eq!(send.size, attach.size);
             assert_eq!(
@@ -18625,7 +18713,15 @@ mod tests {
             assert_eq!(level.origin.x - (model.origin.x + model.size.width), px(8.));
             assert_eq!(model.size.height, attach.size.height);
             assert_eq!(level.size.height, attach.size.height);
+            assert_eq!(model.origin.y, attach.origin.y);
+            assert_eq!(level.origin.y, attach.origin.y);
             assert_eq!(attach.origin.y, send.origin.y);
+            assert!((artwork.center().y - attach.center().y).abs() <= px(1.));
+            assert_eq!(attach.origin.y - toolbar.origin.y, px(7.));
+            assert_eq!(
+                toolbar.origin.y + toolbar.size.height - (attach.origin.y + attach.size.height),
+                px(7.)
+            );
 
             client.update(cx, |client, cx| {
                 client.select_session("ses_running".into());
@@ -18637,6 +18733,134 @@ mod tests {
             assert_eq!(stop.size, send.size);
             assert_eq!(stop.origin.y, send.origin.y);
             assert_eq!(send.origin.x - (stop.origin.x + stop.size.width), px(8.));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn composer_toolbar_keeps_separate_selectors_on_one_row_at_narrow_widths_and_zoom(
+        cx: &mut TestAppContext,
+    ) {
+        assert_eq!(
+            super::client_window_options().window_min_size,
+            Some(size(px(480.), px(480.)))
+        );
+        cx.update(gpui_kit::init);
+        let (handle, client) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Client::from_preview(window, cx, None))
+            })
+            .expect("headless composer window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            for width in [1200., 780., 500., 480.] {
+                window.resize(size(px(width), px(800.)));
+                window.bounds_changed(cx);
+                window.render_frame(cx);
+                let toolbar = window.find("composer-toolbar").bounds();
+                let leading = window.find("composer-leading-actions").bounds();
+                let trailing = window.find("composer-trailing-actions").bounds();
+                let attach = window.find("attach-file").bounds();
+                let artwork = window.find("composer-attach-artwork").bounds();
+                let model = window.find("composer-model").bounds();
+                let level = window.find("composer-level").bounds();
+                let send = window.find("send-prompt").bounds();
+                assert_eq!(attach.origin.y, model.origin.y, "{width}px model row");
+                assert_eq!(attach.origin.y, level.origin.y, "{width}px level row");
+                assert_eq!(attach.origin.y, send.origin.y, "{width}px send row");
+                assert!(
+                    (artwork.center().y - attach.center().y).abs() <= px(1.),
+                    "{width}px paperclip artwork"
+                );
+                assert!(
+                    level.origin.x + level.size.width <= trailing.origin.x,
+                    "{width}px selectors overlap trailing actions"
+                );
+                assert!(
+                    leading.origin.x + leading.size.width <= trailing.origin.x,
+                    "{width}px toolbar zones overlap"
+                );
+                assert!(
+                    model.size.width >= px(30.),
+                    "{width}px model target too small"
+                );
+                assert!(
+                    send.origin.x + send.size.width <= toolbar.origin.x + toolbar.size.width,
+                    "{width}px send escapes toolbar"
+                );
+            }
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            for _ in 0..6 {
+                window.press("ctrl-=", cx);
+            }
+            window.render_frame(cx);
+            let artwork = window.find("composer-attach-artwork").bounds();
+            let attach = window.find("attach-file").bounds();
+            let model = window.find("composer-model").bounds();
+            let level = window.find("composer-level").bounds();
+            let send = window.find("send-prompt").bounds();
+            let toolbar = window.find("composer-toolbar").bounds();
+            assert_eq!(attach.origin.y, model.origin.y);
+            assert_eq!(attach.origin.y, level.origin.y);
+            assert_eq!(attach.origin.y, send.origin.y);
+            assert!((artwork.center().y - attach.center().y).abs() <= px(2.));
+            assert!(
+                level.origin.x + level.size.width <= send.origin.x,
+                "zoomed selectors overlap Send"
+            );
+            assert!(
+                send.origin.x + send.size.width <= toolbar.origin.x + toolbar.size.width,
+                "zoomed Send escapes toolbar"
+            );
+            window.press("ctrl-b", cx);
+            assert!(
+                !client.read(cx).sidebar_visible,
+                "a manual sidebar reopen must not squeeze the toolbar offscreen"
+            );
+            client.update(cx, |client, cx| {
+                client.select_session("ses_running".into());
+                let mut selected = client.selected_model().expect("preview model");
+                selected.variant = Some("extraordinarily-long-reasoning-level".into());
+                let session = client
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == "ses_running")
+                    .expect("running preview session");
+                session.model = Some(model::SessionModel::from_selection(&selected));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let level = window.find("composer-level").bounds();
+            let stop = window.find("stop-run").bounds();
+            let send = window.find("send-prompt").bounds();
+            assert!(
+                level.origin.x + level.size.width <= stop.origin.x,
+                "zoomed running selectors overlap Stop"
+            );
+            assert_eq!(stop.origin.y, send.origin.y);
+            assert!(
+                send.origin.x + send.size.width <= toolbar.origin.x + toolbar.size.width,
+                "zoomed running Send escapes toolbar"
+            );
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-m", cx);
+            window.render_frame(cx);
+            let arrow = window.find("picker-arrow").bounds().center().x.as_f32();
+            let control = window.find("composer-model").bounds().center().x.as_f32();
+            assert!(
+                (arrow - control).abs() < 32.,
+                "narrow max-zoom model picker anchor: {arrow} vs {control}"
+            );
+            window.press("escape", cx);
+            client.read(cx).composer.focus_handle(cx).focus(window, cx);
+            window.press("ctrl-/", cx);
+            window.render_frame(cx);
+            let arrow = window.find("picker-arrow").bounds().center().x.as_f32();
+            let control = window.find("composer-level").bounds().center().x.as_f32();
+            assert!(
+                (arrow - control).abs() < 32.,
+                "narrow max-zoom level picker anchor: {arrow} vs {control}"
+            );
         })
         .unwrap();
     }
