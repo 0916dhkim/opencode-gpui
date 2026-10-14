@@ -18,6 +18,7 @@
 //! | `POST /api/session/{id}/model` | 204 | — |
 //! | `POST /api/session/{id}/prompt` | 200 | [`Data`]`<`[`InboxUser`]`>` |
 //! | `POST /api/session/{id}/interrupt` | 200 | bare [`Interrupted`] |
+//! | `POST /api/session/{id}/background` | 204 | — (no request body or location query) |
 //! | `GET /api/session/{id}/inbox` | 200 | [`Data`]`<Vec<`[`InboxEntry`]`>>` |
 //! | `PATCH /api/session/{id}/inbox/{inboxID}` | 204 | — |
 //! | `DELETE /api/session/{id}/inbox/{inboxID}` | 204 | — |
@@ -2439,6 +2440,10 @@ pub fn session_prompt_path(session_id: &str) -> String {
 
 pub fn session_interrupt_path(session_id: &str) -> String {
     format!("{}/interrupt", session_path(session_id))
+}
+
+pub fn session_background_path(session_id: &str) -> String {
+    format!("{}/background", session_path(session_id))
 }
 
 pub fn session_inbox_path(session_id: &str) -> String {

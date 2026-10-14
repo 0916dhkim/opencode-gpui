@@ -368,6 +368,9 @@ pub struct ChatMessage {
     segments: Vec<Segment>,
     error: Option<String>,
     context_tokens: Option<u64>,
+    /// Canonical assistant completion, also retained when no visible text
+    /// changes. Historical running tool states must not enable backgrounding.
+    completed: Option<u64>,
     /// An inbox item the server has not delivered yet. Queued messages stay
     /// after every delivered one, the way the server appends the entry only
     /// on delivery. Confirmed undelivered user prompts show in the tray
@@ -458,6 +461,7 @@ impl ChatMessage {
             segments: Vec::new(),
             error: None,
             context_tokens: None,
+            completed: None,
             queued: false,
             optimistic: false,
             needs_canonical_history: false,
@@ -729,6 +733,28 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// Public-wire approximation of the server's blocking-job registry.
+    /// Inspect only the latest assistant, never stale tools in older steps.
+    /// A completed tool with running metadata is already backgrounded.
+    pub fn has_backgroundable_tools(&self) -> bool {
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .filter(|message| message.completed.is_none())
+            .is_some_and(|message| {
+                message
+                    .segments
+                    .iter()
+                    .filter_map(|segment| segment.tool.as_ref())
+                    .any(|tool| {
+                        matches!(tool.name.as_str(), "shell" | "subagent" | "bash" | "task")
+                            && matches!(&tool.state, protocol::ToolState::Running { input, .. }
+                            if input.get("background").and_then(Value::as_bool) != Some(true))
+                    })
+            })
+    }
+
     pub fn cache_epoch(&self) -> u64 {
         self.cache_epoch
     }
@@ -965,6 +991,14 @@ impl Conversation {
                 let index = self.ensure_message(&data.assistant_message_id, Role::Assistant);
                 let message = &mut self.messages[index];
                 // A retried step restarts the same message.
+                // Replaying an old start onto completed history must not
+                // resurrect its foreground action.
+                if message
+                    .completed
+                    .is_some_and(|completed| millis(data.started) > completed)
+                {
+                    message.completed = None;
+                }
                 let had_error = message.error.is_some();
                 let old_created = message.created;
                 let has_timestamped_row = message.has_timestamped_row();
@@ -979,6 +1013,7 @@ impl Conversation {
             }
             Kind::StepEnded(data) => {
                 let index = self.ensure_message(&data.assistant_message_id, Role::Assistant);
+                self.messages[index].completed = Some(created);
                 if let Some(tokens) = usage_tokens(&data.tokens) {
                     self.messages[index].context_tokens = Some(tokens);
                 }
@@ -987,6 +1022,7 @@ impl Conversation {
             Kind::StepFailed(data) => {
                 let index = self.ensure_message(&data.assistant_message_id, Role::Assistant);
                 let message = &mut self.messages[index];
+                message.completed = Some(created);
                 if !is_interrupt(&data.error) {
                     let error = structured_error_text(&data.error);
                     if message.error.as_deref() != Some(error.as_str()) {
@@ -1954,6 +1990,7 @@ fn user_chat_message(
 fn assistant_message(message: &protocol::AssistantMessage) -> ChatMessage {
     ChatMessage {
         created: millis(message.time.created),
+        completed: message.time.completed.map(millis),
         segments: assistant_segments(&message.content),
         error: message
             .error
@@ -2045,6 +2082,14 @@ fn tool_segment(tool: &protocol::ToolCall) -> Segment {
         } => (
             if tool.name == "shell" {
                 shell_completion_label(metadata.as_ref())
+            } else if matches!(tool.name.as_str(), "subagent" | "task")
+                && metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("running")
+            {
+                "backgrounded"
             } else {
                 "completed"
             },
@@ -2537,6 +2582,101 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn background_entry(
+        id: &str,
+        name: &str,
+        status: &str,
+        background: bool,
+        completed: Option<u64>,
+    ) -> protocol::SessionMessage {
+        let input = if status == "streaming" {
+            json!("{}")
+        } else {
+            json!({ "background": background })
+        };
+        serde_json::from_value(json!({
+            "id": id, "type": "assistant", "agent": "build",
+            "time": { "created": 1, "completed": completed },
+            "content": [{ "type": "tool", "id": "call_bg", "name": name,
+                "time": { "created": 2, "ran": 3 },
+                "state": { "status": status, "input": input, "content": [],
+                    "metadata": { "status": "running", "shellID": "sh_bg", "sessionID": "ses_child" },
+                    "error": { "type": "test", "message": "failed" } } }]
+        })).unwrap()
+    }
+
+    #[test]
+    fn background_eligibility_uses_foreground_invocations_not_running_metadata() {
+        for (name, status, background, completed, expected) in [
+            ("shell", "running", false, None, true),
+            ("subagent", "running", false, None, true),
+            ("bash", "running", false, None, true),
+            ("task", "running", false, None, true),
+            ("read", "running", false, None, false),
+            ("shell", "streaming", false, None, false),
+            ("shell", "completed", false, None, false),
+            ("subagent", "completed", false, None, false),
+            ("shell", "error", false, None, false),
+            ("shell", "running", true, None, false),
+            ("shell", "running", false, Some(4), false),
+        ] {
+            let mut conversation = Conversation::default();
+            conversation.replace_from_api(
+                &[background_entry(
+                    "msg_bg", name, status, background, completed,
+                )],
+                None,
+            );
+            assert_eq!(
+                conversation.has_backgroundable_tools(),
+                expected,
+                "{name}/{status}/{background}/{completed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_eligibility_never_scans_stale_historical_tools() {
+        let old = background_entry("msg_old", "shell", "running", false, None);
+        for latest in [
+            background_entry("msg_latest", "shell", "running", false, Some(8)),
+            background_entry("msg_latest", "read", "running", false, None),
+        ] {
+            let mut conversation = Conversation::default();
+            conversation.replace_from_api(&[old.clone(), latest], None);
+            assert!(!conversation.has_backgroundable_tools());
+        }
+    }
+
+    #[test]
+    fn background_success_and_completed_steps_remove_eligibility() {
+        let entry = background_entry("msg_bg", "shell", "running", false, None);
+        let mut conversation = Conversation::default();
+        conversation.replace_from_api(std::slice::from_ref(&entry), None);
+        assert!(conversation.has_backgroundable_tools());
+        assert!(conversation.apply_event(&json!({ "id": "evt_bg_success", "type": "session.tool.success", "created": 5,
+            "data": { "sessionID": "ses_a", "assistantMessageID": "msg_bg", "id": "call_bg",
+                      "content": [], "executed": true, "metadata": { "status": "running", "shellID": "sh_bg" } } })));
+        assert!(
+            !conversation.has_backgroundable_tools(),
+            "handoff completed the invocation, not the process"
+        );
+        conversation.replace_from_api(&[entry], None);
+        assert!(conversation.apply_event(
+            &json!({ "id": "evt_bg_ended", "type": "session.step.ended", "created": 10,
+            "data": { "sessionID": "ses_a", "assistantMessageID": "msg_bg" } })
+        ));
+        assert!(!conversation.has_backgroundable_tools());
+        assert!(conversation.apply_event(
+            &json!({ "id": "evt_bg_started", "type": "session.step.started", "created": 1,
+            "data": { "sessionID": "ses_a", "assistantMessageID": "msg_bg", "started": 1 } })
+        ));
+        assert!(
+            !conversation.has_backgroundable_tools(),
+            "old start replay cannot resurrect a completed assistant"
+        );
+    }
 
     fn fixture_body(name: &str) -> Value {
         let path = format!(
@@ -3396,7 +3536,7 @@ mod tests {
         let rows = row_values(&conversation);
         assert_eq!(rows.len(), 5, "{rows:?}");
         assert_eq!(rows[0]["role"], "YOU");
-        assert_eq!(rows[1]["body"], "subagent · completed — Mock child task");
+        assert_eq!(rows[1]["body"], "subagent · backgrounded — Mock child task");
         assert_eq!(rows[1]["kind"], "tool");
         assert_eq!(rows[2]["body"], "Launched a background subagent.");
         assert!(

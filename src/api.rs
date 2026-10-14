@@ -116,6 +116,12 @@ pub enum Command {
     Abort {
         session_id: String,
     },
+    /// Releases every backgroundable job blocking this session. Does not
+    /// interrupt the jobs, recurse into children, or background future work.
+    Background {
+        request_id: u64,
+        session_id: String,
+    },
     /// Acts on one waiting inbox item (a tray row).
     Inbox {
         session_id: String,
@@ -273,6 +279,12 @@ pub enum UiEvent {
         session_id: String,
         result: Result<(), String>,
     },
+    Backgrounded {
+        request_id: u64,
+        session_id: String,
+        /// Acknowledgment only: an idle request is also a successful no-op.
+        result: Result<(), String>,
+    },
     InboxSettled {
         session_id: String,
         inbox_id: String,
@@ -358,6 +370,9 @@ impl ApiHandle {
         if std::env::var("OPENCODE_PREVIEW_HISTORY_PAGES").as_deref() == Ok("1") {
             preview.enable_paged_history();
         }
+        if std::env::var("OPENCODE_PREVIEW_BACKGROUND").as_deref() == Ok("1") {
+            preview.enable_foreground_tools();
+        }
         let state = Arc::new(Mutex::new(preview));
         spawn_preview_worker(refresh_receiver, ui_sender.clone(), state.clone());
         spawn_preview_worker(interaction_receiver, ui_sender.clone(), state.clone());
@@ -393,7 +408,9 @@ impl ApiHandle {
             | Command::SelectModel { .. }
             | Command::SendPrompt { .. } => &self.interaction_commands,
             Command::Abort { .. } => &self.abort_commands,
-            Command::ReplyPermission { .. }
+            // A slow background request must not queue Stop behind it.
+            Command::Background { .. }
+            | Command::ReplyPermission { .. }
             | Command::CancelForm { .. }
             | Command::Inbox { .. } => &self.urgent_commands,
         };
@@ -1035,6 +1052,19 @@ impl Api {
         Ok(interrupted.interrupted)
     }
 
+    fn background(&self, session_id: &str) -> Result<()> {
+        // This session-scoped endpoint resolves the persisted location itself.
+        // Its 204 has no JSON payload, and the POST carries no body at all.
+        self.request(
+            Method::POST,
+            self.url(&protocol::session_background_path(session_id), &[])?,
+        )
+        .send()
+        .context("background request failed")
+        .and_then(expect_success)
+        .map(|_| ())
+    }
+
     /// One tray action on a waiting inbox item. A declared 409 (the item is
     /// no longer waiting in the other mode) or 404 is
     /// [`Settled::AlreadyResolved`]; the caller reconciles with the inbox.
@@ -1119,6 +1149,15 @@ fn spawn_preview_worker(
 ) {
     thread::spawn(move || {
         while let Ok(command) = commands.recv_blocking() {
+            if matches!(&command, Command::Background { .. }) {
+                let delay = std::env::var("OPENCODE_PREVIEW_BACKGROUND_DELAY_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if delay > 0 {
+                    thread::sleep(Duration::from_millis(delay));
+                }
+            }
             let history_delay = if matches!(&command, Command::LoadMessages { cursor: None, .. }) {
                 std::env::var("OPENCODE_PREVIEW_HISTORY_DELAY_MS")
                     .ok()
@@ -1129,7 +1168,21 @@ fn spawn_preview_worker(
             };
             let (event, server_events) = {
                 let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-                let event = state.handle(command);
+                let event = match command {
+                    Command::Background {
+                        request_id,
+                        session_id,
+                    } if std::env::var("OPENCODE_PREVIEW_BACKGROUND_FAIL").as_deref()
+                        == Ok("1") =>
+                    {
+                        UiEvent::Backgrounded {
+                            request_id,
+                            session_id,
+                            result: Err("Preview: background request unavailable".into()),
+                        }
+                    }
+                    command => state.handle(command),
+                };
                 (event, state.take_server_events())
             };
             if history_delay > 0 {
@@ -1230,6 +1283,14 @@ fn spawn_command_worker(api: Api, commands: Receiver<Command>, ui: Sender<UiEven
                     let result = api.abort(&session_id).map(|_| ()).map_err(format_error);
                     UiEvent::Aborted { session_id, result }
                 }
+                Command::Background {
+                    request_id,
+                    session_id,
+                } => UiEvent::Backgrounded {
+                    request_id,
+                    result: api.background(&session_id).map_err(format_error),
+                    session_id,
+                },
                 Command::Inbox {
                     session_id,
                     inbox_id,
@@ -1643,6 +1704,7 @@ mod tests {
     struct HttpRequest {
         line: String,
         body: String,
+        headers: HashMap<String, String>,
     }
 
     impl HttpRequest {
@@ -1672,16 +1734,18 @@ mod tests {
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
         let mut content_length = 0;
+        let mut headers = HashMap::new();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             if line == "\r\n" || line == "\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                content_length = value.trim().parse().unwrap();
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
             }
         }
         let mut body = vec![0; content_length];
@@ -1689,6 +1753,7 @@ mod tests {
         HttpRequest {
             line: request_line.trim_end().to_owned(),
             body: String::from_utf8(body).unwrap(),
+            headers,
         }
     }
 
@@ -1722,6 +1787,80 @@ mod tests {
 
     fn ok(body: Value) -> (u16, String) {
         (200, body.to_string())
+    }
+
+    #[test]
+    fn background_posts_without_body_or_location_and_accepts_empty_204() {
+        let (base, captured, server) = serve(2, |_| (204, String::new()));
+        let api = Api::new(config(format!("{base}/proxy/"), Some("unit-only"))).unwrap();
+        api.background("ses_target").unwrap();
+        api.background("ses_target").unwrap(); // idle/already-backgrounded is also 204
+        server.join().unwrap();
+        for request in captured.lock().unwrap().iter() {
+            assert_eq!(
+                request.line,
+                "POST /proxy/api/session/ses_target/background HTTP/1.1"
+            );
+            assert!(request.body.is_empty());
+            assert!(request.query().is_empty());
+            assert!(!request.headers.contains_key("content-type"));
+            assert!(
+                request
+                    .headers
+                    .get("authorization")
+                    .is_some_and(|value| value.starts_with("Basic "))
+            );
+        }
+    }
+
+    #[test]
+    fn background_worker_preserves_the_originating_session_and_request_id() {
+        let (base, captured, server) = serve(1, |_| (204, String::new()));
+        let (sender, commands) = async_channel::unbounded();
+        let (ui, events) = async_channel::unbounded();
+        spawn_command_worker(Api::new(config(base, None)).unwrap(), commands, ui);
+        sender
+            .send_blocking(Command::Background {
+                request_id: 42,
+                session_id: "ses_original".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(events.recv_blocking().unwrap(), UiEvent::Backgrounded {
+            request_id: 42, session_id, result: Ok(())
+        } if session_id == "ses_original")
+        );
+        server.join().unwrap();
+        assert_eq!(
+            captured.lock().unwrap()[0].path(),
+            "/api/session/ses_original/background"
+        );
+    }
+
+    #[test]
+    fn background_http_failures_are_not_successful_handoffs() {
+        let (base, _, server) = serve(4, |request| {
+            let status = if request.path().contains("401") {
+                401
+            } else if request.path().contains("500") {
+                500
+            } else if request.path().contains("400") {
+                400
+            } else {
+                404
+            };
+            (
+                status,
+                json!({ "_tag": "SessionNotFoundError", "message": "Background denied" })
+                    .to_string(),
+            )
+        });
+        let api = Api::new(config(base, None)).unwrap();
+        for status in [400, 401, 404, 500] {
+            let error = api.background(&format!("ses_{status}")).unwrap_err();
+            assert!(format_error(error).contains("Background denied"));
+        }
+        server.join().unwrap();
     }
 
     fn session_json(id: &str, directory: &str, title: &str, updated: i64) -> Value {

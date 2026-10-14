@@ -195,6 +195,81 @@ impl State {
         self.paged_history = true;
     }
 
+    /// Opt-in visual fixture for the background action. Existing jobs remain
+    /// the same three rows before and after the foreground handoff.
+    pub fn enable_foreground_tools(&mut self) {
+        self.busy.insert(ACTIVE_ID.to_owned());
+        self.messages.entry(ACTIVE_ID.to_owned()).or_default().extend([
+            user_text("msg_foreground_user", CREATED + 65_000, "Continue without waiting for these tasks."),
+            entry(json!({
+                "id": "msg_foreground_assistant", "type": "assistant",
+                "time": { "created": CREATED + 70_000 }, "agent": "build",
+                "content": [
+                    { "type": "tool", "id": "call_foreground_shell", "name": "shell",
+                      "state": { "status": "running", "input": { "command": "pnpm dev --port 5173", "background": false },
+                                 "metadata": { "shellID": "sh_preview_dev" } },
+                      "time": { "created": CREATED + 70_000, "ran": CREATED + 70_000 } },
+                    { "type": "tool", "id": "call_foreground_child", "name": "subagent",
+                      "state": { "status": "running", "input": { "description": "Audit v1 call sites" },
+                                 "metadata": { "sessionID": CHILD_ID, "status": "running" } },
+                      "time": { "created": CREATED + 70_001, "ran": CREATED + 70_001 } }
+                ]
+            })),
+        ]);
+    }
+
+    fn background_tools(&mut self, session_id: &str) -> Result<(), String> {
+        if !self.sessions.iter().any(|session| session.id == session_id) {
+            return Err("Session not found".into());
+        }
+        let mut events = Vec::new();
+        if let Some(protocol::SessionMessage::Assistant(assistant)) =
+            self.messages.get_mut(session_id).and_then(|messages| {
+                messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| matches!(message, protocol::SessionMessage::Assistant(_)))
+            })
+            && assistant.time.completed.is_none()
+        {
+            for content in &mut assistant.content {
+                let protocol::AssistantContent::Tool(tool) = content else {
+                    continue;
+                };
+                if !matches!(tool.name.as_str(), "shell" | "subagent" | "bash" | "task") {
+                    continue;
+                }
+                let protocol::ToolState::Running { input, metadata } = &tool.state else {
+                    continue;
+                };
+                if input.get("background").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                let mut metadata = metadata.clone();
+                metadata.insert("status".into(), json!("running"));
+                let content = vec![protocol::ToolContent::Text {
+                    text: "Continues in background".into(),
+                }];
+                // Mirror the wire-shaped event below; the fixture's process
+                // and child remain in its jobs list.
+                tool.state = protocol::ToolState::Completed {
+                    input: input.clone(),
+                    content,
+                    metadata: Some(metadata.clone()),
+                };
+                tool.time.completed = Some(CREATED as protocol::Millis + 80_000);
+                events.push((assistant.id.clone(), tool.id.clone(), metadata));
+            }
+        }
+        for (assistant, id, metadata) in events {
+            self.push_event(session_id, CREATED + 80_000, "session.tool.success", json!({
+                "assistantMessageID": assistant, "id": id, "executed": true,
+                "content": [{ "type": "text", "text": "Continues in background" }], "metadata": metadata,
+            }));
+        }
+        Ok(())
+    }
+
     pub fn handle(&mut self, command: Command) -> UiEvent {
         match command {
             Command::Bootstrap { .. } => UiEvent::Bootstrap(Ok(self.bootstrap())),
@@ -291,6 +366,14 @@ impl State {
                     result: Ok(()),
                 }
             }
+            Command::Background {
+                request_id,
+                session_id,
+            } => UiEvent::Backgrounded {
+                request_id,
+                result: self.background_tools(&session_id),
+                session_id,
+            },
             Command::Inbox {
                 session_id,
                 inbox_id,
@@ -1042,6 +1125,90 @@ fn parked_messages() -> Vec<protocol::SessionMessage> {
 mod tests {
     use super::*;
     use crate::model::Conversation;
+
+    #[test]
+    fn background_handoff_releases_foreground_tools_without_stopping_jobs() {
+        let mut state = State::new();
+        state.enable_foreground_tools();
+        let mut conversation = Conversation::default();
+        conversation.replace_from_api(&state.message_page(ACTIVE_ID, None).messages, None);
+        assert!(conversation.has_backgroundable_tools());
+        let before = state.bootstrap();
+        assert!(matches!(
+            state.handle(Command::Background {
+                request_id: 7,
+                session_id: ACTIVE_ID.into()
+            }),
+            UiEvent::Backgrounded {
+                request_id: 7,
+                result: Ok(()),
+                ..
+            }
+        ));
+        let events = state.take_server_events();
+        assert_eq!(
+            events.len(),
+            2,
+            "one request backgrounds both foreground tools"
+        );
+        for event in events {
+            let UiEvent::ServerEvent(envelope) = event else {
+                panic!("expected tool success");
+            };
+            assert!(conversation.apply_event(&envelope.payload));
+        }
+        assert!(!conversation.has_backgroundable_tools());
+        assert!(
+            conversation
+                .transcript_rows()
+                .join("\n")
+                .contains("subagent · backgrounded")
+        );
+        let after = state.bootstrap();
+        // Canned snapshots re-anchor elapsed times to the current clock.
+        // Compare process identity/ownership, not those moving timestamps.
+        let identities = |snapshot: &ShellSnapshot| {
+            snapshot
+                .shells
+                .iter()
+                .map(|job| {
+                    (
+                        job.id.clone(),
+                        job.command.clone(),
+                        job.session_id.clone(),
+                        job.directory.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            identities(&before.shells),
+            identities(&after.shells),
+            "processes are not stopped or duplicated"
+        );
+        assert_eq!(before.shells.terminal, after.shells.terminal);
+        assert_eq!(before.statuses, after.statuses, "agent and child continue");
+        conversation.replace_from_api(&state.message_page(ACTIVE_ID, None).messages, None);
+        assert!(
+            !conversation.has_backgroundable_tools(),
+            "history preserves handoff metadata"
+        );
+        state.handle(Command::Background {
+            request_id: 8,
+            session_id: ACTIVE_ID.into(),
+        });
+        assert!(
+            state.take_server_events().is_empty(),
+            "repeated request is an acknowledged no-op"
+        );
+        assert!(matches!(
+            state.handle(Command::Background {
+                request_id: 9,
+                session_id: "ses_missing".into()
+            }),
+            UiEvent::Backgrounded { result: Err(_), .. }
+        ));
+    }
 
     #[test]
     fn bootstrap_opens_a_representative_session() {

@@ -1,5 +1,6 @@
 //! OpenCode v2 state and transport, independent of the desktop UI toolkit.
 pub mod api;
+pub mod background;
 pub mod credentials;
 pub mod jobs;
 pub mod model;

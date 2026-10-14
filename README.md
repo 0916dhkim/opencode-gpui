@@ -6,6 +6,14 @@ The prototype currently renders a session sidebar, transcript, composer, model a
 
 ## Building & Running
 
+### Send foreground tasks to background
+
+The shallow-detour icon beside **BACKGROUND** offers **Continue without waiting** when the active session has a running foreground shell/subagent invocation. It backgrounds all eligible tools blocking that session; the processes and child sessions keep running, the job count is unchanged, and the agent can continue. Already-backgrounded jobs, inbox delivery modes and the composer are not changed. The public running-tool predicate is approximate, so a task that finishes or has not yet entered its blocking wait can produce a harmless no-op.
+
+**Ctrl+Shift+B** invokes the same action with the sidebar hidden. The icon is keyboard-focusable with Enter/Space activation, has a tooltip, and becomes a disabled spinner while the request is pending. Errors appear in the session's sidebar panel and leave the task states untouched for retry. The button disappears when canonical events/history no longer show eligible tools, not just because HTTP returned 204.
+
+For an isolated interactive preview, use `OPENCODE_PREVIEW_BACKGROUND=1 cargo run -- --preview-api`. The optional preview-only `OPENCODE_PREVIEW_BACKGROUND_DELAY_MS` and `OPENCODE_PREVIEW_BACKGROUND_FAIL=1` expose pending/error states for targeted visual inspection.
+
 ### Dependencies
 
 Requires Rust 1.93+ (Rust 2024 edition) and Linux graphics development libraries for GPUI Kit (Wayland/X11, Vulkan and fontconfig). The repository Dockerfile contains an amd64 development/test environment; it is not a minimal runtime image.

@@ -15,6 +15,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar, VirtualListScrollHandle, v_virtual_list,
 };
@@ -23,6 +24,7 @@ use gpui_kit::*;
 use gpui_kit::{Animation, Transformation, percentage};
 use opencode_gpui::{
     api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ServerEnvelope, UiEvent},
+    background,
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
     jobs::{self, JobKind, JobRow, Jobs},
     model::{
@@ -600,6 +602,8 @@ struct Client {
     offline_busy: HashSet<String>,
     statuses: HashMap<String, RunStatus>,
     jobs: Vec<JobRow>,
+    background_requests: background::Requests,
+    background_focus: FocusHandle,
     terminal_shells: HashMap<String, protocol::ShellExited>,
     desktop_notifications: Option<DesktopNotifications>,
     notification_targets: HashMap<String, String>,
@@ -2651,6 +2655,8 @@ impl Client {
             offline_busy: HashSet::new(),
             statuses: HashMap::new(),
             jobs: Vec::new(),
+            background_requests: background::Requests::default(),
+            background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
             desktop_notifications: None,
             notification_targets: HashMap::new(),
@@ -3444,6 +3450,7 @@ impl Client {
             }
         }
         self.composers.remove(id);
+        self.background_requests.remove(id);
         self.attachment_drafts.remove(id);
         self.pending_prompts.remove(id);
         self.failed_prompt_drafts.remove(id);
@@ -3847,6 +3854,7 @@ impl Client {
         self.attachments_draft.clear();
         self.attachment_drafts.clear();
         self.pending_prompts.clear();
+        self.background_requests.clear();
         self.prune_owned_pastes();
         self.model_switches.clear();
         self.failed_prompt_drafts.clear();
@@ -4476,6 +4484,12 @@ impl Client {
         }
         if key == "b" && !modifiers.shift {
             self.toggle_sidebar(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if key == "b" && modifiers.shift && self.modal.is_none() {
+            let session = self.active.clone();
+            self.send_to_background(&session, cx);
             cx.stop_propagation();
             return;
         }
@@ -6046,6 +6060,22 @@ impl Client {
             } => {
                 self.connection_status = format!("Stop failed: {error}");
             }
+            UiEvent::Backgrounded {
+                request_id,
+                session_id,
+                result,
+            } => {
+                let accepted = result.is_ok();
+                if self
+                    .background_requests
+                    .finish(&session_id, request_id, result)
+                    && accepted
+                {
+                    // No optimistic tool completion or job removal: 204 can
+                    // be a no-op. SSE and canonical history determine state.
+                    self.request_newest(&session_id);
+                }
+            }
             UiEvent::SessionInfoLoaded(info) => {
                 for (_, result) in &info {
                     if let Ok(session) = result
@@ -6117,6 +6147,7 @@ impl Client {
                             self.model_switches.remove(&id);
                             self.open_tabs.retain(|tab| tab != &id);
                             self.conversations.remove(&id);
+                            self.background_requests.remove(&id);
                             self.transcript.remove(&id);
                             self.transcript_spans.remove(&id);
                             self.attachments.remove_session(&id);
@@ -6487,6 +6518,8 @@ impl Client {
             offline_busy: HashSet::new(),
             statuses: bootstrap.statuses,
             jobs,
+            background_requests: background::Requests::default(),
+            background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
             desktop_notifications: None,
             notification_targets: HashMap::new(),
@@ -7154,6 +7187,90 @@ impl Client {
         )
     }
 
+    fn can_background(&self, session: &str) -> bool {
+        self.api.is_some()
+            && !self.disconnected
+            && !self.loading_messages.contains_key(session)
+            && self.statuses.get(session).is_some_and(RunStatus::is_busy)
+            && self
+                .conversations
+                .get(session)
+                .is_some_and(Conversation::has_backgroundable_tools)
+    }
+
+    fn send_to_background(&mut self, session: &str, cx: &mut Context<Self>) {
+        if session != self.active || self.modal.is_some() || !self.can_background(session) {
+            return;
+        }
+        let Some(request_id) = self.background_requests.begin(session) else {
+            return;
+        };
+        if let Some(api) = &self.api {
+            api.send(Command::Background {
+                request_id,
+                session_id: session.to_owned(),
+            });
+        }
+        cx.notify();
+    }
+
+    fn background_control(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let pending = self.background_requests.pending(&self.active);
+        if !pending && !self.can_background(&self.active) {
+            return None;
+        }
+        let session = self.active.clone();
+        let label = if pending {
+            "Sending tasks to background…"
+        } else {
+            "Continue without waiting — send foreground tasks to background"
+        };
+        let glyph = if pending {
+            Icon::default()
+                .data(include_bytes!("icons/spinner.svg"))
+                .with_size(px(20.))
+                .with_animation(
+                    format!("background-pending-{}", self.active),
+                    Animation::new(Duration::from_secs(1)).repeat(),
+                    |icon, phase| icon.transform(Transformation::rotate(percentage(phase))),
+                )
+                .into_any_element()
+        } else {
+            Icon::default()
+                .data(include_bytes!("icons/send-to-background.svg"))
+                .with_size(px(20.))
+                .into_any_element()
+        };
+        Some(
+            BaseButton::new("send-to-background")
+                .accessibility_label(label)
+                .track_focus(&self.background_focus)
+                .disabled(pending)
+                .size(px(32.))
+                .flex_shrink_0()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(rgba(0x00000000))
+                .text_color(self.tone(0x485250, 0xe2e6e4))
+                .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                .when(!pending, |button| button
+                    .cursor_pointer()
+                    .hover(|style| style.bg(self.tone(0xe3e0da, 0x22262a))))
+                .tooltip(move |window, cx| {
+                    Tooltip::new(if pending {
+                        "Sending tasks to background…"
+                    } else {
+                        "Continue without waiting (Ctrl+Shift+B)\nForeground tasks keep running in the background."
+                    }).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.send_to_background(&session, cx);
+                }))
+                .child(glyph)
+                .into_any_element(),
+        )
+    }
+
     fn sidebar(&self, floating: bool, cx: &Context<Self>) -> AnyElement {
         let mut tabs = div()
             .flex()
@@ -7206,10 +7323,15 @@ impl Client {
             .gap(px(8.))
             .border_t_1()
             .border_color(self.tone(0xc8c3ba, 0x24282c));
-        if !self.jobs.is_empty() {
+        let background_control = self.background_control(cx);
+        let show_jobs = !self.jobs.is_empty()
+            || background_control.is_some()
+            || self.background_requests.error(&self.active).is_some();
+        if show_jobs {
             let now = wall_clock_millis();
             jobs_panel = jobs_panel.child(
                 div()
+                    .relative()
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -7224,8 +7346,24 @@ impl Client {
                             .bg(self.tone(0xe4ddd0, 0x1c242b))
                             .text_color(self.tone(0x5c4a2e, 0xd7c4a3))
                             .child(self.jobs.len().to_string()),
-                    ),
+                    )
+                    // The hit target extends into the existing padding instead
+                    // of growing the header and moving all task rows.
+                    .when_some(background_control, |header, control| {
+                        header.child(div().absolute().right(px(-6.)).top(px(-8.)).child(control))
+                    }),
             );
+            if let Some(error) = self.background_requests.error(&self.active) {
+                jobs_panel = jobs_panel.child(
+                    div()
+                        .id("background-error")
+                        .role(Role::Label)
+                        .aria_label(format!("Send to back failed: {error}"))
+                        .text_size(px(11.))
+                        .text_color(self.tone(0xb84b45, 0xe79b96))
+                        .child(format!("Send to back failed: {error}")),
+                );
+            }
             for job in &self.jobs {
                 let shell = job.kind == JobKind::Shell;
                 let (label, elapsed) = job.subtitle_parts(now);
@@ -7331,7 +7469,7 @@ impl Client {
             )
             .child(tabs)
             .child(div().flex_1())
-            .when(!self.jobs.is_empty(), |sidebar| sidebar.child(jobs_panel))
+            .when(show_jobs, |sidebar| sidebar.child(jobs_panel))
             .child(
                 div()
                     .p(self.scaled(14.))
@@ -11167,6 +11305,24 @@ impl Render for Client {
                             .when_some(self.transcript_indicator(cx), |view, pill| view.child(pill))
                             .when_some(self.form_notice(cx), |view, notice| view.child(notice))
                             .when_some(self.tray_view(cx), |view, tray| view.child(tray))
+                            .when(!self.sidebar_visible, |view| {
+                                view.when_some(
+                                    self.background_requests.error(&self.active),
+                                    |view, error| {
+                                        view.child(
+                                            div()
+                                                .id("background-error-hidden")
+                                                .role(Role::Label)
+                                                .aria_label(format!("Send to back failed: {error}"))
+                                                .mx(px(16.))
+                                                .mb(px(6.))
+                                                .text_size(px(11.))
+                                                .text_color(self.tone(0xb84b45, 0xe79b96))
+                                                .child(format!("Send to back failed: {error}")),
+                                        )
+                                    },
+                                )
+                            })
                             .when_some(self.resume_warning(cx), |view, warning| {
                                 view.child(
                                     div()

@@ -392,6 +392,28 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == hover-close ]]; then
   xdotool mousemove --window "$win" 245 110
 fi
 sleep 6
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == background-* ]]; then
+  # Agent-directed inspection only. The foreground fixture is opt-in through
+  # OPENCODE_PREVIEW_BACKGROUND=1 and PREVIEW_API=1; no GUI suite is added.
+  background_y="${BACKGROUND_Y:-$((window_h - 240))}"
+  case "$INTERACTION" in
+    background-hover)
+      xdotool mousemove --window "$win" 250 "$background_y"
+      sleep 1
+      ;;
+    background-click|background-pending|background-error)
+      xdotool mousemove --window "$win" 250 "$background_y" click 1
+      xdotool mousemove --window "$win" 140 400
+      sleep 0.8
+      ;;
+    background-shortcut-hidden)
+      xdotool mousemove --window "$win" 410 680 click 1
+      xdotool key ctrl+b
+      xdotool key ctrl+shift+b
+      sleep 0.8
+      ;;
+  esac
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == composer-lines ]]; then
   # Scroll after settling so a transient native scrollbar is visible in the
   # capture. Optional coordinates also allow a targeted thumb-drag inspection.
