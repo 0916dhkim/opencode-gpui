@@ -7228,7 +7228,7 @@ impl Client {
         let glyph = if pending {
             Icon::default()
                 .data(include_bytes!("icons/spinner.svg"))
-                .with_size(px(20.))
+                .with_size(self.scaled(20.))
                 .with_animation(
                     format!("background-pending-{}", self.active),
                     Animation::new(Duration::from_secs(1)).repeat(),
@@ -7238,7 +7238,7 @@ impl Client {
         } else {
             Icon::default()
                 .data(include_bytes!("icons/send-to-background.svg"))
-                .with_size(px(20.))
+                .with_size(self.scaled(20.))
                 .into_any_element()
         };
         Some(
@@ -7246,7 +7246,9 @@ impl Client {
                 .accessibility_label(label)
                 .track_focus(&self.background_focus)
                 .disabled(pending)
-                .size(px(32.))
+                // Keep the header's vertical hit target stable while the artwork zooms.
+                .w(self.scaled(32.))
+                .h(px(32.))
                 .flex_shrink_0()
                 .rounded(px(4.))
                 .border_1()
