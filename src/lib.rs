@@ -3,6 +3,7 @@ pub mod api;
 pub mod background;
 pub mod credentials;
 pub mod jobs;
+pub mod latency;
 pub mod model;
 pub mod notifications;
 pub mod pending;

@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use gpui_kit::base::{
@@ -27,6 +27,7 @@ use opencode_gpui::{
     background,
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
     jobs::{self, JobKind, JobRow, Jobs},
+    latency::{self, Action as TraceAction, Operation as TraceOperation},
     model::{
         self, Conversation, ModelCatalog, ModelSelection, Project, RunStatus, Session,
         SessionModel, TranscriptRow, TranscriptRowKey, TranscriptRowKind,
@@ -513,7 +514,77 @@ fn may_open_link(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto"))
 }
 
+#[derive(Default)]
+struct LatencyCapture {
+    collector: Option<Rc<RefCell<profiler::journal::ForegroundJournalCollector>>>,
+    task: Option<Task<()>>,
+    window_id: Option<WindowId>,
+    saving: bool,
+    report: Option<PathBuf>,
+    failed: Option<latency::Report>,
+    copied: bool,
+}
+
+impl Drop for LatencyCapture {
+    fn drop(&mut self) {
+        self.task.take();
+        if self.collector.is_some() {
+            // Deliberate Stop is needed for export; never leave probes enabled.
+            latency::global().stop();
+        }
+    }
+}
+
+fn collect_latency(
+    collector: &mut profiler::journal::ForegroundJournalCollector,
+    window: WindowId,
+) {
+    let _latency = latency::global().span(TraceOperation::TraceCollect, 1);
+    use profiler::journal::{
+        ForegroundEvent as E, ForegroundJournalEntry as J, IntervalBoundary as B,
+    };
+    let trace = latency::global();
+    for entry in collector.collect_unseen().entries {
+        match entry {
+            J::Discontinuity { lost } => trace.gap(lost),
+            J::Event(E::Input(input)) => {
+                let action = match input.kind {
+                    "key_down" => TraceAction::Key,
+                    "mouse_up" => TraceAction::Pointer,
+                    "scroll_wheel" => TraceAction::Scroll,
+                    _ => continue,
+                };
+                trace.dispatch(input.start, input.end, action, input.caused_invalidation);
+            }
+            J::Event(E::Draw(frame)) if frame.window_id == window => {
+                trace.draw(
+                    frame.draw_start,
+                    frame.draw_end,
+                    frame.invalidations,
+                    frame.dirty_at,
+                );
+            }
+            J::Boundary(B::Presented(frame)) if frame.frame.window_id == window => {
+                trace.submitted(
+                    frame.frame.draw_start,
+                    frame.frame.draw_end,
+                    frame.presentation.present_start,
+                    frame.presentation.present_end,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn trace_input(action: TraceAction, cx: &mut App) {
+    if let Some(token) = latency::global().input(action) {
+        cx.defer(move |_| latency::global().dispatched(token));
+    }
+}
+
 struct Client {
+    latency: LatencyCapture,
     dark: bool,
     api: Option<ApiHandle>,
     preview_api: bool,
@@ -1528,6 +1599,7 @@ impl Element for TranscriptMeasurementProbe {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let _latency = latency::global().span(TraceOperation::RowMeasure, self.rows.len());
         if let Some((loading, control)) = &mut self.load {
             let height = control
                 .layout_as_root(
@@ -1775,6 +1847,7 @@ fn permission_metadata(text: String, dark: bool) -> AnyElement {
 }
 
 fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
+    let _latency = latency::global().span(TraceOperation::MarkdownParse, source.len());
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut list_depth = 0;
@@ -2165,6 +2238,7 @@ fn simple_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
 }
 
 fn inline_image(url: &str) -> Option<Arc<Image>> {
+    let _latency = latency::global().span(TraceOperation::ImagePrepare, url.len());
     let (metadata, encoded) = url.strip_prefix("data:")?.split_once(',')?;
     let format = match metadata {
         "image/png;base64" => ImageFormat::Png,
@@ -2188,6 +2262,144 @@ fn inline_image(url: &str) -> Option<Arc<Image>> {
 }
 
 impl Client {
+    fn toggle_latency_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.latency.saving {
+            return;
+        }
+        if latency::global().enabled() {
+            self.latency.task.take();
+            if let (Some(collector), Some(window_id)) =
+                (self.latency.collector.take(), self.latency.window_id.take())
+            {
+                collect_latency(&mut collector.borrow_mut(), window_id);
+            }
+            if let Some(report) = latency::global().stop() {
+                self.save_latency_report(report, cx);
+            }
+        } else if let Some(report) = self.latency.failed.take() {
+            self.save_latency_report(report, cx);
+        } else {
+            latency::global().start();
+            self.latency.report = None;
+            self.latency.copied = false;
+            let window_id = window.window_handle().window_id();
+            let collector = Rc::new(RefCell::new(cx.foreground_journal().collector()));
+            self.latency.collector = Some(collector.clone());
+            self.latency.window_id = Some(window_id);
+            let bg = cx.background_executor().clone();
+            self.latency.task = Some(cx.spawn(async move |_, _| {
+                loop {
+                    let due = Instant::now() + latency::PROBE_INTERVAL;
+                    let worker = bg.clone();
+                    // Awaiting one worker is single-flight even during a long UI stall.
+                    let posted = bg
+                        .spawn(async move {
+                            worker.timer(latency::PROBE_INTERVAL).await;
+                            Instant::now()
+                        })
+                        .await;
+                    if !latency::global().enabled() {
+                        break;
+                    }
+                    latency::global().probe(due, posted, Instant::now());
+                    collect_latency(&mut collector.borrow_mut(), window_id);
+                    // No notify, refresh, window update or next-frame callback here.
+                }
+            }));
+        }
+        cx.notify();
+    }
+
+    fn save_latency_report(&mut self, report: latency::Report, cx: &mut Context<Self>) {
+        self.latency.saving = true;
+        let worker = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = worker
+                .spawn(async move {
+                    let directory = dirs::data_local_dir()
+                        .unwrap_or_else(std::env::temp_dir)
+                        .join("opencode-gpui/diagnostics");
+                    match report.write(&directory) {
+                        Ok(path) => Ok(path),
+                        Err(_) => Err(report),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.latency.saving = false;
+                match result {
+                    Ok(path) => this.latency.report = Some(path),
+                    Err(report) => this.latency.failed = Some(report),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn latency_controls(&self, cx: &Context<Self>) -> AnyElement {
+        let recording = latency::global().enabled();
+        let label = if self.latency.saving {
+            "Saving lag report…"
+        } else if recording {
+            "Stop lag capture"
+        } else if self.latency.failed.is_some() {
+            "Retry saving lag report"
+        } else {
+            "Record lag"
+        };
+        let mut view = div().flex().flex_col().gap(self.scaled(5.)).child(
+            BaseButton::new("latency-capture")
+                .accessibility_label(label)
+                .h(self.scaled(21.))
+                .line_height(self.scaled(16.))
+                .justify_start()
+                .disabled(self.latency.saving)
+                .when(recording, |button| button.text_color(self.tone(0xb84b45, 0xe79b96)))
+                .tooltip(|window, cx| Tooltip::new(
+                    "Start/stop latency capture (Ctrl+Shift+L). Timings and counts only; no conversation contents."
+                ).build(window, cx))
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_latency_capture(window, cx)))
+                .child(label),
+        );
+        if !recording && !self.latency.saving {
+            if self.latency.failed.is_some() {
+                view = view.child(
+                    div()
+                        .text_size(self.scaled(10.))
+                        .text_color(self.tone(0xb84b45, 0xe79b96))
+                        .child("Save failed; capture kept for retry."),
+                );
+            } else if let Some(path) = &self.latency.report {
+                let path = path.to_string_lossy().into_owned();
+                view = view
+                    .child(
+                        div()
+                            .text_size(self.scaled(10.))
+                            .child("Lag report saved locally"),
+                    )
+                    .child(
+                        BaseButton::new("latency-copy-path")
+                            .accessibility_label("Copy saved lag report path")
+                            .h(self.scaled(21.))
+                            .line_height(self.scaled(16.))
+                            .justify_start()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                                this.latency.copied = true;
+                                cx.notify();
+                            }))
+                            .child(if self.latency.copied {
+                                "Report path copied"
+                            } else {
+                                "Copy report path"
+                            }),
+                    );
+            }
+        }
+        view.into_any_element()
+    }
+
     // Keep GTK light/dark design-token pairs at each call site. Distinct roles
     // can share a light value (notably white text and white inputs) but differ
     // in dark mode, so do not translate colors by looking up their light hex.
@@ -2656,6 +2868,7 @@ impl Client {
             statuses: HashMap::new(),
             jobs: Vec::new(),
             background_requests: background::Requests::default(),
+            latency: LatencyCapture::default(),
             background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
             desktop_notifications: None,
@@ -2705,6 +2918,7 @@ impl Client {
             &client.composer,
             |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Change => {
+                    latency::global().edited();
                     *this
                         .composer_edit_generation
                         .entry(this.composer_session.clone())
@@ -3495,6 +3709,7 @@ impl Client {
                 &composer,
                 move |this, _, event: &InputEvent, cx| match event {
                     InputEvent::Change => {
+                        latency::global().edited();
                         *this
                             .composer_edit_generation
                             .entry(session.clone())
@@ -4161,6 +4376,8 @@ impl Client {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        trace_input(TraceAction::Key, cx);
+        let _latency = latency::global().span(TraceOperation::InputHandler, 1);
         let modifiers = &event.keystroke.modifiers;
         let key = event.keystroke.key.to_ascii_lowercase();
         if (matches!(key.as_str(), "alt" | "alt_l" | "alt_r")
@@ -4490,6 +4707,11 @@ impl Client {
         if key == "b" && modifiers.shift && self.modal.is_none() {
             let session = self.active.clone();
             self.send_to_background(&session, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if key == "l" && modifiers.shift {
+            self.toggle_latency_capture(window, cx);
             cx.stop_propagation();
             return;
         }
@@ -5133,6 +5355,7 @@ impl Client {
     }
 
     fn update_transcript_with_tail_hint(&mut self, session_id: &str, tail_delta: Option<&str>) {
+        let mut latency = latency::global().span(TraceOperation::TranscriptProjection, 0);
         self.prepare_follow_bottom(session_id);
         let Some(conversation) = self.conversations.get(session_id) else {
             return;
@@ -5161,6 +5384,7 @@ impl Client {
                 cache.stale.clear();
             }
         }
+        latency.units(rows.len());
     }
 
     fn prepare_follow_bottom(&mut self, session_id: &str) {
@@ -5495,6 +5719,7 @@ impl Client {
     }
 
     fn handle_live_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
+        let _latency = latency::global().span(TraceOperation::EventApply, 1);
         match event {
             UiEvent::Connection {
                 connected: true, ..
@@ -5755,6 +5980,8 @@ impl Client {
                     if self.open_tabs.contains(&session_id) {
                         match result {
                             Ok(page) => {
+                                let _latency = latency::global()
+                                    .span(TraceOperation::HistoryReconcile, page.messages.len());
                                 self.message_load_errors.remove(&session_id);
                                 let protected = if cursor.is_none() {
                                     self.skip_prune_for_load
@@ -6519,6 +6746,7 @@ impl Client {
             statuses: bootstrap.statuses,
             jobs,
             background_requests: background::Requests::default(),
+            latency: LatencyCapture::default(),
             background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
             desktop_notifications: None,
@@ -6675,6 +6903,7 @@ impl Client {
         let initial_session = client.active.clone();
         cx.subscribe(&client.composer, move |this, _, event: &InputEvent, _| {
             if matches!(event, InputEvent::Change) {
+                latency::global().edited();
                 *this
                     .composer_edit_generation
                     .entry(initial_session.clone())
@@ -7480,6 +7709,7 @@ impl Client {
                     .flex()
                     .flex_col()
                     .gap(self.scaled(12.))
+                    .child(self.latency_controls(cx))
                     .child(
                         BaseButton::new("footer-tabs")
                             .accessibility_label("Open tabs")
@@ -10886,6 +11116,34 @@ impl Client {
 
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _latency = latency::global().span(TraceOperation::UiBuild, 1);
+        if latency::global().enabled() {
+            let viewport = window.viewport_size();
+            latency::global().context(latency::Context {
+                transcript_rows: self.transcript.get(&self.active).map_or(0, Vec::len),
+                measured_rows: self
+                    .row_heights
+                    .get(&self.active)
+                    .map_or(0, |cache| cache.borrow().entries.len()),
+                busy_tabs: self
+                    .open_tabs
+                    .iter()
+                    .filter(|id| {
+                        self.statuses
+                            .get(id.as_str())
+                            .is_some_and(RunStatus::is_busy)
+                            || self.local_busy.contains(id.as_str())
+                    })
+                    .count(),
+                background_jobs: self.jobs.len(),
+                sidebar_visible: self.sidebar_visible,
+                window_active: window.is_window_active(),
+                window_width: viewport.width.as_f32(),
+                window_height: viewport.height.as_f32(),
+                display_scale: window.scale_factor(),
+                zoom: self.zoom(),
+            });
+        }
         self.dark = Theme::global(cx).is_dark();
         if !self.sidebar_zoom_initialized || self.sidebar_zoom_width != window.viewport_size().width
         {
@@ -11133,6 +11391,26 @@ impl Render for Client {
             .id("app-root")
             .size_full()
             .relative()
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    |_, (), window, _| {
+                        latency::global().paint();
+                        window.on_mouse_event::<ScrollWheelEvent>(|_, phase, _, cx| {
+                            if phase.capture() {
+                                trace_input(TraceAction::Scroll, cx);
+                            }
+                        });
+                        window.on_mouse_event::<MouseUpEvent>(|_, phase, _, cx| {
+                            if phase.capture() {
+                                trace_input(TraceAction::Pointer, cx);
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .capture_key_down(cx.listener(Self::handle_key_down))
             .capture_key_up(cx.listener(Self::handle_key_up))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {

@@ -14,6 +14,21 @@ The shallow-detour icon beside **BACKGROUND** offers **Continue without waiting*
 
 For an isolated interactive preview, use `OPENCODE_PREVIEW_BACKGROUND=1 cargo run -- --preview-api`. The optional preview-only `OPENCODE_PREVIEW_BACKGROUND_DELAY_MS` and `OPENCODE_PREVIEW_BACKGROUND_FAIL=1` expose pending/error states for targeted visual inspection.
 
+### Collect a latency report
+
+The normal client has a **Record lag** button above Tabs. **Ctrl+Shift+L** also starts/stops collection, including with the sidebar hidden or an in-app modal open.
+
+1. Click **Record lag** and use the client normally while the delay occurs.
+2. Click **Stop lag capture** (or press Ctrl+Shift+L).
+3. Wait for **Lag report saved locally**, then use **Copy report path**. Do not close the client before saving finishes. A failed save keeps the bounded capture available through **Retry saving lag report**.
+4. Provide that path when asking for analysis. The report can then be copied/read from that machine without launching the client or running a benchmark there.
+
+Reports are private `lag-*.jsonl` files under the local data directory's `opencode-gpui/diagnostics/` (normally `~/.local/share/opencode-gpui/diagnostics/` on Linux). Nothing is uploaded automatically. They contain categorized input/dispatch and edit markers, main-executor scheduling delay, paired GPUI draw/platform-call timings, slow named app-operation spans and technical counts/context. Keys, message contents, images, server URLs, credentials and user paths are not recorded in report contents. A source fingerprint identifies the instrumented build.
+
+The recorder keeps a bounded rolling buffer (32,768 events) and reports overwritten events, unmatched/dropped inputs and GPUI journal gaps. It preserves individual slow spans rather than only percentile summaries. Saving/serialization happens off the UI thread. Custom collection/probes are off by default; the compiled GPUI profiler still performs its own bounded journal bookkeeping. The single-flight scheduling probe does not notify, refresh, or request frames.
+
+All durations are elapsed time, not exclusive CPU execution. Input receipt is not physical key-press time; edit notifications have independent IDs rather than guessed key causality. A correlated frame is the first paired draw starting after an edit/post-dispatch marker, not proof that the change became visible. The platform draw-call endpoint is **not GPU completion, compositor presentation or scanout**, and does not guarantee successful submission. Synchronous inline-image preparation is timed; GPUI's asynchronous image decode is not separately timed. Read the report's header semantics and gap/drop fields before interpreting it.
+
 ### Dependencies
 
 Requires Rust 1.93+ (Rust 2024 edition) and Linux graphics development libraries for GPUI Kit (Wayland/X11, Vulkan and fontconfig). The repository Dockerfile contains an amd64 development/test environment; it is not a minimal runtime image.

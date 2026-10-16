@@ -24,7 +24,7 @@ cleanup() {
 }
 trap cleanup EXIT
 for _ in {1..80}; do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.1; done
-export XDG_CONFIG_HOME="${TEST_CONFIG_DIR:-$(mktemp -d)}" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)"
+export XDG_CONFIG_HOME="${TEST_CONFIG_DIR:-$(mktemp -d)}" XDG_DATA_HOME="${TEST_DATA_DIR:-$(mktemp -d)}" XDG_CACHE_HOME="$(mktemp -d)"
 if [[ "$CLIENT" == gpui && "${TEST_INVALID_STATE:-0}" == 1 ]]; then
   mkdir -p "$XDG_CONFIG_HOME/opencode-gpui"
   printf '{"connection":{"server":"not-a-url","username":"opencode"}}\n' > "$XDG_CONFIG_HOME/opencode-gpui/state.json"
@@ -392,6 +392,24 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == hover-close ]]; then
   xdotool mousemove --window "$win" 245 110
 fi
 sleep 6
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == latency-* ]]; then
+  # Manual agent inspection of the real button/shortcut/export, not a GUI suite.
+  xdotool mousemove --window "$win" 65 "$((window_h - 90))" click 1
+  sleep 0.4
+  xdotool mousemove --window "$win" "$((window_w / 2))" "$((window_h - 125))" click 1
+  xdotool type --clearmodifiers --delay 50 'latency sample'
+  xdotool key ctrl+p
+  sleep 0.2
+  xdotool key Escape
+  xdotool mousemove --window "$win" "$((window_w - 60))" 350 click --repeat 3 --delay 60 4
+  sleep 1
+  if [[ "$INTERACTION" == latency-report ]]; then
+    xdotool key ctrl+shift+l
+    sleep 2
+    xdotool mousemove --window "$win" 65 "$((window_h - 90))" click 1
+  fi
+  xdotool mousemove --window "$win" 140 400
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == background-* ]]; then
   # Agent-directed inspection only. The foreground fixture is opt-in through
   # OPENCODE_PREVIEW_BACKGROUND=1 and PREVIEW_API=1; no GUI suite is added.
