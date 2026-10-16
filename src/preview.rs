@@ -868,7 +868,9 @@ fn catalog() -> ModelCatalog {
             "limit": { "context": 200000, "output": 32000 }
         })
     };
-    let gpt = model("gpt-5.6", "openai", "GPT-5.6", &["high", "low", "medium"]);
+    // Preview-only long-label inspection; normal clients use their server catalog.
+    let name = std::env::var("OPENCODE_PREVIEW_MODEL_NAME").unwrap_or_else(|_| "GPT-5.6".into());
+    let gpt = model("gpt-5.6", "openai", &name, &["high", "low", "medium"]);
     let list: protocol::ModelListResponse = decode(json!({
         "location": { "directory": DIRECTORY },
         "data": [

@@ -140,13 +140,17 @@ fn model_button_presentation(
     }
     match selected {
         Some(selection) => catalog.find(selection).map_or_else(
-            || {
-                (
-                    format!("{}/{}", selection.provider_id, selection.model_id),
-                    None,
-                )
+            || (selection.model_id.clone(), None),
+            |option| {
+                // Catalog/dropdown labels retain the routing provider. Only
+                // the collapsed composer control shows the model name alone.
+                let name = option
+                    .label
+                    .strip_prefix(option.provider_id.as_str())
+                    .and_then(|suffix| suffix.strip_prefix(" / "))
+                    .unwrap_or(&option.label);
+                (name.to_owned(), option.context_limit)
             },
-            |option| (option.label.clone(), option.context_limit),
         ),
         None => ("Choose model".into(), None),
     }
@@ -9345,7 +9349,9 @@ impl Client {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.show_modal(Modal::Model, window, cx);
                                     }))
-                                    .max_w(self.scaled(160.))
+                                    // A ceiling, not a fixed width: flex can still
+                                    // shrink this before reasoning/Send controls.
+                                    .max_w(self.scaled(320.))
                                     .min_w(self.scaled(42.))
                                     .h(self.scaled(32.))
                                     .px(self.scaled(8.))
@@ -9391,6 +9397,10 @@ impl Client {
                                     .h(self.scaled(32.))
                                     .max_w(self.scaled(112.))
                                     .min_w(self.scaled(44.))
+                                    .when(
+                                        self.transcript_width(window) >= self.scaled(480.),
+                                        |control| control.flex_shrink_0(),
+                                    )
                                     .px(self.scaled(8.))
                                     .flex()
                                     .items_center()
@@ -12855,12 +12865,42 @@ mod tests {
         };
         assert_eq!(
             super::model_button_presentation(&catalog, Some(&missing)),
-            ("missing/saved".into(), None)
+            ("saved".into(), None)
         );
         assert_eq!(
             super::model_button_presentation(&catalog, None),
             ("Choose model".into(), None)
         );
+    }
+
+    #[test]
+    fn composer_model_label_hides_only_the_routing_provider() {
+        let selected = model::ModelSelection {
+            provider_id: "openrouter".into(),
+            model_id: "google/gemini-preview".into(),
+            variant: None,
+        };
+        let catalog = model::ModelCatalog {
+            models: vec![model::ModelOption {
+                provider_id: selected.provider_id.clone(),
+                model_id: selected.model_id.clone(),
+                label: "openrouter / Vendor / Gemini Pro Preview".into(),
+                variants: vec![],
+                supports_attachments: true,
+                context_limit: Some(1_000_000),
+            }],
+            preferred: None,
+        };
+        assert_eq!(
+            super::model_button_presentation(&catalog, Some(&selected)),
+            ("Vendor / Gemini Pro Preview".into(), Some(1_000_000))
+        );
+        assert_eq!(
+            catalog.models[0].label,
+            "openrouter / Vendor / Gemini Pro Preview"
+        );
+        assert_eq!(selected.provider_id, "openrouter");
+        assert_eq!(selected.model_id, "google/gemini-preview");
     }
 
     #[test]

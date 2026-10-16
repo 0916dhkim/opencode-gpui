@@ -50,6 +50,8 @@ cargo run -- --preview
 cargo run -- --preview-api
 ```
 
+For targeted long-label inspection, set `OPENCODE_PREVIEW_MODEL_NAME="GPT-5.6 Long Context Preview"` on a preview run. The composer shows only the model name with a flexible width; the dropdown retains provider details. This override never affects a normal server catalog.
+
 ### CLI Flags
 
 ```
