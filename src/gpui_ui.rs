@@ -2364,7 +2364,18 @@ impl Client {
                     "Start/stop latency capture (Ctrl+Shift+L). Timings and counts only; no conversation contents."
                 ).build(window, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_latency_capture(window, cx)))
-                .child(label),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(self.scaled(7.))
+                        .child(
+                            Icon::default()
+                                .data(include_bytes!("icons/bug.svg"))
+                                .with_size(self.scaled(14.)),
+                        )
+                        .child(label),
+                ),
         );
         if !recording && !self.latency.saving {
             if self.latency.failed.is_some() {
