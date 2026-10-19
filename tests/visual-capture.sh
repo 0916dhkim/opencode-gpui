@@ -166,6 +166,20 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == complex-top ]]; then
   xdotool mousemove --window "$win" 550 350 click --repeat 30 --delay 20 4
   sleep 1
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == transcript-scrollbar-top ]]; then
+  # Manual inspection aid for a long already-loaded transcript, not a GUI test.
+  # Wake an auto-hidden native scrollbar before attempting to grab its thumb.
+  xdotool mousemove --window "$win" 550 350 click 4
+  sleep "${TRANSCRIPT_STEP_WAIT:-0.3}"
+  xdotool mousemove --window "$win" "${TRANSCRIPT_THUMB_X:-773}" "${TRANSCRIPT_THUMB_Y:-560}"
+  sleep "${TRANSCRIPT_STEP_WAIT:-0.3}"
+  xdotool mousedown 1
+  sleep "${TRANSCRIPT_HOLD_WAIT:-0.4}"
+  xdotool mousemove --sync --window "$win" "${TRANSCRIPT_THUMB_X:-773}" 48
+  sleep "${TRANSCRIPT_STEP_WAIT:-0.3}"
+  xdotool mouseup 1
+  sleep "${TRANSCRIPT_SETTLE_WAIT:-1}"
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == sticky-mid ]]; then
   if (( ${STICKY_ZOOM_STEPS:-0} > 0 )); then
     xdotool mousemove --window "$win" 410 680 click 1

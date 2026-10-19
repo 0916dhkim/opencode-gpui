@@ -569,6 +569,8 @@ impl Report {
                     "ordering": "completion-order journal; use timestamps, not line order",
                     "dispatch_scope": "GPUI dispatch intervals are process-wide; own input IDs and frames are captured in the main client window",
                     "image_prepare": "synchronous inline-byte preparation only; GPUI asynchronous image decode is not separately timed",
+                    "transcript_layout": "all loaded rows use natural overflow layout; no virtualization or detached height measurement",
+                    "measured_rows": "legacy field is always zero; it does not count rendered rows",
                     "limits": "bounded rolling event buffer; no correlation across journal gaps",
                     "disabled": "custom recording/probes disabled; compiled GPUI journal retains its own bounded bookkeeping"
                 }

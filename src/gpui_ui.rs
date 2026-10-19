@@ -16,9 +16,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar, VirtualListScrollHandle, v_virtual_list,
-};
+use gpui_kit::component::{Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use gpui_kit::{Animation, Transformation, percentage};
@@ -615,9 +613,8 @@ struct Client {
     skip_prune_for_load: HashMap<String, HashSet<String>>,
     message_events_during_load: HashMap<String, Vec<protocol::Event>>,
     reload_after_load: HashSet<String>,
-    preserve_scroll: Option<TranscriptAnchor>,
-    follow_bottom: Option<(String, Point<Pixels>)>,
-    zoom_follow_bottom: bool,
+    follow_bottom: bool,
+    transcript_pointer_down: bool,
     catalogs: HashMap<String, ModelCatalog>,
     model_retry_count: HashMap<String, u8>,
     model_retry_scheduled: HashSet<String>,
@@ -640,8 +637,7 @@ struct Client {
     projects: Vec<Project>,
     active: String,
     transcript: HashMap<String, Vec<TranscriptRow>>,
-    row_heights: HashMap<String, Rc<RefCell<RowHeightCache>>>,
-    virtual_scrolls: HashMap<String, VirtualListScrollHandle>,
+    transcript_scrolls: HashMap<String, ScrollHandle>,
     transcript_spans: HashMap<String, Vec<MessageSpan>>,
     attachments: ImageCache,
     catalog: ModelCatalog,
@@ -660,11 +656,8 @@ struct Client {
     link_menu_focus: [FocusHandle; 2],
     autoscroll: Option<TranscriptAutoscroll>,
     next_autoscroll_token: u64,
-    scroll: VirtualListScrollHandle,
+    scroll: ScrollHandle,
     transcript_content_width: Pixels,
-    safe_scroll: HashMap<String, (RowLayoutStamp, Point<Pixels>)>,
-    safe_anchors: HashMap<String, (RowLayoutStamp, TranscriptAnchor)>,
-    pending_jump: Option<PendingTranscriptJump>,
     history_focus: FocusHandle,
     retry_history_focus: FocusHandle,
     sessions_picker_scroll: ScrollHandle,
@@ -883,16 +876,6 @@ enum MarkdownBlock {
     Rule,
 }
 
-// Increment this when the row's typography or layout rules change. The other
-// parts of the stamp follow the live width, theme and conversation snapshot.
-const TRANSCRIPT_ROW_STYLE_REVISION: u64 = 4;
-const TRANSCRIPT_MEASURE_BATCH: usize = 64;
-const TRANSCRIPT_PROGRESSIVE_MIN_ROWS: usize = 256;
-// A width change invalidates exact heights, but it should not build 64 natural
-// Markdown rows just to cover one viewport while the detached probe catches up.
-fn transcript_fallback_budget(viewport_height: Pixels) -> usize {
-    ((viewport_height.as_f32() / 48.).ceil() as usize + 4).clamp(8, TRANSCRIPT_MEASURE_BATCH)
-}
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
 const LONG_BULLET_OVERFLOW_PREVIEW: &str = "- The parent session (`opencode-gpui`) is waiting on an explore subagent, \"Audit idle send queue flash\" (`ses_ece0a1bdfffes1R6C9nEGp5Z77`).\n\n- The subagent's last model request started at 17:13:47 and never got a single token back. [Open log](https://example.com/log).";
 const LONG_ORDERED_LIST_PREVIEW: &str = r#"A long answer with rich list items and linked source locations. The remaining differences are:
@@ -903,34 +886,6 @@ const LONG_ORDERED_LIST_PREVIEW: &str = r#"A long answer with rich list items an
 4. **Header and tab separators differ slightly.** Long lines use nearby but different theme colors. See [session header](/test/worktrees/really-long-reproduction-project/source/tree/src/gpui_ui.rs#L6251)."#;
 const SIDEBAR_WIDTH: f32 = 270.;
 const TRANSCRIPT_SCROLLBAR_GUTTER: f32 = 14.;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct RowLayoutStamp {
-    width: Pixels,
-    dark: bool,
-    style_revision: u64,
-    epoch: u64,
-}
-
-#[derive(Clone, Copy)]
-struct CachedRowHeight {
-    revision: u64,
-    height: Pixels,
-}
-
-#[derive(Clone)]
-struct TranscriptAnchor {
-    session: String,
-    key: TranscriptRowKey,
-    within: Pixels,
-    offset: Point<Pixels>,
-}
-
-#[derive(Clone)]
-struct PendingTranscriptJump {
-    stamp: RowLayoutStamp,
-    anchor: TranscriptAnchor,
-}
 
 /// One entry for every message, including undelivered prompts with zero rows.
 /// The epoch prevents an unrelated replacement snapshot with colliding IDs
@@ -963,8 +918,6 @@ thread_local! {
 struct ProjectionChange {
     range: std::ops::Range<usize>,
     removed_images: Vec<(TranscriptRowKey, usize)>,
-    old_rows: Vec<TranscriptRow>,
-    old_images: HashMap<(TranscriptRowKey, usize), Arc<Image>>,
 }
 
 /// Keep the unchanged message prefix and suffix intact. Their row indices may
@@ -1045,7 +998,7 @@ fn splice_transcript_with_tail_hint(
         })
         .collect::<Vec<_>>();
     // The model revision belongs to the whole assistant message. A streaming
-    // tail edit must not invalidate every already measured tool/reasoning row
+    // tail edit must not invalidate every unchanged tool/reasoning row
     // in that message. Reuse a row revision only when its complete visible
     // presentation and its snapshot epoch are unchanged.
     if spans[prefix..spans.len() - suffix]
@@ -1070,13 +1023,11 @@ fn splice_transcript_with_tail_hint(
         .iter()
         .flat_map(|row| (0..row.images.len()).map(|index| (row.key.clone(), index)))
         .collect();
-    let old_rows = rows.splice(start..end, replacements).collect();
+    rows.splice(start..end, replacements);
     spans.splice(prefix..spans.len() - suffix, new_spans);
     Some(ProjectionChange {
         range: start..new_end,
         removed_images,
-        old_rows,
-        old_images: HashMap::new(),
     })
 }
 
@@ -1107,15 +1058,6 @@ impl ImageCache {
                     })
                     .as_ref()
             })
-    }
-
-    /// A replaced offscreen row must not decode an old image merely to keep
-    /// a stale snapshot; only already painted images need that retention.
-    fn peek(&self, session: &str, row: &TranscriptRow, index: usize) -> Option<&Arc<Image>> {
-        self.entries
-            .get(&(session.to_owned(), row.key.clone(), index))
-            .filter(|entry| row.images.get(index) == Some(&entry.url))
-            .and_then(|entry| entry.image.get().and_then(Option::as_ref))
     }
 
     fn update(&mut self, session: &str, rows: &[TranscriptRow], change: &ProjectionChange) {
@@ -1174,35 +1116,9 @@ fn update_session_projection(
     } else {
         splice_transcript(conversation, rows, spans)
     };
-    change.map(|mut change| {
-        for row in &change.old_rows {
-            for index in 0..row.images.len() {
-                if let Some(image) = images.peek(session, row, index) {
-                    change
-                        .old_images
-                        .insert((row.key.clone(), index), image.clone());
-                }
-            }
-        }
-        images.update(session, rows, &change);
-        change
+    change.inspect(|change| {
+        images.update(session, rows, change);
     })
-}
-
-#[derive(Default)]
-struct RowHeightCache {
-    stamp: Option<RowLayoutStamp>,
-    entries: HashMap<TranscriptRowKey, CachedRowHeight>,
-    /// Only replaced measured rows, retained until the next exact layout.
-    stale: HashMap<TranscriptRowKey, StaleMeasuredRow>,
-    load_height: Option<(bool, Pixels)>,
-}
-
-#[derive(Clone)]
-struct StaleMeasuredRow {
-    row: TranscriptRow,
-    height: Pixels,
-    images: Vec<Option<Arc<Image>>>,
 }
 
 struct PendingModelPick {
@@ -1272,489 +1188,6 @@ fn restored_failed_text(current: &str, submitted: &str, original_unchanged: bool
     }
 }
 
-impl RowHeightCache {
-    fn prepare_stamp(&mut self, stamp: RowLayoutStamp) {
-        if self.stamp != Some(stamp) {
-            self.entries.clear();
-            self.stale.clear();
-            self.load_height = None;
-            self.stamp = Some(stamp);
-        }
-    }
-
-    fn missing(&mut self, stamp: RowLayoutStamp, rows: &[TranscriptRow]) -> Vec<usize> {
-        self.prepare_stamp(stamp);
-        rows.iter()
-            .enumerate()
-            .filter_map(|(index, row)| self.height(row).is_none().then_some(index))
-            .collect()
-    }
-
-    /// Choose a bounded exact-layout batch nearest the first-visit tail.
-    /// This planner does not change what is painted until the virtual list can
-    /// safely admit partially measured ranges without blank visible slots.
-    fn missing_tail(
-        &mut self,
-        stamp: RowLayoutStamp,
-        rows: &[TranscriptRow],
-        budget: usize,
-        target_height: Pixels,
-    ) -> Vec<usize> {
-        self.prepare_stamp(stamp);
-        let mut indices = Vec::with_capacity(budget);
-        let mut exact_height = px(0.);
-        for (index, row) in rows.iter().enumerate().rev() {
-            if let Some(height) = self.height(row) {
-                exact_height += height;
-                if exact_height >= target_height {
-                    break;
-                }
-            } else {
-                indices.push(index);
-                if indices.len() == budget {
-                    break;
-                }
-            }
-        }
-        indices.reverse();
-        indices
-    }
-
-    fn missing_range(
-        &mut self,
-        stamp: RowLayoutStamp,
-        rows: &[TranscriptRow],
-        range: std::ops::Range<usize>,
-        budget: usize,
-    ) -> Vec<usize> {
-        self.prepare_stamp(stamp);
-        rows.iter()
-            .enumerate()
-            .skip(range.start)
-            .take(range.end.saturating_sub(range.start))
-            .filter_map(|(index, row)| self.height(row).is_none().then_some(index))
-            .take(budget)
-            .collect()
-    }
-
-    fn exact_tail(&self, rows: &[TranscriptRow]) -> (usize, Pixels) {
-        let mut count = 0;
-        let mut height = px(0.);
-        for row in rows.iter().rev() {
-            let Some(exact) = self.height(row) else { break };
-            count += 1;
-            height += exact;
-        }
-        (count, height)
-    }
-
-    fn provisional_prefix(&self, rows: &[TranscriptRow], index: usize, has_load: bool) -> Pixels {
-        let mut top = if has_load {
-            self.load_height.map_or(px(48.), |(_, height)| height)
-        } else {
-            px(0.)
-        };
-        for row in rows.iter().take(index) {
-            top += self
-                .entries
-                .get(&row.key)
-                .map_or(px(64.), |entry| entry.height);
-        }
-        top
-    }
-
-    fn provisional_viewport(
-        &self,
-        rows: &[TranscriptRow],
-        has_load: bool,
-        offset: Point<Pixels>,
-        viewport_height: Pixels,
-    ) -> std::ops::Range<usize> {
-        let first_row = usize::from(has_load);
-        let visible_top = (-offset.y).max(px(0.));
-        let visible_bottom = visible_top + viewport_height;
-        let mut top = px(0.);
-        let mut start = None;
-        let mut end = first_row;
-        if has_load {
-            let height = self.load_height.map_or(px(48.), |(_, height)| height);
-            if height > visible_top {
-                start = Some(0);
-            }
-            top += height;
-        }
-        for (index, row) in rows.iter().enumerate() {
-            let height = self
-                .entries
-                .get(&row.key)
-                .map_or(px(64.), |entry| entry.height);
-            let item = index + first_row;
-            if top + height > visible_top && start.is_none() {
-                start = Some(item);
-            }
-            if top < visible_bottom {
-                end = item + 1;
-            }
-            top += height;
-            if top >= visible_bottom && start.is_some() {
-                break;
-            }
-        }
-        let length = rows.len() + first_row;
-        let start = start.unwrap_or(length.saturating_sub(1));
-        start..end.max(start + 1).min(length)
-    }
-
-    fn viewport_ready(
-        &self,
-        rows: &[TranscriptRow],
-        has_load: bool,
-        loading: bool,
-        range: std::ops::Range<usize>,
-    ) -> bool {
-        range.into_iter().all(|index| {
-            if has_load && index == 0 {
-                self.load_height
-                    .is_some_and(|(was_loading, _)| was_loading == loading)
-            } else {
-                let row = &rows[index - usize::from(has_load)];
-                self.height(row).is_some()
-                    || self.stale.get(&row.key).is_some_and(|old| {
-                        self.entries.get(&row.key).is_some_and(|entry| {
-                            entry.revision == old.row.render_revision()
-                                && entry.height == old.height
-                        })
-                    })
-            }
-        })
-    }
-
-    fn record(
-        &mut self,
-        stamp: RowLayoutStamp,
-        key: TranscriptRowKey,
-        revision: u64,
-        height: Pixels,
-    ) {
-        // A superseding render can replace the snapshot before this layout runs.
-        if self.stamp == Some(stamp) {
-            self.stale.remove(&key);
-            self.entries
-                .insert(key, CachedRowHeight { revision, height });
-        }
-    }
-
-    fn height(&self, row: &TranscriptRow) -> Option<Pixels> {
-        self.entries
-            .get(&row.key)
-            .and_then(|entry| (entry.revision == row.render_revision()).then_some(entry.height))
-    }
-
-    fn retain_replaced(&mut self, rows: &[TranscriptRow], change: &ProjectionChange) {
-        // The key is semantic, not the row index: prepends may shift the slot.
-        // Keep the first still-measured revision through rapid token updates.
-        // Only the spliced message range can replace or remove a stale row.
-        // Building a map of all history on every streamed token costs O(history).
-        let changed_keys: HashSet<_> = change.old_rows.iter().map(|row| &row.key).collect();
-        let current: HashMap<_, _> = rows[change.range.clone()]
-            .iter()
-            .map(|row| (&row.key, row))
-            .collect();
-        self.stale.retain(|key, old| {
-            !changed_keys.contains(key)
-                || current
-                    .get(key)
-                    .is_some_and(|row| row.render_revision() != old.row.render_revision())
-        });
-        for row in &change.old_rows {
-            let Some(new) = current.get(&row.key) else {
-                continue;
-            };
-            if new.render_revision() == row.render_revision() || self.stale.contains_key(&row.key) {
-                continue;
-            }
-            let Some(entry) = self.entries.get(&row.key).copied() else {
-                continue;
-            };
-            if entry.revision != row.render_revision() {
-                continue;
-            }
-            self.stale.insert(
-                row.key.clone(),
-                StaleMeasuredRow {
-                    row: row.clone(),
-                    height: entry.height,
-                    images: (0..row.images.len())
-                        .map(|index| change.old_images.get(&(row.key.clone(), index)).cloned())
-                        .collect(),
-                },
-            );
-        }
-    }
-
-    fn prefix(&self, rows: &[TranscriptRow], index: usize, has_load: bool) -> Option<Pixels> {
-        let mut top = if has_load {
-            self.load_height?.1
-        } else {
-            px(0.)
-        };
-        for row in rows.iter().take(index) {
-            top += self.height(row)?;
-        }
-        Some(top)
-    }
-
-    fn sizes(
-        &self,
-        rows: &[TranscriptRow],
-        has_load: bool,
-        width: Pixels,
-    ) -> Option<Rc<Vec<Size<Pixels>>>> {
-        let mut sizes = Vec::with_capacity(rows.len() + usize::from(has_load));
-        if has_load {
-            sizes.push(size(width, self.load_height?.1));
-        }
-        for row in rows {
-            sizes.push(size(width, self.height(row)?));
-        }
-        Some(Rc::new(sizes))
-    }
-
-    /// A new-row miss is an empty placeholder for one layout frame. A changed
-    /// row can instead paint its last measured snapshot at this exact height;
-    /// the unmeasured revision never enters a definite-height virtual slot.
-    fn provisional_sizes(
-        &self,
-        rows: &[TranscriptRow],
-        has_load: bool,
-        width: Pixels,
-    ) -> Rc<Vec<Size<Pixels>>> {
-        let mut sizes = Vec::with_capacity(rows.len() + usize::from(has_load));
-        if has_load {
-            sizes.push(size(
-                width,
-                self.load_height.map_or(px(48.), |(_, height)| height),
-            ));
-        }
-        for row in rows {
-            let height = self
-                .entries
-                .get(&row.key)
-                .map_or(px(64.), |entry| entry.height);
-            sizes.push(size(width, height));
-        }
-        Rc::new(sizes)
-    }
-
-    fn provisional_positions(&self, rows: &[TranscriptRow], has_load: bool) -> Vec<Pixels> {
-        let mut top = if has_load {
-            self.load_height.map_or(px(48.), |(_, height)| height)
-        } else {
-            px(0.)
-        };
-        rows.iter()
-            .map(|row| {
-                let origin = top;
-                top += self
-                    .entries
-                    .get(&row.key)
-                    .map_or(px(64.), |entry| entry.height);
-                origin
-            })
-            .collect()
-    }
-}
-
-/// Detached rows are laid out at a definite width during GPUI's layout phase,
-/// never prepainted, painted, or inserted into the transcript scroll area.
-/// `layout_as_root` panics if called from the view's render method instead.
-struct TranscriptMeasurementProbe {
-    rows: Vec<(TranscriptRowKey, u64, AnyElement)>,
-    load: Option<(bool, AnyElement)>,
-    stamp: RowLayoutStamp,
-    cache: Rc<RefCell<RowHeightCache>>,
-    spacer: Div,
-}
-
-impl IntoElement for TranscriptMeasurementProbe {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for TranscriptMeasurementProbe {
-    type RequestLayoutState = <Div as Element>::RequestLayoutState;
-    type PrepaintState = <Div as Element>::PrepaintState;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let _latency = latency::global().span(TraceOperation::RowMeasure, self.rows.len());
-        if let Some((loading, control)) = &mut self.load {
-            let height = control
-                .layout_as_root(
-                    size(
-                        AvailableSpace::Definite(self.stamp.width),
-                        AvailableSpace::MinContent,
-                    ),
-                    window,
-                    cx,
-                )
-                .height;
-            let mut cache = self.cache.borrow_mut();
-            if cache.stamp == Some(self.stamp) {
-                cache.load_height = Some((*loading, height));
-            }
-        }
-        let measured: Vec<_> = self
-            .rows
-            .iter_mut()
-            .map(|(key, revision, row)| {
-                let height = row
-                    .layout_as_root(
-                        size(
-                            AvailableSpace::Definite(self.stamp.width),
-                            AvailableSpace::MinContent,
-                        ),
-                        window,
-                        cx,
-                    )
-                    .height;
-                (key.clone(), *revision, height)
-            })
-            .collect();
-        let mut cache = self.cache.borrow_mut();
-        for (key, revision, height) in measured {
-            cache.record(self.stamp, key, revision, height);
-        }
-        // Re-render once the provisional virtual slots have exact heights.
-        window.refresh();
-        self.spacer
-            .request_layout(global_id, inspector_id, window, cx)
-    }
-
-    fn prepaint(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        self.spacer
-            .prepaint(global_id, inspector_id, bounds, layout, window, cx)
-    }
-
-    fn paint(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        layout: &mut Self::RequestLayoutState,
-        paint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.spacer
-            .paint(global_id, inspector_id, bounds, layout, paint, window, cx);
-    }
-}
-
-/// A Markdown TextView may finish parsing after its detached row was measured.
-/// Compare the mounted row's natural layout with that exact cached slot; a
-/// child-only refresh otherwise leaves the following virtual row at the old
-/// position, painting both rows on top of each other indefinitely.
-struct TranscriptMeasuredRow {
-    row: AnyElement,
-    cache: Rc<RefCell<RowHeightCache>>,
-    stamp: RowLayoutStamp,
-    key: TranscriptRowKey,
-    revision: u64,
-}
-
-impl IntoElement for TranscriptMeasuredRow {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl Element for TranscriptMeasuredRow {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        (self.row.request_layout(window, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let height = bounds.size.height;
-        let mut cache = self.cache.borrow_mut();
-        if cache.stamp == Some(self.stamp)
-            && cache.entries.get(&self.key).is_some_and(|entry| {
-                entry.revision == self.revision
-                    && (entry.height.as_f32() - height.as_f32()).abs() > 0.5
-            })
-        {
-            cache.record(self.stamp, self.key.clone(), self.revision, height);
-            window.refresh();
-        }
-        drop(cache);
-        self.row.prepaint(window, cx);
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.row.paint(window, cx);
-    }
-}
-
 fn image_display_size(width: usize, height: usize, available_width: f32) -> (f32, f32) {
     let (width, height) = if width == 0 || height == 0 {
         (200, 120)
@@ -1810,20 +1243,19 @@ fn connected_status(version: Option<&str>, partial: bool, settings_warning: bool
 }
 
 fn sticky_user_index(
-    users: impl IntoIterator<Item = (usize, Pixels, Pixels)>,
-    viewport_top: Pixels,
-    viewport_bottom: Pixels,
+    rows: &[TranscriptRow],
+    top_child: usize,
+    has_load: bool,
+    at_item_start: bool,
 ) -> Option<usize> {
-    let mut last_past_top = None;
-    let mut flush_with_top = false;
-    for (index, top, bottom) in users {
-        if top < viewport_top - px(1.) {
-            last_past_top = Some(index);
-        } else if top <= viewport_top + px(1.) && bottom <= viewport_bottom + px(1.) {
-            flush_with_top = true;
-        }
+    let index = top_child.checked_sub(usize::from(has_load))?;
+    let row = rows.get(index)?;
+    if row.role.label() == "YOU" {
+        return (!at_item_start).then_some(index);
     }
-    if flush_with_top { None } else { last_past_top }
+    rows[..=index]
+        .iter()
+        .rposition(|row| row.role.label() == "YOU")
 }
 
 fn permission_detail(text: String, dark: bool) -> AnyElement {
@@ -2791,7 +2223,7 @@ impl Client {
             password: password.password,
             cloudflare_access,
         };
-        let scroll = VirtualListScrollHandle::new();
+        let scroll = ScrollHandle::new();
         let mut client = Self {
             dark: Theme::global(cx).is_dark(),
             api: None,
@@ -2817,9 +2249,8 @@ impl Client {
             skip_prune_for_load: HashMap::new(),
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
-            preserve_scroll: None,
-            follow_bottom: None,
-            zoom_follow_bottom: false,
+            follow_bottom: true,
+            transcript_pointer_down: false,
             catalogs: HashMap::new(),
             model_retry_count: HashMap::new(),
             model_retry_scheduled: HashSet::new(),
@@ -2843,8 +2274,7 @@ impl Client {
             active: String::new(),
             transcript: HashMap::new(),
             transcript_spans: HashMap::new(),
-            row_heights: HashMap::new(),
-            virtual_scrolls: HashMap::new(),
+            transcript_scrolls: HashMap::new(),
             attachments: ImageCache::default(),
             catalog: ModelCatalog::default(),
             composer: cx.new(|cx| {
@@ -2869,9 +2299,6 @@ impl Client {
             next_autoscroll_token: 0,
             scroll,
             transcript_content_width: px(420.),
-            safe_scroll: HashMap::new(),
-            safe_anchors: HashMap::new(),
-            pending_jump: None,
             history_focus: cx.focus_handle().tab_stop(true),
             retry_history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
@@ -3064,17 +2491,13 @@ impl Client {
             }
             self.attachments_draft = self.attachment_drafts.remove(&id).unwrap_or_default();
             self.scroll = self
-                .virtual_scrolls
+                .transcript_scrolls
                 .entry(id.clone())
-                .or_insert_with(VirtualListScrollHandle::new)
+                .or_default()
                 .clone();
-            self.preserve_scroll = None;
-            self.pending_jump = None;
-            self.follow_bottom = Some((id.clone(), self.scroll.offset()));
-            self.zoom_follow_bottom = false;
+            self.follow_bottom = true;
             self.active = id.clone();
-            // Switching tabs intentionally follows the selected session's
-            // latest message once its exact or provisional heights settle.
+            // Switching tabs intentionally follows the latest loaded message.
         }
         self.jobs = self.running_jobs.rows(Some(&id));
         if !self
@@ -3168,11 +2591,7 @@ impl Client {
             .max(-self.scroll.max_offset().y)
             .min(px(0.));
         if next_y != offset.y {
-            self.preserve_scroll = None;
-            self.pending_jump = None;
-            self.follow_bottom = None;
-            self.safe_scroll.remove(&self.active);
-            self.safe_anchors.remove(&self.active);
+            self.follow_bottom = false;
             self.scroll.set_offset(point(offset.x, next_y));
             cx.notify();
         }
@@ -3238,27 +2657,10 @@ impl Client {
         px(value * self.zoom())
     }
 
-    fn row_style_revision(&self) -> u64 {
-        TRANSCRIPT_ROW_STYLE_REVISION ^ (u64::from(self.zoom().to_bits() ^ 1.0f32.to_bits()) << 32)
-    }
-
     fn set_zoom(&mut self, zoom: f64, window: &mut Window, cx: &mut Context<Self>) {
         let zoom = normalized_zoom(zoom);
         if (self.settings.persisted.zoom_level - zoom).abs() < f64::EPSILON {
             return;
-        }
-        if let Some(jump) = self.pending_jump.take() {
-            self.preserve_scroll = Some(jump.anchor);
-            self.follow_bottom = None;
-            self.zoom_follow_bottom = false;
-        } else if self.scroll.offset().y + self.scroll.max_offset().y <= px(16.) {
-            self.preserve_scroll = None;
-            self.follow_bottom = Some((self.active.clone(), self.scroll.offset()));
-            self.zoom_follow_bottom = true;
-        } else {
-            self.preserve_scroll = self.transcript_anchor();
-            self.follow_bottom = None;
-            self.zoom_follow_bottom = false;
         }
         self.settings.persisted.zoom_level = zoom;
         self.reconcile_zoom_sidebar(window);
@@ -3300,14 +2702,6 @@ impl Client {
     fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.sidebar_visible && !self.can_open_sidebar(window) {
             return;
-        }
-        let offset = self.scroll.offset();
-        if self.pending_jump.is_none() && offset.y + self.scroll.max_offset().y <= px(16.) {
-            self.preserve_scroll = None;
-            self.follow_bottom = Some((self.active.clone(), offset));
-        } else if self.pending_jump.is_none() {
-            self.preserve_scroll = self.transcript_anchor();
-            self.follow_bottom = None;
         }
         self.sidebar_visible = !self.sidebar_visible;
         self.sidebar_auto_hidden = false;
@@ -3659,8 +3053,7 @@ impl Client {
         self.transcript.remove(id);
         self.transcript_spans.remove(id);
         self.attachments.remove_session(id);
-        self.row_heights.remove(id);
-        self.virtual_scrolls.remove(id);
+        self.transcript_scrolls.remove(id);
         self.unread.remove(id);
         self.withdraw_session_notification(id);
         if self.active == id {
@@ -4098,12 +3491,8 @@ impl Client {
         self.transcript.clear();
         self.transcript_spans.clear();
         self.attachments = ImageCache::default();
-        self.row_heights.clear();
-        self.virtual_scrolls.clear();
-        self.scroll = VirtualListScrollHandle::new();
-        self.safe_scroll.clear();
-        self.safe_anchors.clear();
-        self.pending_jump = None;
+        self.transcript_scrolls.clear();
+        self.scroll = ScrollHandle::new();
         self.conversations.clear();
         self.terminal_shells.clear();
         if let Some(notifier) = &self.desktop_notifications {
@@ -4117,9 +3506,8 @@ impl Client {
         self.skip_prune_for_load.clear();
         self.message_events_during_load.clear();
         self.reload_after_load.clear();
-        self.preserve_scroll = None;
-        self.follow_bottom = None;
-        self.zoom_follow_bottom = false;
+        self.follow_bottom = true;
+        self.transcript_pointer_down = false;
         self.catalogs.clear();
         self.model_retry_count.clear();
         self.model_retry_scheduled.clear();
@@ -5371,7 +4759,6 @@ impl Client {
 
     fn update_transcript_with_tail_hint(&mut self, session_id: &str, tail_delta: Option<&str>) {
         let mut latency = latency::global().span(TraceOperation::TranscriptProjection, 0);
-        self.prepare_follow_bottom(session_id);
         let Some(conversation) = self.conversations.get(session_id) else {
             return;
         };
@@ -5380,357 +4767,15 @@ impl Client {
             .entry(session_id.to_owned())
             .or_default();
         let rows = self.transcript.entry(session_id.to_owned()).or_default();
-        if let Some(change) = update_session_projection(
+        update_session_projection(
             session_id,
             conversation,
             rows,
             spans,
             &mut self.attachments,
             tail_delta,
-        ) && let Some(cache) = self.row_heights.get(session_id)
-        {
-            let mut cache = cache.borrow_mut();
-            if cache
-                .stamp
-                .is_some_and(|stamp| stamp.epoch == conversation.cache_epoch())
-            {
-                cache.retain_replaced(rows, &change);
-            } else {
-                cache.stale.clear();
-            }
-        }
+        );
         latency.units(rows.len());
-    }
-
-    fn prepare_follow_bottom(&mut self, session_id: &str) {
-        if session_id == self.active
-            && self.preserve_scroll.is_none()
-            && self.transcript.contains_key(session_id)
-        {
-            let offset = self.scroll.offset();
-            let pending_at_same_offset =
-                self.follow_bottom
-                    .as_ref()
-                    .is_some_and(|(session, pending_offset)| {
-                        session == session_id && *pending_offset == offset
-                    });
-            // A stream can grow the virtual list's max offset one frame
-            // before the pending correction moves the actual scroll handle.
-            // That temporary gap is not evidence that the user scrolled away.
-            if pending_at_same_offset || offset.y + self.scroll.max_offset().y <= px(16.) {
-                self.follow_bottom = Some((session_id.to_owned(), offset));
-            } else {
-                self.follow_bottom = None;
-            }
-        }
-    }
-
-    fn transcript_anchor(&self) -> Option<TranscriptAnchor> {
-        let rows = self.transcript.get(&self.active)?;
-        let offset = self.scroll.offset();
-        let has_load = self
-            .conversations
-            .get(&self.active)
-            .is_some_and(|conversation| conversation.next_cursor.is_some());
-        let cache = self.row_heights.get(&self.active)?.borrow();
-        let mut top = cache.provisional_prefix(rows, 0, has_load);
-        let visible_top = -offset.y;
-        for row in rows {
-            let bottom = top
-                + cache
-                    .entries
-                    .get(&row.key)
-                    .map_or(px(64.), |entry| entry.height);
-            if bottom > visible_top {
-                return Some(TranscriptAnchor {
-                    session: self.active.clone(),
-                    key: row.key.clone(),
-                    // A viewport in the load-earlier control anchors the
-                    // first message at its existing on-screen position.
-                    within: visible_top - top,
-                    offset,
-                });
-            }
-            top = bottom;
-        }
-        None
-    }
-
-    /// The Kit decides the visible range in prepaint. Before it reaches that
-    /// callback, hold the last exact viewport while measuring an unmeasured
-    /// jump; otherwise the callback would paint empty provisional slots.
-    fn guard_unmeasured_scroll(&mut self, window: &Window) {
-        let Some(rows) = self.transcript.get(&self.active) else {
-            return;
-        };
-        if rows.len() <= TRANSCRIPT_PROGRESSIVE_MIN_ROWS {
-            return;
-        }
-        if let Some(anchor) = &self.preserve_scroll
-            && anchor.session == self.active
-        {
-            if self.scroll.offset() == anchor.offset && rows.iter().any(|row| row.key == anchor.key)
-            {
-                return;
-            }
-            // A user movement or deletion of the anchored row supersedes it.
-            self.preserve_scroll = None;
-        }
-        let width = self.transcript_width(window);
-        let stamp = RowLayoutStamp {
-            width,
-            dark: self.dark,
-            style_revision: self.row_style_revision(),
-            epoch: self
-                .conversations
-                .get(&self.active)
-                .map_or(0, Conversation::cache_epoch),
-        };
-        let has_load = self
-            .conversations
-            .get(&self.active)
-            .is_some_and(|conversation| conversation.next_cursor.is_some());
-        let loading = self.loading_messages.contains_key(&self.active);
-        let cache = self
-            .row_heights
-            .entry(self.active.clone())
-            .or_default()
-            .clone();
-        let cache = cache.borrow();
-        if cache.stamp != Some(stamp) {
-            self.safe_scroll.remove(&self.active);
-            self.safe_anchors.remove(&self.active);
-            if self.zoom_follow_bottom
-                || self
-                    .follow_bottom
-                    .as_ref()
-                    .is_some_and(|(session, offset)| {
-                        session == &self.active && *offset == self.scroll.offset()
-                    })
-            {
-                self.pending_jump = None;
-                return;
-            }
-            // Keep a scrolled-up row stable across a resize/theme/snapshot
-            // invalidation while only its neighborhood is remeasured.
-            let current = self.scroll.offset();
-            let visible_top = (-current.y).max(px(0.));
-            let sizes = cache.provisional_sizes(rows, has_load, width);
-            let mut top = px(0.);
-            let mut row_index = rows.len() - 1;
-            for (index, item) in sizes.iter().enumerate() {
-                if top + item.height > visible_top {
-                    row_index = index
-                        .saturating_sub(usize::from(has_load))
-                        .min(rows.len() - 1);
-                    break;
-                }
-                top += item.height;
-            }
-            let within = visible_top - cache.provisional_prefix(rows, row_index, has_load);
-            let estimated_top = px(row_index as f32 * 64. + if has_load { 48. } else { 0. });
-            let parked = point(current.x, -(estimated_top + within));
-            self.pending_jump = Some(PendingTranscriptJump {
-                stamp,
-                anchor: TranscriptAnchor {
-                    session: self.active.clone(),
-                    key: rows[row_index].key.clone(),
-                    within,
-                    offset: parked,
-                },
-            });
-            self.scroll.set_offset(parked);
-            return;
-        }
-        let current = self.scroll.offset();
-        if self.zoom_follow_bottom {
-            self.pending_jump = None;
-            return;
-        }
-        if cache.sizes(rows, has_load, width).is_some() {
-            self.safe_scroll
-                .insert(self.active.clone(), (stamp, current));
-            self.pending_jump = None;
-            return;
-        }
-        let viewport_height = if self.scroll.bounds().size.height > px(0.) {
-            self.scroll.bounds().size.height
-        } else {
-            (window.viewport_size().height - px(220.)).max(px(160.))
-        };
-        let safe = self
-            .safe_scroll
-            .get(&self.active)
-            .filter(|(saved_stamp, _)| *saved_stamp == stamp)
-            .map(|(_, offset)| *offset);
-        if let Some(jump) = &self.pending_jump
-            && jump.stamp == stamp
-            && jump.anchor.session == self.active
-            && (safe == Some(current) || (safe.is_none() && current == jump.anchor.offset))
-        {
-            if let Some(index) = rows.iter().position(|row| row.key == jump.anchor.key) {
-                if cache.height(&rows[index]).is_none() {
-                    return; // Do not use a 64px estimate for a tall anchor.
-                }
-                let top = cache.provisional_prefix(rows, index, has_load);
-                let target = point(current.x, -(top + jump.anchor.within));
-                let range = cache.provisional_viewport(rows, has_load, target, viewport_height);
-                if cache.viewport_ready(rows, has_load, loading, range) {
-                    self.scroll.set_offset(target);
-                    self.safe_scroll
-                        .insert(self.active.clone(), (stamp, target));
-                    self.pending_jump = None;
-                }
-                return;
-            }
-            self.pending_jump = None; // The anchored row was deleted.
-        }
-        let range = cache.provisional_viewport(rows, has_load, current, viewport_height);
-        if cache.viewport_ready(rows, has_load, loading, range) {
-            if safe != Some(current) {
-                // A second user movement into a measured region supersedes the
-                // earlier deferred jump; never resume it on a later frame.
-                self.pending_jump = None;
-            }
-            self.safe_scroll
-                .insert(self.active.clone(), (stamp, current));
-            return;
-        }
-        if safe == Some(current)
-            || (safe.is_none()
-                && self
-                    .follow_bottom
-                    .as_ref()
-                    .is_some_and(|(session, offset)| session == &self.active && *offset == current))
-        {
-            return;
-        }
-        let visible_top = (-current.y).max(px(0.));
-        let sizes = cache.provisional_sizes(rows, has_load, width);
-        let mut top = px(0.);
-        let mut row_index = rows.len() - 1;
-        for (index, item) in sizes.iter().enumerate() {
-            if top + item.height > visible_top {
-                row_index = index
-                    .saturating_sub(usize::from(has_load))
-                    .min(rows.len() - 1);
-                break;
-            }
-            top += item.height;
-        }
-        let row_top = cache.provisional_prefix(rows, row_index, has_load);
-        self.pending_jump = Some(PendingTranscriptJump {
-            stamp,
-            anchor: TranscriptAnchor {
-                session: self.active.clone(),
-                key: rows[row_index].key.clone(),
-                within: visible_top - row_top,
-                offset: current,
-            },
-        });
-        self.follow_bottom = None;
-        if let Some(safe) = safe {
-            self.scroll.set_offset(safe);
-        }
-    }
-
-    fn correct_scroll(&mut self, window: &mut Window) {
-        let Some(rows) = self.transcript.get(&self.active) else {
-            return;
-        };
-        let width = self.transcript_width(window);
-        let stamp = RowLayoutStamp {
-            width,
-            dark: self.dark,
-            style_revision: self.row_style_revision(),
-            epoch: self
-                .conversations
-                .get(&self.active)
-                .map_or(0, Conversation::cache_epoch),
-        };
-        let has_load = self
-            .conversations
-            .get(&self.active)
-            .is_some_and(|conversation| conversation.next_cursor.is_some());
-        let Some(cache) = self.row_heights.get(&self.active) else {
-            return;
-        };
-        let cache = cache.borrow();
-        if cache.stamp != Some(stamp) {
-            return;
-        }
-        let exact_sizes = cache.sizes(rows, has_load, width);
-        if let Some(mut anchor) = self.preserve_scroll.take() {
-            if anchor.session == self.active
-                && self.scroll.offset() == anchor.offset
-                && let Some(index) = rows.iter().position(|row| row.key == anchor.key)
-            {
-                let top = if exact_sizes.is_some() {
-                    cache
-                        .prefix(rows, index, has_load)
-                        .unwrap_or_else(|| cache.provisional_prefix(rows, index, has_load))
-                } else {
-                    cache.provisional_prefix(rows, index, has_load)
-                };
-                let next = point(anchor.offset.x, -(top + anchor.within));
-                self.scroll.set_offset(next);
-                self.safe_scroll.insert(self.active.clone(), (stamp, next));
-                if exact_sizes.is_none() {
-                    anchor.offset = next;
-                    self.preserve_scroll = Some(anchor);
-                }
-            }
-        } else if self.preserve_scroll.is_none()
-            && let Some((session, offset)) = self.follow_bottom.clone()
-            && session == self.active
-        {
-            if self.scroll.offset() != offset && !self.zoom_follow_bottom {
-                self.follow_bottom = None; // The user moved away from the tail.
-                return;
-            }
-            let viewport_height = if self.scroll.bounds().size.height > px(0.) {
-                self.scroll.bounds().size.height
-            } else {
-                (window.viewport_size().height - px(220.)).max(px(160.))
-            };
-            // The virtual list may use provisional *offscreen* prefix sizes,
-            // but never place its visible tail in an unmeasured slot.
-            if exact_sizes.is_none() && cache.exact_tail(rows).1 < viewport_height + px(32.) {
-                return;
-            }
-            let sizes = exact_sizes
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| cache.provisional_sizes(rows, has_load, width));
-            let content_height = sizes.iter().fold(px(0.), |sum, item| sum + item.height);
-            let next = point(offset.x, -(content_height - viewport_height).max(px(0.)));
-            self.scroll.set_offset(next);
-            self.safe_scroll.insert(self.active.clone(), (stamp, next));
-            self.zoom_follow_bottom = false;
-            if exact_sizes.is_some() {
-                self.follow_bottom = None;
-            } else {
-                self.follow_bottom = Some((session, next));
-            }
-        } else if self.pending_jump.is_none()
-            && let Some((saved_stamp, mut anchor)) = self.safe_anchors.get(&self.active).cloned()
-            && saved_stamp == stamp
-            && anchor.offset == self.scroll.offset()
-            && let Some(index) = rows.iter().position(|row| row.key == anchor.key)
-        {
-            // An offscreen sticky/header row can replace its 64px estimate
-            // with a much taller exact height. Keep the painted semantic row
-            // at the same within-row position when that prefix changes.
-            let top = cache.provisional_prefix(rows, index, has_load);
-            let next = point(anchor.offset.x, -(top + anchor.within));
-            if next != anchor.offset {
-                self.scroll.set_offset(next);
-                self.safe_scroll.insert(self.active.clone(), (stamp, next));
-                anchor.offset = next;
-                self.safe_anchors
-                    .insert(self.active.clone(), (stamp, anchor));
-            }
-        }
     }
 
     fn handle_live_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
@@ -6005,10 +5050,25 @@ impl Client {
                                 } else {
                                     HashSet::new()
                                 };
-                                if cursor.is_some() && self.active == session_id {
-                                    self.preserve_scroll = self.transcript_anchor();
-                                    self.follow_bottom = None;
-                                }
+                                // Preserve a message identity, not a height or
+                                // pixel displacement. GPUI aligns the same row
+                                // using the new natural layout after prepend.
+                                let anchor = if cursor.is_some() && self.active == session_id {
+                                    self.follow_bottom = false;
+                                    let first = usize::from(
+                                        self.conversations.get(&session_id).is_some_and(
+                                            |conversation| conversation.next_cursor.is_some(),
+                                        ),
+                                    );
+                                    self.transcript
+                                        .get(&session_id)
+                                        .and_then(|rows| {
+                                            rows.get(self.scroll.top_item().saturating_sub(first))
+                                        })
+                                        .map(|row| row.key.clone())
+                                } else {
+                                    None
+                                };
                                 let conversation =
                                     self.conversations.entry(session_id.clone()).or_default();
                                 if cursor.is_some() {
@@ -6041,6 +5101,16 @@ impl Client {
                                 }
                                 conversation.reconcile_shell_exits(&self.terminal_shells);
                                 self.update_transcript(&session_id);
+                                if let Some(key) = anchor
+                                    && let Some(index) = self.transcript[&session_id]
+                                        .iter()
+                                        .position(|row| row.key == key)
+                                {
+                                    let first = usize::from(
+                                        self.conversations[&session_id].next_cursor.is_some(),
+                                    );
+                                    self.scroll.scroll_to_top_of_item(index + first);
+                                }
                                 self.maybe_dispatch_deferred_abort(&session_id);
                                 self.resolve_late_prompt_confirmation(&session_id);
                             }
@@ -6393,17 +5463,7 @@ impl Client {
                             self.transcript.remove(&id);
                             self.transcript_spans.remove(&id);
                             self.attachments.remove_session(&id);
-                            self.row_heights.remove(&id);
-                            self.virtual_scrolls.remove(&id);
-                            self.safe_scroll.remove(&id);
-                            self.safe_anchors.remove(&id);
-                            if self
-                                .pending_jump
-                                .as_ref()
-                                .is_some_and(|jump| jump.anchor.session == id)
-                            {
-                                self.pending_jump = None;
-                            }
+                            self.transcript_scrolls.remove(&id);
                             self.composers.remove(&id);
                             self.skip_prune_for_load.remove(&id);
                             self.attachment_drafts.remove(&id);
@@ -6623,6 +5683,18 @@ impl Client {
                 conversations.insert(session.id.clone(), conversation);
             }
         }
+        if overlay.as_deref() == Some("long-transcript") {
+            let conversation = conversations.get_mut(&active).unwrap();
+            conversation.replace_from_api(&preview::long_transcript_messages(), None);
+            update_session_projection(
+                &active,
+                conversation,
+                transcript.get_mut(&active).unwrap(),
+                transcript_spans.get_mut(&active).unwrap(),
+                &mut attachments,
+                None,
+            );
+        }
         let preview_markdown = match overlay.as_deref() {
             Some("complex-markdown") => Some(COMPLEX_MARKDOWN_PREVIEW),
             Some("long-ordered-list") => Some(LONG_ORDERED_LIST_PREVIEW),
@@ -6651,7 +5723,7 @@ impl Client {
             } => catalog,
             _ => ModelCatalog::default(),
         };
-        let scroll = VirtualListScrollHandle::new();
+        let scroll = ScrollHandle::new();
         let mut client = Self {
             dark: Theme::global(cx).is_dark(),
             api: None,
@@ -6687,9 +5759,8 @@ impl Client {
             skip_prune_for_load: HashMap::new(),
             message_events_during_load: HashMap::new(),
             reload_after_load: HashSet::new(),
-            preserve_scroll: None,
-            follow_bottom: Some((active.clone(), scroll.offset())),
-            zoom_follow_bottom: false,
+            follow_bottom: true,
+            transcript_pointer_down: false,
             catalogs: HashMap::new(),
             model_retry_count: HashMap::new(),
             model_retry_scheduled: HashSet::new(),
@@ -6713,8 +5784,7 @@ impl Client {
             active: active.clone(),
             transcript,
             transcript_spans,
-            row_heights: HashMap::new(),
-            virtual_scrolls: HashMap::from([(active, scroll.clone())]),
+            transcript_scrolls: HashMap::from([(active, scroll.clone())]),
             attachments,
             catalog,
             composer: cx.new(|cx| {
@@ -6747,9 +5817,6 @@ impl Client {
             next_autoscroll_token: 0,
             scroll,
             transcript_content_width: px(420.),
-            safe_scroll: HashMap::new(),
-            safe_anchors: HashMap::new(),
-            pending_jump: None,
             history_focus: cx.focus_handle().tab_stop(true),
             retry_history_focus: cx.focus_handle().tab_stop(true),
             sessions_picker_scroll: ScrollHandle::new(),
@@ -7765,16 +6832,6 @@ impl Client {
     // Keep the actual row and the detached measurement probe on this same
     // renderer. A text-length estimate cannot model GPUI's Markdown wrapping.
     fn message_row(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> Stateful<Div> {
-        self.message_row_with_images(row, index, None, cx)
-    }
-
-    fn message_row_with_images(
-        &self,
-        row: &TranscriptRow,
-        index: usize,
-        stale_images: Option<&[Option<Arc<Image>>]>,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
         let user = row.role.label() == "YOU";
         let last = self
             .transcript
@@ -7834,11 +6891,7 @@ impl Client {
             _ => body = body.child(row.body.clone()),
         }
         for (image_index, image) in row.images.iter().enumerate() {
-            let source = if let Some(stale_images) = stale_images {
-                stale_images.get(image_index).and_then(Option::as_ref)
-            } else {
-                self.attachments.get(&self.active, row, image_index)
-            };
+            let source = self.attachments.get(&self.active, row, image_index);
             let (width, height) = source
                 .and_then(|source| imagesize::blob_size(source.bytes()).ok())
                 .map_or_else(
@@ -7878,8 +6931,6 @@ impl Client {
         div()
             .id(("message", index))
             .w_full()
-            // The transcript inherits these from app-root. Make them explicit
-            // so a detached root gets the same text metrics as a mounted row.
             .font_family("Noto Sans")
             .text_size(self.scaled(13.))
             .flex_shrink_0()
@@ -7889,7 +6940,7 @@ impl Client {
             .px(self.scaled(28.))
             .pt(self.scaled(18.))
             // Agent segments stay continuous. A final user row replaces its
-            // separator with padding so an append keeps its measured height.
+            // separator with padding to keep consistent spacing on append.
             .pb(self.scaled(if user && last { 21. } else { 20. }))
             .bg(shade)
             .when(user, |view| {
@@ -7921,210 +6972,6 @@ impl Client {
                     ),
             )
             .child(body)
-    }
-
-    fn message(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> AnyElement {
-        self.message_with_images(row, index, None, cx)
-    }
-
-    fn message_with_images(
-        &self,
-        row: &TranscriptRow,
-        index: usize,
-        stale_images: Option<&[Option<Arc<Image>>]>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let element = self.message_row_with_images(row, index, stale_images, cx);
-        let element = element.into_any_element();
-        if stale_images.is_none()
-            && let Some(cache) = self.row_heights.get(&self.active)
-            && let Some(stamp) = cache.borrow().stamp
-        {
-            TranscriptMeasuredRow {
-                row: element,
-                cache: cache.clone(),
-                stamp,
-                key: row.key.clone(),
-                revision: row.render_revision(),
-            }
-            .into_any_element()
-        } else {
-            element
-        }
-    }
-
-    /// The fixed sidebar and gutter leave the same definite width for mounted
-    /// and detached rows, including the first frame after a window resize.
-    fn row_measurement_probe(
-        &mut self,
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> Option<TranscriptMeasurementProbe> {
-        let transcript = self.transcript.get(&self.active)?;
-        let width = self.transcript_width(window);
-        if width <= px(0.) {
-            return None;
-        }
-        let stamp = RowLayoutStamp {
-            width,
-            dark: self.dark,
-            style_revision: self.row_style_revision(),
-            epoch: self
-                .conversations
-                .get(&self.active)
-                .map_or(0, Conversation::cache_epoch),
-        };
-        let cache = self
-            .row_heights
-            .entry(self.active.clone())
-            .or_default()
-            .clone();
-        let load = self
-            .conversations
-            .get(&self.active)
-            .and_then(|conversation| conversation.next_cursor.clone());
-        let target_anchor = self
-            .pending_jump
-            .as_ref()
-            .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
-            .map(|jump| &jump.anchor)
-            .or_else(|| {
-                self.preserve_scroll
-                    .as_ref()
-                    .filter(|anchor| anchor.session == self.active)
-            });
-        let pending_range = target_anchor.and_then(|anchor| {
-            transcript
-                .iter()
-                .position(|row| row.key == anchor.key)
-                .map(|index| {
-                    let cache = cache.borrow();
-                    if cache.stamp != Some(stamp) || cache.height(&transcript[index]).is_none() {
-                        return index..index + 1;
-                    }
-                    let top = cache.provisional_prefix(transcript, index, load.is_some());
-                    let viewport_height = if self.scroll.bounds().size.height > px(0.) {
-                        self.scroll.bounds().size.height
-                    } else {
-                        (window.viewport_size().height - px(220.)).max(px(160.))
-                    };
-                    let range = cache.provisional_viewport(
-                        transcript,
-                        load.is_some(),
-                        point(px(0.), -(top + anchor.within)),
-                        viewport_height,
-                    );
-                    range.start.saturating_sub(1 + usize::from(load.is_some()))
-                        ..(range.end + 1)
-                            .min(transcript.len() + usize::from(load.is_some()))
-                            .saturating_sub(usize::from(load.is_some()))
-                })
-        });
-        let mut missing = if transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS {
-            if let Some(range) = pending_range {
-                cache
-                    .borrow_mut()
-                    .missing_range(stamp, transcript, range, TRANSCRIPT_MEASURE_BATCH)
-            } else {
-                let viewport_height = if self.scroll.bounds().size.height > px(0.) {
-                    self.scroll.bounds().size.height
-                } else {
-                    (window.viewport_size().height - px(220.)).max(px(160.))
-                };
-                let follows_bottom = self.zoom_follow_bottom
-                    || self
-                        .follow_bottom
-                        .as_ref()
-                        .is_some_and(|(session, offset)| {
-                            session == &self.active && *offset == self.scroll.offset()
-                        });
-                let need_tail = follows_bottom && {
-                    let cache = cache.borrow();
-                    cache.stamp != Some(stamp)
-                        || cache.exact_tail(transcript).1 < viewport_height + px(32.)
-                };
-                if need_tail {
-                    cache.borrow_mut().missing_tail(
-                        stamp,
-                        transcript,
-                        TRANSCRIPT_MEASURE_BATCH,
-                        viewport_height + px(32.),
-                    )
-                } else {
-                    let range = cache.borrow().provisional_viewport(
-                        transcript,
-                        load.is_some(),
-                        self.scroll.offset(),
-                        viewport_height,
-                    );
-                    cache.borrow_mut().missing_range(
-                        stamp,
-                        transcript,
-                        range.start.saturating_sub(1 + usize::from(load.is_some()))
-                            ..(range.end + 1)
-                                .min(transcript.len() + usize::from(load.is_some()))
-                                .saturating_sub(usize::from(load.is_some())),
-                        TRANSCRIPT_MEASURE_BATCH,
-                    )
-                }
-            }
-        } else {
-            cache.borrow_mut().missing(stamp, transcript)
-        };
-        if transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS && self.scroll.offset().y < px(-1.) {
-            let cache = cache.borrow();
-            let positions = cache.provisional_positions(transcript, load.is_some());
-            let visible_top = -self.scroll.offset().y;
-            let sticky = transcript
-                .iter()
-                .enumerate()
-                .filter(|(index, row)| row.role.label() == "YOU" && positions[*index] < visible_top)
-                .map(|(index, _)| index)
-                .next_back();
-            if let Some(index) = sticky
-                && cache.height(&transcript[index]).is_none()
-                && !missing.contains(&index)
-            {
-                missing.push(index);
-            }
-        }
-        let loading = self.loading_messages.contains_key(&self.active);
-        let measure_load = load.as_ref().is_some_and(|_| {
-            cache
-                .borrow()
-                .load_height
-                .is_none_or(|(was_loading, _)| was_loading != loading)
-        });
-        if missing.is_empty() && !measure_load {
-            return None;
-        }
-        Some(TranscriptMeasurementProbe {
-            rows: missing
-                .into_iter()
-                .map(|index| {
-                    let row = &transcript[index];
-                    (
-                        row.key.clone(),
-                        row.render_revision(),
-                        self.message_row(row, index, cx).into_any_element(),
-                    )
-                })
-                .collect(),
-            load: if measure_load {
-                load.map(|cursor| {
-                    (
-                        loading,
-                        self.load_earlier_row(cursor, loading, cx)
-                            .into_any_element(),
-                    )
-                })
-            } else {
-                None
-            },
-            stamp,
-            cache,
-            spacer: div().size(px(0.)),
-        })
     }
 
     fn load_earlier_row(&self, cursor: String, loading: bool, cx: &Context<Self>) -> Stateful<Div> {
@@ -8563,18 +7410,68 @@ impl Client {
         Some(pill.into_any_element())
     }
 
-    fn chat(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+    fn chat(&self, _window: &Window, cx: &Context<Self>) -> AnyElement {
+        if self.follow_bottom {
+            self.scroll.scroll_to_bottom();
+        }
+        let scroll = self.scroll.clone();
+        let client = cx.entity().downgrade();
+        let session = self.active.clone();
+        let following = self.follow_bottom;
+        let generation = self.connection_generation;
+        let rendered_top = scroll.top_item();
         // GTK reserves a permanent 14px gutter for the transcript scrollbar.
         let mut rows = div()
+            .on_children_prepainted(move |_, window, cx| {
+                // Read GPUI's resolved scroll state; never calculate row heights
+                // or content extents. A late Markdown/image layout can grow the
+                // content after the one-shot bottom request was consumed.
+                let at_bottom = scroll.offset().y <= -scroll.max_offset().y;
+                if following != at_bottom || scroll.top_item() != rendered_top {
+                    let client = client.clone();
+                    let session = session.clone();
+                    window.defer(cx, move |_, cx| {
+                        let _ = client.update(cx, |this, cx| {
+                            if this.active != session || this.connection_generation != generation {
+                                return;
+                            }
+                            // Recheck after input dispatch, outside prepaint.
+                            // Refresh during prepaint itself cannot schedule a frame.
+                            let at_bottom = this.scroll.offset().y <= -this.scroll.max_offset().y;
+                            let was_following = this.follow_bottom;
+                            let request_bottom = was_following && !at_bottom;
+                            if at_bottom
+                                && !this.transcript_pointer_down
+                                && this.autoscroll.is_none()
+                            {
+                                this.follow_bottom = true;
+                            }
+                            if request_bottom
+                                || was_following != this.follow_bottom
+                                || this.scroll.top_item() != rendered_top
+                            {
+                                // Only render may issue the native bottom request,
+                                // using the latest follow flag immediately before
+                                // prepaint. Never leave one queued across input.
+                                cx.notify();
+                            }
+                        });
+                    });
+                }
+            })
             .id("transcript")
             .size_full()
             .overflow_y_scroll()
-            .track_scroll(self.scroll.base_handle())
+            .track_scroll(&self.scroll)
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.follow_bottom = false;
+                cx.notify();
+            }))
             .w_full()
             .pr(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
             .flex()
             .flex_col();
-        let sticky = self.sticky_user_row(window).map(|row| {
+        let sticky = self.sticky_user_row().map(|row| {
             div()
                 .id("sticky-user")
                 .test_support()
@@ -8622,354 +7519,40 @@ impl Client {
             .conversations
             .get(&self.active)
             .is_some_and(|conversation| conversation.next_cursor.is_some());
-        let width = self.transcript_width(window);
-        let stamp = RowLayoutStamp {
-            width,
-            dark: self.dark,
-            style_revision: self.row_style_revision(),
-            epoch: self
-                .conversations
-                .get(&self.active)
-                .map_or(0, Conversation::cache_epoch),
-        };
-        let layout = self.transcript.get(&self.active).and_then(|transcript| {
-            self.row_heights.get(&self.active).and_then(|cache| {
-                let cache = cache.borrow();
-                (cache.stamp == Some(stamp)).then(|| {
-                    let load_current = !has_load
-                        || cache.load_height.map(|(loading, _)| loading)
-                            == Some(self.loading_messages.contains_key(&self.active));
-                    // Freeze which slots had exact heights at render time.
-                    // The probe records misses during request_layout, before
-                    // virtual prepaint. Reading the live cache in the renderer
-                    // would paint freshly measured content into *old* sizes.
-                    let mut ready = Vec::with_capacity(transcript.len() + usize::from(has_load));
-                    if has_load {
-                        ready.push(load_current);
-                    }
-                    ready.extend(transcript.iter().map(|row| cache.height(row).is_some()));
-                    let stale = transcript
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, row)| {
-                            (!ready[index + usize::from(has_load)])
-                                .then(|| cache.stale.get(&row.key))
-                                .flatten()
-                                .filter(|old| {
-                                    old.row.render_revision() != row.render_revision()
-                                        && cache.entries.get(&row.key).is_some_and(|entry| {
-                                            entry.revision == old.row.render_revision()
-                                                && entry.height == old.height
-                                        })
-                                })
-                                .map(|old| (index, old.clone()))
-                        })
-                        .collect::<HashMap<_, _>>();
-                    let viewport_height = if self.scroll.bounds().size.height > px(0.) {
-                        self.scroll.bounds().size.height
-                    } else {
-                        (window.viewport_size().height - px(220.)).max(px(160.))
-                    };
-                    let viewport = cache.provisional_viewport(
-                        transcript,
-                        has_load,
-                        self.scroll.offset(),
-                        viewport_height,
-                    );
-                    let safe_partial = cache.viewport_ready(
-                        transcript,
-                        has_load,
-                        self.loading_messages.contains_key(&self.active),
-                        viewport,
-                    );
-                    let anchor_unmeasured = self
-                        .pending_jump
-                        .as_ref()
-                        .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
-                        .map(|jump| &jump.anchor)
-                        .or_else(|| {
-                            self.preserve_scroll
-                                .as_ref()
-                                .filter(|anchor| anchor.session == self.active)
-                        })
-                        .and_then(|anchor| transcript.iter().find(|row| row.key == anchor.key))
-                        .is_some_and(|row| cache.height(row).is_none());
-                    let parked_at_safe_viewport = self.preserve_scroll.is_none()
-                        && self.safe_scroll.get(&self.active).is_some_and(
-                            |(saved_stamp, offset)| {
-                                *saved_stamp == stamp && *offset == self.scroll.offset()
-                            },
-                        )
-                        && safe_partial;
-                    // A single newly appended visible row has no stale
-                    // snapshot. Do not paint an empty provisional virtual
-                    // slot for one frame; use the bounded natural slice until
-                    // its exact height is available.
-                    if (anchor_unmeasured && !parked_at_safe_viewport) || !safe_partial {
-                        return None;
-                    }
-                    let sizes = if ready.iter().all(|ready| *ready) {
-                        cache.sizes(transcript, has_load, width)
-                    } else {
-                        None
-                    }
-                    .unwrap_or_else(|| cache.provisional_sizes(transcript, has_load, width));
-                    Some((sizes, ready, stale))
-                })?
-            })
-        });
-        let content: AnyElement = if let Some((sizes, ready, stale)) = layout {
-            let session = self.active.clone();
-            v_virtual_list(
-                cx.entity(),
-                "transcript",
-                sizes,
-                move |client, range, _, cx| {
-                    let Some(transcript) = client.transcript.get(&session) else {
-                        return Vec::new();
-                    };
-                    let has_load = client
-                        .conversations
-                        .get(&session)
-                        .is_some_and(|conversation| conversation.next_cursor.is_some());
-                    range
-                        .map(|index| {
-                            if has_load && index == 0 {
-                                if !ready[index] {
-                                    return div().into_any_element();
-                                }
-                                let loading = client.loading_messages.contains_key(&session);
-                                let cursor =
-                                    client.conversations[&session].next_cursor.clone().unwrap();
-                                client.load_earlier_element(cursor, loading, cx)
-                            } else if !ready[index] {
-                                let row_index = index - usize::from(has_load);
-                                stale.get(&row_index).map_or_else(
-                                    || div().into_any_element(),
-                                    |old| {
-                                        client.message_with_images(
-                                            &old.row,
-                                            row_index,
-                                            Some(&old.images),
-                                            cx,
-                                        )
-                                    },
-                                )
-                            } else {
-                                let row_index = index - usize::from(has_load);
-                                client.message(&transcript[row_index], row_index, cx)
-                            }
-                        })
-                        .collect()
-                },
-            )
-            .track_scroll(&self.scroll)
-            .pr(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
-            .into_any_element()
-        } else {
-            // A first layout or width/style change has no usable measurements.
-            // Natural rows avoid guessing their geometry while the probe runs.
-            // On a large first visit paint only a bounded tail rather than
-            // mounting the entire unmeasured history before virtualization.
-            if let Some(transcript) = self.transcript.get(&self.active) {
-                let tail_only = transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
-                    && self
-                        .follow_bottom
-                        .as_ref()
-                        .is_some_and(|(id, _)| id == &self.active);
-                let pending_index = self
-                    .pending_jump
-                    .as_ref()
-                    .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
-                    .map(|jump| &jump.anchor)
-                    .or_else(|| {
-                        self.preserve_scroll
-                            .as_ref()
-                            .filter(|anchor| anchor.session == self.active)
-                    })
-                    .and_then(|anchor| transcript.iter().position(|row| row.key == anchor.key));
-                let has_load = self
-                    .conversations
-                    .get(&self.active)
-                    .is_some_and(|conversation| conversation.next_cursor.is_some());
-                let viewport_height = if self.scroll.bounds().size.height > px(0.) {
-                    self.scroll.bounds().size.height
-                } else {
-                    (window.viewport_size().height - px(220.)).max(px(160.))
-                };
-                let fallback_budget = transcript_fallback_budget(viewport_height);
-                let current_range = if pending_index.is_none()
-                    && transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
-                    && !tail_only
-                {
-                    self.row_heights.get(&self.active).map(|cache| {
-                        cache.borrow().provisional_viewport(
-                            transcript,
-                            has_load,
-                            self.scroll.offset(),
-                            viewport_height,
-                        )
-                    })
-                } else {
-                    None
-                };
-                let target_index = pending_index.or_else(|| {
-                    current_range.as_ref().map(|range| {
-                        range
-                            .start
-                            .saturating_sub(usize::from(has_load))
-                            .min(transcript.len() - 1)
-                    })
-                });
-                let bounded_target = transcript.len() > TRANSCRIPT_PROGRESSIVE_MIN_ROWS
-                    && !tail_only
-                    && target_index.is_some();
-                let start = if let Some(index) = target_index.filter(|_| bounded_target) {
-                    let within = self
-                        .pending_jump
-                        .as_ref()
-                        .filter(|jump| jump.stamp == stamp && jump.anchor.session == self.active)
-                        .map(|jump| jump.anchor.within)
-                        .or_else(|| {
-                            self.preserve_scroll
-                                .as_ref()
-                                .filter(|anchor| anchor.session == self.active)
-                                .map(|anchor| anchor.within)
-                        })
-                        .unwrap_or(px(0.));
-                    if within >= px(0.) {
-                        // A tall anchor can begin far above the viewport. Do
-                        // not put unmeasured natural rows ahead of it after an
-                        // estimated spacer: their real heights would shift it.
-                        index
-                    } else {
-                        index.saturating_sub(fallback_budget)
-                    }
-                } else if tail_only {
-                    let measured_tail = self.row_heights.get(&self.active).map_or(0, |cache| {
-                        let cache = cache.borrow();
-                        if cache.stamp == Some(stamp) {
-                            cache.exact_tail(transcript).0
-                        } else {
-                            0
-                        }
-                    });
-                    transcript
-                        .len()
-                        .saturating_sub(measured_tail + fallback_budget)
-                } else {
-                    0
-                };
-                let end =
-                    target_index
-                        .filter(|_| bounded_target)
-                        .map_or(transcript.len(), |index| {
-                            (index + fallback_budget + 1)
-                                .max(current_range.as_ref().map_or(0, |range| {
-                                    range.end.saturating_sub(usize::from(has_load))
-                                        + fallback_budget
-                                }))
-                                .min(transcript.len())
-                        });
-                if bounded_target
-                    && start > 0
-                    && let Some(cache) = self.row_heights.get(&self.active)
-                {
-                    let height = cache
-                        .borrow()
-                        .provisional_prefix(transcript, start, has_load);
-                    rows = rows.child(div().h(height).flex_shrink_0());
-                }
-                if !tail_only
-                    && start == 0
-                    && let Some(cursor) = self
-                        .conversations
-                        .get(&self.active)
-                        .and_then(|conversation| conversation.next_cursor.clone())
-                {
-                    let loading = self.loading_messages.contains_key(&self.active);
-                    rows = rows.child(self.load_earlier_element(cursor, loading, cx));
-                }
-                for (index, row) in transcript.iter().enumerate().take(end).skip(start) {
-                    rows = rows.child(self.message(row, index, cx));
-                }
-                if bounded_target
-                    && end < transcript.len()
-                    && let Some(cache) = self.row_heights.get(&self.active)
-                {
-                    let cache = cache.borrow();
-                    let remaining =
-                        cache.provisional_prefix(transcript, transcript.len(), has_load)
-                            - cache.provisional_prefix(transcript, end, has_load);
-                    rows = rows.child(div().h(remaining).flex_shrink_0());
-                }
+        if has_load {
+            let cursor = self.conversations[&self.active]
+                .next_cursor
+                .clone()
+                .unwrap();
+            let loading = self.loading_messages.contains_key(&self.active);
+            rows = rows.child(self.load_earlier_element(cursor, loading, cx));
+        }
+        if let Some(transcript) = self.transcript.get(&self.active) {
+            for (index, row) in transcript.iter().enumerate() {
+                rows = rows.child(self.message_row(row, index, cx));
             }
-            rows.into_any_element()
-        };
+        }
         div()
             .flex_1()
             .min_h_0()
             .relative()
             // Clip scroll content at the chat edge, including subpixel glyphs above the sticky row.
             .overflow_hidden()
-            .child(content)
+            .child(rows)
             .when_some(sticky, |view, sticky| view.child(sticky))
             .vertical_scrollbar(&self.scroll)
             .into_any_element()
     }
 
-    fn sticky_user_row(&self, window: &Window) -> Option<&TranscriptRow> {
-        if self.scroll.offset().y >= px(-1.) {
-            return None;
-        }
+    fn sticky_user_row(&self) -> Option<&TranscriptRow> {
         let transcript = self.transcript.get(&self.active)?;
-        let viewport = self.scroll.bounds();
-        let top = viewport.origin.y;
-        let bottom = top + viewport.size.height;
-        let first_child = usize::from(
-            self.conversations
-                .get(&self.active)
-                .is_some_and(|conversation| conversation.next_cursor.is_some()),
-        );
-        let measured = self
-            .row_heights
+        let has_load = self
+            .conversations
             .get(&self.active)
-            .map(|cache| cache.borrow());
-        let measured = measured.as_ref().filter(|cache| {
-            cache.stamp.is_some_and(|stamp| {
-                stamp.dark == self.dark
-                    && stamp.style_revision == self.row_style_revision()
-                    && stamp.width == self.transcript_width(window)
-                    && stamp.epoch
-                        == self
-                            .conversations
-                            .get(&self.active)
-                            .map_or(0, Conversation::cache_epoch)
-            })
-        });
-        let positions =
-            measured.map(|cache| cache.provisional_positions(transcript, first_child != 0));
-        let users = transcript.iter().enumerate().filter_map(|(index, row)| {
-            if row.role.label() != "YOU" {
-                return None;
-            }
-            if let (Some(cache), Some(positions)) = (measured, &positions) {
-                let row_top = top + self.scroll.offset().y + positions[index];
-                let height = cache
-                    .entries
-                    .get(&row.key)
-                    .map_or(px(64.), |entry| entry.height);
-                Some((index, row_top, row_top + height))
-            } else {
-                let bounds = self.scroll.bounds_for_item(index + first_child)?;
-                let row_top = bounds.origin.y + self.scroll.offset().y;
-                Some((index, row_top, row_top + bounds.size.height))
-            }
-        });
-        sticky_user_index(users, top, bottom).and_then(|index| {
-            let row = transcript.get(index)?;
-            (measured.is_none_or(|cache| cache.height(row).is_some())).then_some(row)
-        })
+            .is_some_and(|conversation| conversation.next_cursor.is_some());
+        let (top, displacement) = self.scroll.logical_scroll_top();
+        sticky_user_index(transcript, top, has_load, displacement == px(0.))
+            .and_then(|index| transcript.get(index))
     }
 
     fn resume_warning(&self, cx: &Context<Self>) -> Option<String> {
@@ -11142,10 +9725,8 @@ impl Render for Client {
             let viewport = window.viewport_size();
             latency::global().context(latency::Context {
                 transcript_rows: self.transcript.get(&self.active).map_or(0, Vec::len),
-                measured_rows: self
-                    .row_heights
-                    .get(&self.active)
-                    .map_or(0, |cache| cache.borrow().entries.len()),
+                // Legacy trace field; natural overflow has no app-owned measurements.
+                measured_rows: 0,
                 busy_tabs: self
                     .open_tabs
                     .iter()
@@ -11363,31 +9944,6 @@ impl Render for Client {
                 },
             );
         }
-        self.guard_unmeasured_scroll(window);
-        if self.preserve_scroll.is_none()
-            && self.pending_jump.is_none()
-            && self.follow_bottom.is_none()
-            && let Some(cache) = self.row_heights.get(&self.active)
-            && let Some(stamp) = cache.borrow().stamp
-            && self
-                .safe_scroll
-                .get(&self.active)
-                .is_some_and(|(saved_stamp, offset)| {
-                    *saved_stamp == stamp && *offset == self.scroll.offset()
-                })
-            && self
-                .safe_anchors
-                .get(&self.active)
-                .is_none_or(|(saved_stamp, anchor)| {
-                    *saved_stamp != stamp || anchor.offset != self.scroll.offset()
-                })
-            && let Some(anchor) = self.transcript_anchor()
-        {
-            self.safe_anchors
-                .insert(self.active.clone(), (stamp, anchor));
-        }
-        let row_probe = self.row_measurement_probe(window, cx);
-        self.correct_scroll(window);
         let visible_permission_id = if self.modal.is_none() {
             self.visible_permission().map(|item| item.request.id)
         } else {
@@ -11408,6 +9964,7 @@ impl Render for Client {
             .permission_card(cx)
             .unwrap_or_else(|| self.composer(window, cx));
         self.ensure_jobs_elapsed_refresh(cx);
+        let pointer_client = cx.entity().downgrade();
         let root = div()
             .id("app-root")
             .size_full()
@@ -11415,16 +9972,27 @@ impl Render for Client {
             .child(
                 canvas(
                     |_, _, _| (),
-                    |_, (), window, _| {
+                    move |_, (), window, _| {
                         latency::global().paint();
                         window.on_mouse_event::<ScrollWheelEvent>(|_, phase, _, cx| {
                             if phase.capture() {
                                 trace_input(TraceAction::Scroll, cx);
                             }
                         });
-                        window.on_mouse_event::<MouseUpEvent>(|_, phase, _, cx| {
+                        let client = pointer_client.clone();
+                        window.on_mouse_event::<MouseUpEvent>(move |event, phase, _, cx| {
                             if phase.capture() {
                                 trace_input(TraceAction::Pointer, cx);
+                                // Window-wide release also covers a thumb released
+                                // outside the transcript or over an opaque child.
+                                if event.button == MouseButton::Left {
+                                    let _ = client.update(cx, |this, cx| {
+                                        if this.transcript_pointer_down {
+                                            this.transcript_pointer_down = false;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
                             }
                         });
                     },
@@ -11442,6 +10010,13 @@ impl Render for Client {
                 }
             }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if this.modal.is_none() && this.scroll.bounds().contains(&event.position) {
+                    // Yield to scrollbar dragging and selection before the
+                    // next render can issue another follow-bottom request.
+                    this.follow_bottom = false;
+                    this.transcript_pointer_down = event.button == MouseButton::Left;
+                    cx.notify();
+                }
                 if event.button == MouseButton::Middle
                     && this.modal.is_none()
                     && this.link_menu.is_none()
@@ -11661,12 +10236,7 @@ impl Render for Client {
                         .child(feedback.label),
                 )
             });
-        client_frame(
-            root.when_some(row_probe, |view, probe| view.child(probe))
-                .into_any_element(),
-            window,
-            self.dark,
-        )
+        client_frame(root.into_any_element(), window, self.dark)
     }
 }
 
@@ -11882,13 +10452,13 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        COMPLEX_MARKDOWN_PREVIEW, LONG_ORDERED_LIST_PREVIEW, MarkdownBlock, RowHeightCache,
-        RowLayoutStamp, SESSION_PICKER_LIMIT, TRANSCRIPT_ROW_STYLE_REVISION, TabAttention,
-        filter_all_sessions, filter_levels, filter_models, filter_new_session_projects,
-        filter_tab_sessions, frame_resize_edge, fuzzy_score, markdown_blocks, markdown_view_id,
-        model, needs_new_connection, new_session_choice, picker_list_height, reorder_tab_ids,
-        safe_connection_error, splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
-        unread_on_server_switch, update_session_projection,
+        COMPLEX_MARKDOWN_PREVIEW, LONG_ORDERED_LIST_PREVIEW, MarkdownBlock, SESSION_PICKER_LIMIT,
+        TabAttention, filter_all_sessions, filter_levels, filter_models,
+        filter_new_session_projects, filter_tab_sessions, frame_resize_edge, fuzzy_score,
+        markdown_blocks, markdown_view_id, model, needs_new_connection, new_session_choice,
+        picker_list_height, reorder_tab_ids, safe_connection_error, splice_transcript,
+        sticky_user_index, tab_indicator, tab_number_key, unread_on_server_switch,
+        update_session_projection,
     };
     use gpui_kit::{ResizeEdge, Tiling, WindowBackgroundAppearance, point, px, size};
     use opencode_gpui::model::RunStatus;
@@ -12112,7 +10682,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_tail_of_tool_heavy_message_keeps_unchanged_row_heights() {
+    fn streaming_tail_of_tool_heavy_message_keeps_unchanged_row_revisions() {
         let mut conversation = model::Conversation::default();
         let mut content = vec![json!({ "type": "text", "text": "Starting work" })];
         for index in 0..12 {
@@ -12138,17 +10708,6 @@ mod tests {
             "tool and text segments must form distinct rows"
         );
         let original = rows.clone();
-        let stamp = RowLayoutStamp {
-            width: px(500.),
-            dark: false,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
-            epoch: conversation.cache_epoch(),
-        };
-        let mut heights = RowHeightCache::default();
-        assert_eq!(heights.missing(stamp, &rows).len(), rows.len());
-        for row in &rows {
-            heights.record(stamp, row.key.clone(), row.render_revision(), px(60.));
-        }
 
         assert!(conversation.apply_event(&json!({
             "id": "evt_00000000000000000000000001", "created": 2000,
@@ -12157,7 +10716,7 @@ mod tests {
                 "ordinal": 1, "delta": " streamed"
             }
         })));
-        let change = splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
+        splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
         assert_eq!(rows.len(), original.len());
         let changed: Vec<_> = rows
             .iter()
@@ -12169,12 +10728,8 @@ mod tests {
             assert_eq!(row.key, old.key);
             assert_eq!(row.render_revision(), old.render_revision());
         }
-        heights.retain_replaced(&rows, &change);
-        assert_eq!(heights.missing(stamp, &rows), changed);
-        assert_eq!(heights.stale.len(), 1);
-
         // An unrelated replacement snapshot with the same IDs must not reuse
-        // the previous epoch's cached heights or retained row revisions.
+        // the previous epoch's retained row revisions.
         snapshot(
             &mut conversation,
             vec![json!({
@@ -12183,15 +10738,11 @@ mod tests {
             })],
         );
         splice_transcript(&conversation, &mut rows, &mut spans).unwrap();
-        let next_stamp = RowLayoutStamp {
-            epoch: conversation.cache_epoch(),
-            ..stamp
-        };
-        assert_eq!(heights.missing(next_stamp, &rows), vec![0]);
+        assert_eq!(rows, full_rows(&conversation));
     }
 
     #[test]
-    fn ten_thousand_offscreen_images_are_registered_without_decoding() {
+    fn image_registration_does_not_decode_before_render() {
         let mut cache = super::ImageCache::default();
         let rows: Vec<_> = (0..10_000)
             .map(|index| {
@@ -12206,8 +10757,6 @@ mod tests {
             &super::ProjectionChange {
                 range: 0..rows.len(),
                 removed_images: Vec::new(),
-                old_rows: Vec::new(),
-                old_images: Default::default(),
             },
         );
         assert_eq!(cache.entries.len(), 10_000);
@@ -12225,8 +10774,6 @@ mod tests {
         let change = super::ProjectionChange {
             range: 0..1,
             removed_images: Vec::new(),
-            old_rows: Vec::new(),
-            old_images: Default::default(),
         };
         cache.update("ses_a", &rows, &change);
         assert_eq!(
@@ -12245,8 +10792,6 @@ mod tests {
             &super::ProjectionChange {
                 range: 1..2,
                 removed_images: vec![(image.key.clone(), 0)],
-                old_rows: Vec::new(),
-                old_images: Default::default(),
             },
         );
         assert!(std::sync::Arc::ptr_eq(
@@ -12262,8 +10807,6 @@ mod tests {
             &super::ProjectionChange {
                 range: 1..2,
                 removed_images: vec![(image.key.clone(), 0)],
-                old_rows: Vec::new(),
-                old_images: Default::default(),
             },
         );
         assert!(!std::sync::Arc::ptr_eq(
@@ -12295,8 +10838,6 @@ mod tests {
         let change = super::ProjectionChange {
             range: 0..1,
             removed_images: Vec::new(),
-            old_rows: Vec::new(),
-            old_images: Default::default(),
         };
         cache.update("ses_a", &[row.clone()], &change);
         cache.update("ses_a", &[row.clone()], &change);
@@ -12311,8 +10852,6 @@ mod tests {
             &super::ProjectionChange {
                 range: 0..1,
                 removed_images: vec![(row.key.clone(), 0), (row.key.clone(), 1)],
-                old_rows: Vec::new(),
-                old_images: Default::default(),
             },
         );
         assert_eq!(cache.entries.len(), 1);
@@ -12322,8 +10861,6 @@ mod tests {
             &super::ProjectionChange {
                 range: 0..0,
                 removed_images: vec![(row.key.clone(), 0)],
-                old_rows: Vec::new(),
-                old_images: Default::default(),
             },
         );
         assert!(cache.entries.is_empty());
@@ -12370,138 +10907,6 @@ mod tests {
         assert_eq!(images.entries.len(), 1);
     }
 
-    #[test]
-    fn stale_row_keeps_exact_image_when_url_changes_and_clears_on_invalidation() {
-        let stamp = RowLayoutStamp {
-            width: px(746.),
-            dark: false,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
-            epoch: 1,
-        };
-        let mut old = cache_row("image", "old caption");
-        old.images = vec!["data:image/png;base64,aGVsbG8=".into()];
-        let mut images = super::ImageCache::default();
-        images.update(
-            "ses_a",
-            std::slice::from_ref(&old),
-            &super::ProjectionChange {
-                range: 0..1,
-                removed_images: Vec::new(),
-                old_rows: Vec::new(),
-                old_images: Default::default(),
-            },
-        );
-        let old_image = images.get("ses_a", &old, 0).unwrap().clone();
-        let mut cache = RowHeightCache::default();
-        cache.missing(stamp, std::slice::from_ref(&old));
-        cache.record(stamp, old.key.clone(), old.render_revision(), px(180.));
-
-        let mut new = old.clone();
-        new.render_revision += 1;
-        new.body = "new caption".into();
-        new.images[0] = "data:image/png;base64,d29ybGQ=".into();
-        let mut change = super::ProjectionChange {
-            range: 0..1,
-            removed_images: vec![(old.key.clone(), 0)],
-            old_rows: vec![old.clone()],
-            old_images: Default::default(),
-        };
-        change
-            .old_images
-            .insert((old.key.clone(), 0), old_image.clone());
-        images.update("ses_a", std::slice::from_ref(&new), &change);
-        cache.retain_replaced(std::slice::from_ref(&new), &change);
-        let stale = &cache.stale[&old.key];
-        assert_eq!(stale.row, old);
-        assert_eq!(stale.height, px(180.));
-        assert!(std::sync::Arc::ptr_eq(
-            stale.images[0].as_ref().unwrap(),
-            &old_image
-        ));
-        assert!(!std::sync::Arc::ptr_eq(
-            images.get("ses_a", &new, 0).unwrap(),
-            &old_image
-        ));
-        // Prepending another message must not discard this offscreen stale row.
-        let prepended = cache_row("earlier", "earlier");
-        cache.retain_replaced(
-            &[prepended, new.clone()],
-            &super::ProjectionChange {
-                range: 0..1,
-                removed_images: Vec::new(),
-                old_rows: Vec::new(),
-                old_images: Default::default(),
-            },
-        );
-        assert_eq!(cache.stale.len(), 1);
-        cache.retain_replaced(
-            &[],
-            &super::ProjectionChange {
-                range: 0..0,
-                removed_images: Vec::new(),
-                old_rows: vec![new.clone()],
-                old_images: Default::default(),
-            },
-        );
-        assert!(cache.stale.is_empty());
-        cache.retain_replaced(std::slice::from_ref(&new), &change);
-        assert_eq!(cache.stale.len(), 1);
-        cache.missing(
-            RowLayoutStamp {
-                width: px(700.),
-                ..stamp
-            },
-            std::slice::from_ref(&new),
-        );
-        assert!(cache.stale.is_empty());
-        cache.missing(stamp, std::slice::from_ref(&old));
-        cache.record(stamp, old.key.clone(), old.render_revision(), px(180.));
-        cache.retain_replaced(std::slice::from_ref(&new), &change);
-        cache.record(stamp, new.key.clone(), new.render_revision(), px(200.));
-        assert!(cache.stale.is_empty());
-    }
-
-    #[test]
-    fn superseding_tokens_keep_the_last_measured_revision_until_layout() {
-        let stamp = RowLayoutStamp {
-            width: px(746.),
-            dark: false,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
-            epoch: 1,
-        };
-        let old = cache_row("stream", "measured");
-        let mut cache = RowHeightCache::default();
-        cache.missing(stamp, std::slice::from_ref(&old));
-        cache.record(stamp, old.key.clone(), 0, px(88.));
-        let mut current = old.clone();
-        for revision in 1..=4 {
-            let mut next = current.clone();
-            next.render_revision = revision;
-            next.body.push_str(" more");
-            cache.retain_replaced(
-                &[next.clone()],
-                &super::ProjectionChange {
-                    range: 0..1,
-                    removed_images: Vec::new(),
-                    old_rows: vec![current],
-                    old_images: Default::default(),
-                },
-            );
-            let stale = &cache.stale[&old.key];
-            assert_eq!(stale.row, old);
-            assert_eq!(stale.height, px(88.));
-            current = next;
-        }
-        cache.record(
-            stamp,
-            current.key.clone(),
-            current.render_revision(),
-            px(130.),
-        );
-        assert!(cache.stale.is_empty());
-        assert_eq!(cache.height(&current), Some(px(130.)));
-    }
-
     fn cache_row(id: &str, body: &str) -> model::TranscriptRow {
         model::TranscriptRow {
             key: model::TranscriptRowKey {
@@ -12518,181 +10923,47 @@ mod tests {
     }
 
     #[test]
-    fn row_height_planner_bounds_cold_tail_and_preserves_semantic_keys() {
-        let stamp = RowLayoutStamp {
-            width: px(746.),
-            dark: false,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
-            epoch: 1,
-        };
-        let mut cache = RowHeightCache::default();
-        let mut rows: Vec<_> = (0..10_000)
-            .map(|index| cache_row(&format!("message-{index}"), "a line of Markdown"))
-            .collect();
-        assert_eq!(
-            cache.missing_tail(stamp, &rows, 32, px(1500.)),
-            (9968..10_000).collect::<Vec<_>>()
+    fn paged_projection_contains_only_requested_pages_without_a_render_window() {
+        let all = opencode_gpui::preview::long_transcript_messages();
+        let mut conversation = model::Conversation::default();
+        let mut rows = Vec::new();
+        let mut spans = Vec::new();
+        let mut images = super::ImageCache::default();
+        conversation.replace_from_api(&all[1100..], Some("older".into()));
+        update_session_projection(
+            "session",
+            &conversation,
+            &mut rows,
+            &mut spans,
+            &mut images,
+            None,
         );
-        for row in rows.iter().skip(9968) {
-            cache.record(stamp, row.key.clone(), 0, px(36.));
-        }
-        assert!(
-            cache.missing_tail(stamp, &rows, 32, px(500.)).is_empty(),
-            "covered viewport must not trigger offscreen measurement"
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows, full_rows(&conversation));
+        assert_eq!(conversation.next_cursor.as_deref(), Some("older"));
+        // Only explicit page responses add history; no projection cap is applied.
+        conversation.prepend_from_api(&all[600..1100], Some("oldest".into()));
+        update_session_projection(
+            "session",
+            &conversation,
+            &mut rows,
+            &mut spans,
+            &mut images,
+            None,
         );
-        assert_eq!(
-            cache.missing_tail(stamp, &rows, 32, px(1500.)),
-            (9936..9968).collect::<Vec<_>>()
+        assert_eq!(rows.len(), 600);
+        conversation.prepend_from_api(&all[..600], None);
+        update_session_projection(
+            "session",
+            &conversation,
+            &mut rows,
+            &mut spans,
+            &mut images,
+            None,
         );
-        rows.insert(0, cache_row("prepended", "older page"));
-        assert_eq!(
-            cache.missing_tail(stamp, &rows, 2, px(1500.)),
-            vec![9967, 9968]
-        );
-        let last = rows.last_mut().unwrap();
-        last.render_revision += 1;
-        assert_eq!(
-            cache.missing_tail(stamp, &rows, 32, px(500.)),
-            vec![10_000],
-            "streaming tail remeasures only the changed row"
-        );
-        assert_eq!(
-            cache.missing_tail(stamp, &rows, 2, px(1500.)),
-            vec![9968, 10_000]
-        );
-        let changed = RowLayoutStamp {
-            dark: true,
-            ..stamp
-        };
-        assert_eq!(
-            cache.missing_tail(changed, &rows, 2, px(1500.)),
-            vec![9999, 10_000]
-        );
-    }
-
-    #[test]
-    fn row_height_cache_retains_prepend_and_invalidates_stream_snapshot_width_theme_and_style() {
-        let stamp = RowLayoutStamp {
-            width: px(746.),
-            dark: false,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
-            epoch: 7,
-        };
-        let mut cache = RowHeightCache::default();
-        let old = cache_row("old", "wrapped Markdown");
-        assert_eq!(cache.missing(stamp, std::slice::from_ref(&old)), vec![0]);
-        cache.record(stamp, old.key.clone(), old.render_revision(), px(88.));
-        assert_eq!(
-            cache.missing(stamp, std::slice::from_ref(&old)),
-            Vec::<usize>::new()
-        );
-        assert_eq!(cache.height(&old), Some(px(88.)));
-
-        let earlier = cache_row("earlier", "history");
-        assert_eq!(
-            cache.missing(stamp, &[earlier.clone(), old.clone()]),
-            vec![0]
-        );
-        assert_eq!(
-            cache.height(&old),
-            Some(px(88.)),
-            "prepend preserves the old key"
-        );
-        let mut streamed = old.clone();
-        streamed.body.push_str(" and more text");
-        streamed.render_revision += 1;
-        assert_eq!(
-            cache.missing(stamp, &[earlier, streamed.clone()]),
-            vec![0, 1]
-        );
-        cache.record(
-            stamp,
-            streamed.key.clone(),
-            streamed.render_revision(),
-            px(112.),
-        );
-        assert_eq!(cache.height(&streamed), Some(px(112.)));
-
-        // Snapshot replacement can reuse the same ID and revision with different
-        // content; the epoch, rather than a content hash, guards that collision.
-        let replaced = cache_row("old", "new snapshot");
-        let snapshot = RowLayoutStamp { epoch: 8, ..stamp };
-        assert_eq!(
-            cache.missing(snapshot, std::slice::from_ref(&replaced)),
-            vec![0]
-        );
-        cache.record(
-            snapshot,
-            replaced.key.clone(),
-            replaced.render_revision(),
-            px(64.),
-        );
-        assert_eq!(cache.height(&replaced), Some(px(64.)));
-        for changed in [
-            RowLayoutStamp {
-                width: px(1116.),
-                ..snapshot
-            },
-            RowLayoutStamp {
-                dark: true,
-                ..snapshot
-            },
-            RowLayoutStamp {
-                style_revision: snapshot.style_revision + 1,
-                ..snapshot
-            },
-        ] {
-            assert_eq!(
-                cache.missing(changed, std::slice::from_ref(&replaced)),
-                vec![0]
-            );
-            cache.record(
-                changed,
-                replaced.key.clone(),
-                replaced.render_revision(),
-                px(80.),
-            );
-        }
-        let mut other_session = RowHeightCache::default();
-        assert_eq!(other_session.missing(stamp, &[old]), vec![0]);
-    }
-
-    #[test]
-    fn measured_prefix_preserves_row_identity_and_local_offset_across_prepend() {
-        let stamp = RowLayoutStamp {
-            width: px(746.),
-            dark: false,
-            style_revision: TRANSCRIPT_ROW_STYLE_REVISION,
-            epoch: 1,
-        };
-        let mut cache = RowHeightCache::default();
-        let old = [
-            cache_row("a", "first"),
-            cache_row("b", "anchor"),
-            cache_row("c", "last"),
-        ];
-        cache.missing(stamp, &old);
-        for (row, height) in old.iter().zip([px(40.), px(90.), px(200.)]) {
-            cache.record(stamp, row.key.clone(), row.render_revision(), height);
-        }
-        cache.load_height = Some((false, px(35.)));
-        let old_top = cache.prefix(&old, 1, true).unwrap();
-        let within = px(23.);
-        let old_offset = -(old_top + within);
-        let earlier = cache_row("older", "earlier");
-        cache.record(
-            stamp,
-            earlier.key.clone(),
-            earlier.render_revision(),
-            px(55.),
-        );
-        let new = [earlier, old[0].clone(), old[1].clone(), old[2].clone()];
-        let index = new.iter().position(|row| row.key == old[1].key).unwrap();
-        let new_top = cache.prefix(&new, index, true).unwrap();
-        let new_offset = -(new_top + within);
-        assert_eq!(new_offset - old_offset, px(-55.));
-        assert_eq!(new_top + new_offset, old_top + old_offset);
-        assert_eq!(cache.provisional_positions(&new, true)[index], new_top);
+        assert_eq!(rows.len(), 1200);
+        assert_eq!(rows, full_rows(&conversation));
+        assert_eq!(conversation.next_cursor, None);
     }
 
     #[test]
@@ -13080,13 +11351,25 @@ mod tests {
     }
 
     #[test]
-    fn sticky_tracks_latest_user_past_top_and_hides_flush_row() {
-        let users = [(0, px(-120.), px(-25.)), (3, px(210.), px(280.))];
-        assert_eq!(sticky_user_index(users, px(0.), px(400.)), Some(0));
-        let users = [(0, px(-480.), px(-385.)), (3, px(-20.), px(50.))];
-        assert_eq!(sticky_user_index(users, px(0.), px(400.)), Some(3));
-        let users = [(0, px(-480.), px(-385.)), (3, px(0.), px(70.))];
-        assert_eq!(sticky_user_index(users, px(0.), px(400.)), None);
+    fn sticky_uses_native_child_index_without_row_geometry() {
+        let mut rows: Vec<_> = (0..5)
+            .map(|index| cache_row(&index.to_string(), "body"))
+            .collect();
+        rows[0].role = model::Role::User;
+        rows[3].role = model::Role::User;
+        assert_eq!(sticky_user_index(&rows, 0, false, true), None);
+        assert_eq!(sticky_user_index(&rows, 0, false, false), Some(0));
+        assert_eq!(sticky_user_index(&rows, 2, false, true), Some(0));
+        assert_eq!(sticky_user_index(&rows, 3, false, true), None);
+        assert_eq!(sticky_user_index(&rows, 3, false, false), Some(3));
+        assert_eq!(sticky_user_index(&rows, 4, false, true), Some(3));
+        // The load-earlier control is an immediate child, but not a message.
+        assert_eq!(sticky_user_index(&rows, 0, true, false), None);
+        assert_eq!(sticky_user_index(&rows, 1, true, true), None);
+        assert_eq!(sticky_user_index(&rows, 3, true, true), Some(0));
+        assert_eq!(sticky_user_index(&rows, 5, true, true), Some(3));
+        assert_eq!(sticky_user_index(&[], 0, false, true), None);
+        assert_eq!(sticky_user_index(&rows, 50, false, true), None);
     }
 
     #[test]

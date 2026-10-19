@@ -2,9 +2,21 @@
 
 An in-progress native Linux desktop client for [OpenCode v2](https://opencode.ai/v2/docs/) using GPUI Kit. This GPUI prototype is now on `main` while the last verified COSMIC client remains recoverable in Git history. It is **not ready to install as a replacement** until behavior and visual parity are accepted.
 
-The prototype currently renders a session sidebar, transcript, composer, model and effort pickers, waiting tray, and several modals. Basic v2 bootstrap, streaming events, message send, session creation/rename, model selection, editable connection settings and per-server tab persistence are wired. Queue/switch/cancel/resume and several shortcuts and picker-keyboard paths have been exercised against the in-process preview API. Not all UI paths have been verified against a live server. Permission cards, robust Markdown/virtualized transcript behavior, comprehensive shortcuts, dark-theme parity, and interaction/accessibility testing still need work. Do not treat a successful preview capture as proof of those features.
+The prototype currently renders a session sidebar, transcript, composer, model and effort pickers, waiting tray, and several modals. Basic v2 bootstrap, streaming events, message send, session creation/rename, model selection, editable connection settings and per-server tab persistence are wired. Queue/switch/cancel/resume and several shortcuts and picker-keyboard paths have been exercised against the in-process preview API. Not all UI paths have been verified against a live server. Complex transcript behavior, comprehensive shortcuts, dark-theme parity, and interaction/accessibility testing still need work. Do not treat a successful preview capture as proof of those features.
 
 ## Building & Running
+
+### Transcript scrolling and history
+
+The transcript is a normal GPUI overflow-scrolling column containing **every loaded row**. It has no virtual list, detached row measurement, height cache, estimated spacers or custom layout/scroll-correction engine. GPUI handles natural layout and clipping; a plain `ScrollHandle` supplies bottom scrolling, item positions and the scrollbar.
+
+Opening a session still requests only its newest history page. **Load earlier messages** requests one older page on demand, with the existing loading, duplicate-request and retry handling. Rendering loaded content does not trigger further history requests, and no loaded-row cap or automatic eviction is imposed.
+
+While following the tail, updates use GPUI's native bottom-scroll request; manual scrolling yields that follow mode. Loading an older page keeps the same message in view by asking GPUI to align that row to the top. It does not retain an exact pixel displacement inside that message. The sticky user-context header is selected from GPUI's first visible child rather than calculated row positions. Resize/zoom reflows naturally without semantic/pixel anchor correction.
+
+The latency report's legacy `measured_rows` field is always zero with this renderer; it does **not** mean that no rows are rendered. The old detached `transcript.row_measure` operation no longer runs.
+
+`--preview --drawer long-transcript` supplies 1,200 already-loaded user/Markdown rows for manual top/bottom, scroll, scrollbar and resize inspection. It neither changes the normal page size nor fetches server history. Use `--preview-api` with `OPENCODE_PREVIEW_HISTORY_PAGES=1` to inspect actual on-demand page loading against the in-process fixture.
 
 ### Send foreground tasks to background
 

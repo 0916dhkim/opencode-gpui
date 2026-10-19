@@ -29,6 +29,24 @@ const CHILD_ID: &str = "ses_preview_child";
 const IDLE_ID: &str = "ses_idle";
 const CREATED: u64 = 1_704_067_200_000;
 
+/// Already-loaded content for manual overflow inspection, never a live API load.
+pub fn long_transcript_messages() -> Vec<protocol::SessionMessage> {
+    (1..=600)
+        .flat_map(|index| {
+            [
+                user_text(&format!("long_user_{index}"), CREATED, &format!("Question {index} of 600")),
+                entry(json!({
+                    "id": format!("long_answer_{index}"), "type": "assistant",
+                    "agent": "build", "time": { "created": CREATED },
+                    "content": [{ "type": "text", "text": format!(
+                        "## Answer {index} of 600\n\nA **formatted** paragraph with a [link](https://example.com).\n\n- First item\n- Second item\n\n```rust\nlet answer = {index};\n```"
+                    ) }]
+                })),
+            ]
+        })
+        .collect()
+}
+
 pub fn server_state() -> ServerState {
     ServerState {
         tabs: vec![
