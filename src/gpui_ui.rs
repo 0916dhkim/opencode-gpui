@@ -498,7 +498,8 @@ fn autoscroll_step(distance: Pixels, zoom: f32) -> Pixels {
     if beyond_dead_zone == 0. {
         px(0.)
     } else {
-        let speed = (beyond_dead_zone / (8. * zoom)).powf(1.2).clamp(1., 40.) * zoom;
+        // Linear from zero outside the dead zone, without a speed floor or cap.
+        let speed = beyond_dead_zone / 8.;
         px(-speed.copysign(distance))
     }
 }
@@ -10473,6 +10474,38 @@ mod tests {
     use opencode_gpui::persist::PersistedState;
     use opencode_gpui::protocol;
     use serde_json::json;
+
+    #[test]
+    fn autoscroll_dead_zone_and_sensitivity_scale_with_zoom() {
+        for zoom in [0.7, 1., 1.75] {
+            let edge = 16. * zoom;
+            for distance in [-edge, -edge / 2., 0., edge / 2., edge] {
+                assert_eq!(super::autoscroll_step(px(distance), zoom), px(0.));
+            }
+            for direction in [-1., 1.] {
+                for extra in [0.5 * zoom, 8. * zoom] {
+                    let actual =
+                        super::autoscroll_step(px(direction * (edge + extra)), zoom).as_f32();
+                    let expected = -direction * extra / 8.;
+                    assert!((actual - expected).abs() < 0.00001);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn autoscroll_is_linear_without_a_speed_floor_or_cap() {
+        for (distance, step) in [
+            (17., 0.125),
+            (24., 1.),
+            (80., 8.),
+            (416., 50.),
+            (816., 100.),
+        ] {
+            assert_eq!(super::autoscroll_step(px(distance), 1.), px(-step));
+            assert_eq!(super::autoscroll_step(px(-distance), 1.), px(step));
+        }
+    }
 
     fn snapshot(conversation: &mut model::Conversation, values: Vec<serde_json::Value>) {
         conversation.replace_from_api(
