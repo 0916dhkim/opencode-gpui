@@ -7849,6 +7849,9 @@ impl Client {
                         })
                     })
                     .bordered(false)
+                    // The outer composer owns the background for both editor
+                    // and toolbar; borderless alone still paints an input fill.
+                    .appearance(false)
                     // Keep the editor's viewport separate from the toolbar;
                     // content overflow uses the input engine's own scrollbar.
                     .h(self.scaled(89.))
@@ -8438,8 +8441,13 @@ impl Client {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(self.scaled(16.))
-                .child("↕")
+                .child(
+                    svg()
+                        .data(include_bytes!("icons/autoscroll.svg"))
+                        .size(self.scaled(16.))
+                        .flex_shrink_0()
+                        .text_color(self.tone(0x252829, 0xe8e5df)),
+                )
                 .into_any_element(),
         )
     }

@@ -241,6 +241,10 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == alt-hold ]]; then
   sleep 0.3
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == transcript-autoscroll ]]; then
+  if (( ${AUTOSCROLL_ZOOM_STEPS:-0} > 0 )); then
+    xdotool mousemove --window "$win" 410 680 click 1
+    for ((i = 0; i < AUTOSCROLL_ZOOM_STEPS; i++)); do xdotool key ctrl+equal; sleep 0.15; done
+  fi
   xdotool mousemove --window "$win" 550 350 click 2
   sleep 0.2
   import -window "$win" "${OUTPUT%.png}-marker.png"
