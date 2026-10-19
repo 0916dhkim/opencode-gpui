@@ -317,7 +317,11 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == draft-return-after-send ]]; the
   xdotool mousemove --window "$win" 92 110 click 1
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == load-earlier ]]; then
+  xdotool mousemove --window "$win" 550 350 click --repeat 30 --delay 20 4
+  sleep 0.5
   xdotool mousemove --window "$win" 400 76 click 1
+  sleep 0.8
+  xdotool mousemove --window "$win" 550 350 click --repeat 30 --delay 20 4
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
   xdotool mousemove --window "$win" 410 680 click 1
@@ -333,7 +337,7 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == repair-server ]]; then
   xdotool key ctrl+Return
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == copy-code ]]; then
-  xdotool mousemove --window "$win" 720 392 click 1
+  xdotool mousemove --window "$win" "${COPY_CODE_X:-720}" "${COPY_CODE_Y:-407}" click 1
   sleep 0.2
   xdotool mousemove --window "$win" 410 680 click 1
   xdotool key ctrl+v
@@ -417,7 +421,9 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == apply-settings ]]; then
   xdotool type --clearmodifiers --delay 30 'http://127.0.0.1:4555'
   xdotool key ctrl+Return
 fi
-xdotool mousemove 1100 850
+if [[ "${INTERACTION:-}" != link-hover ]]; then
+  xdotool mousemove 1100 850
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == hover-close ]]; then
   xdotool mousemove --window "$win" 245 110
 fi
@@ -439,6 +445,28 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == latency-* ]]; then
     xdotool mousemove --window "$win" 65 "$((window_h - 90))" click 1
   fi
   xdotool mousemove --window "$win" 140 400
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == cache-profile ]]; then
+  # Agent-directed render-count inspection, not an automated GUI regression.
+  # Record an otherwise unchanged busy-icon/caret window, optionally editing.
+  # Clicking also gives the nested Wayland surface keyboard focus; focusing
+  # the containing Weston X window alone is insufficient for the first key.
+  xdotool mousemove --window "$win" 65 "$((window_h - 90))" click 1
+  xdotool mousemove 1100 850
+  sleep "${CACHE_PROFILE_IDLE_SECONDS:-8}"
+  if [[ "${CACHE_PROFILE_TYPE:-0}" == 1 ]]; then
+    xdotool mousemove --window "$win" "$((window_w - 200))" "$((window_h - 120))" click 1
+    xdotool type --clearmodifiers --delay 120 'cached editor remains live'
+    sleep 1
+  fi
+  xdotool key ctrl+shift+l
+  # Debug symbolization can outlast a fixed delay under emulation. Wait for
+  # this isolated capture's exported artifact, retaining the screenshot even
+  # if it times out so the agent can inspect failure rather than claim success.
+  for ((attempt = 0; attempt < ${CACHE_REPORT_TIMEOUT_SECONDS:-90}; attempt++)); do
+    if compgen -G "$XDG_DATA_HOME/opencode-gpui/diagnostics/lag-*.jsonl" >/dev/null; then break; fi
+    sleep 1
+  done
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == background-* ]]; then
   # Agent-directed inspection only. The foreground fixture is opt-in through
@@ -483,6 +511,19 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == composer-lines ]]; then
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == history-race ]]; then
   xdotool mousemove --window "$win" 710 350 click --repeat 30 --delay 20 5
+  sleep 1
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == cache-selection ]]; then
+  xdotool mousemove --window "$win" 300 306 mousedown 1
+  sleep 0.2
+  xdotool mousemove --window "$win" 570 372
+  sleep 0.4
+  xdotool mouseup 1
+  sleep 0.4
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == model-search ]]; then
+  xdotool mousemove --window "$win" 330 568 click 1
+  xdotool type --clearmodifiers --delay 100 'Claude'
   sleep 1
 fi
 if [[ "$CLIENT" == gpui ]]; then

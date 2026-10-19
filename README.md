@@ -26,6 +26,14 @@ The latency report's legacy `measured_rows` field is always zero with this rende
 
 `--preview --drawer long-transcript` supplies 1,200 already-loaded user/Markdown rows for manual top/bottom, scroll, scrollbar and resize inspection. It neither changes the normal page size nor fetches server history. Use `--preview-api` with `OPENCODE_PREVIEW_HISTORY_PAGES=1` to inspect actual on-demand page loading against the in-process fixture.
 
+### View ownership and redraw
+
+Repeating gear and pending-background spinner animations have persistent, keyed view entities; their frame requests notify the icon rather than the application controller. Definite-size transcript, sidebar, editor and modal-layer views use GPUI's native retained-view API. Message rows, attachment strips, notices and other naturally sized content do not have application geometry/height caches.
+
+The controller still owns application state. Transcript presentation inputs cover active session/connection, projection revision (including same-row-count streaming updates), history cursor/loading, native scrolling/follow state and code-copy feedback. The editor retains its existing input entity and tracks session/focus transitions. Sidebar and modal layers conservatively observe controller notifications. Native descendant notifications still invalidate cached ancestors for parsing, image readiness, selection, scrolling and cursor blinking. Changed inputs render immediately through GPUI's uncached path before returning to retained rendering; no arbitrary state hash or pixel-height estimate is used. Cheap application chrome and layout-changing animations remain live.
+
+Latency reports include `transcript_build`, `sidebar_build` and `editor_build` operation totals to distinguish root frames from actual pane reconstruction. These are CPU-side inclusive build spans, not GPU timings or a native performance guarantee. `ui_build` now covers the live shell rather than all pane construction. A native cache miss can construct/layout a subtree during root prepaint, so compare whole draw timings—not old versus new root-phase percentages—as a performance measure. This is subtree construction/layout reuse, not GPU dirty-rectangle rendering: an animated icon still schedules window frames, and actual transcript scrolling still needs layout of the loaded natural-height content.
+
 ### Link destinations
 
 Hover a rendered Markdown link to see its underlying URL, including its query and fragment, in a plain-text tooltip. Link labels, wrapping, selection, opening policy and the right-click Open/Copy menu are unchanged. The tooltip wraps long destinations to the window width rather than abbreviating them.

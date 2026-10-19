@@ -422,16 +422,247 @@ fn tab_indicator(busy: bool, unread: bool, has_jobs: bool) -> (bool, TabAttentio
 
 /// Foreground work and background jobs both rotate, regardless of attention color.
 fn status_gear(color: Rgba, id: String) -> AnyElement {
-    Icon::default()
-        .data(include_bytes!("icons/settings.svg"))
-        .with_size(px(14.))
-        .text_color(color)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_secs(1)).repeat(),
-            |gear, phase| gear.transform(Transformation::rotate(percentage(phase))),
-        )
-        .into_any_element()
+    AnimatedIcon {
+        id,
+        props: AnimatedIconProps {
+            spinner: false,
+            size: px(14.),
+            color: Some(color),
+        },
+    }
+    .into_any_element()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct AnimatedIconProps {
+    spinner: bool,
+    size: Pixels,
+    color: Option<Rgba>,
+}
+
+/// The element is just a declarative handle. The persistent view, not Client
+/// or its containing pane, owns the animation's next-frame notifications.
+#[derive(IntoElement)]
+struct AnimatedIcon {
+    id: String,
+    props: AnimatedIconProps,
+}
+
+struct AnimatedIconView {
+    props: AnimatedIconProps,
+}
+
+impl RenderOnce for AnimatedIcon {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let props = self.props;
+        let view = window.use_keyed_state(
+            SharedString::from(format!("animated-icon/{}", self.id)),
+            cx,
+            |_, _| AnimatedIconView { props },
+        );
+        view.update(cx, |view, cx| {
+            if view.props != props {
+                view.props = props;
+                cx.notify();
+            }
+        });
+        view
+    }
+}
+
+impl Render for AnimatedIconView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let data: &'static [u8] = if self.props.spinner {
+            include_bytes!("icons/spinner.svg")
+        } else {
+            include_bytes!("icons/settings.svg")
+        };
+        Icon::default()
+            .data(data)
+            .with_size(self.props.size)
+            .when_some(self.props.color, |icon, color| icon.text_color(color))
+            .with_animation(
+                "rotation",
+                Animation::new(Duration::from_secs(1)).repeat(),
+                |icon, phase| icon.transform(Transformation::rotate(percentage(phase))),
+            )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClientSurfaceKind {
+    Sidebar,
+    Transcript,
+    Editor,
+    Modal,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct SurfaceEnvironment {
+    dark: bool,
+    zoom: f32,
+    floating: bool,
+}
+
+/// Presentation inputs, not geometry estimates. Projection revision covers
+/// same-row-count streaming/image/tool changes; native descendants invalidate
+/// this surface themselves when parsing, selection or resources change.
+#[derive(Clone, PartialEq)]
+struct TranscriptPresentation {
+    session: String,
+    connection: u64,
+    revision: u64,
+    cursor: Option<String>,
+    loading: bool,
+    following: bool,
+    pointer_down: bool,
+    autoscrolling: bool,
+    scroll_offset: Point<Pixels>,
+    logical_top: (usize, Pixels),
+    copied: Option<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct EditorPresentation {
+    session: String,
+    input: EntityId,
+    focused: bool,
+}
+
+/// Client remains the shared controller. Sidebar observes it conservatively;
+/// transcript/editor receive only their explicit presentation inputs, so jobs,
+/// dialogs, typing and unrelated tab updates do not invalidate the transcript.
+struct ClientSurface {
+    owner: WeakEntity<Client>,
+    kind: ClientSurfaceKind,
+    environment: Option<SurfaceEnvironment>,
+    transcript: Option<TranscriptPresentation>,
+    editor: Option<EditorPresentation>,
+    fresh: bool,
+    _subscription: Option<Subscription>,
+}
+
+impl ClientSurface {
+    fn new(owner: Entity<Client>, kind: ClientSurfaceKind, cx: &mut Context<Self>) -> Self {
+        let subscription = matches!(kind, ClientSurfaceKind::Sidebar | ClientSurfaceKind::Modal)
+            .then(|| cx.observe(&owner, |_, _, cx| cx.notify()));
+        Self {
+            owner: owner.downgrade(),
+            kind,
+            environment: None,
+            transcript: None,
+            editor: None,
+            fresh: true,
+            _subscription: subscription,
+        }
+    }
+}
+
+impl Render for ClientSurface {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let kind = self.kind;
+        let environment = self
+            .environment
+            .expect("surface environment set before mounting");
+        self.owner
+            .update(cx, |owner, cx| match kind {
+                ClientSurfaceKind::Sidebar => {
+                    let _span = latency::global().span(TraceOperation::SidebarBuild, 1);
+                    owner.sidebar(environment.floating, cx)
+                }
+                ClientSurfaceKind::Transcript => {
+                    let _span = latency::global().span(TraceOperation::TranscriptBuild, 1);
+                    // The cached subtree is independently laid out; its root
+                    // cannot rely on being a flex child of Client's column.
+                    // Preserve the same definite-height flex parent in both
+                    // fresh and retained modes, including scroll hit testing.
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(owner.chat(window, cx))
+                        .into_any_element()
+                }
+                ClientSurfaceKind::Editor => {
+                    let _span = latency::global().span(TraceOperation::EditorBuild, 1);
+                    owner.composer_editor(cx)
+                }
+                // Absolute backdrop insets need a containing block. A cached
+                // view's independently laid-out root is not that backdrop's
+                // original full-window parent.
+                ClientSurfaceKind::Modal => div()
+                    .relative()
+                    .size_full()
+                    .when_some(owner.modal_view(window, cx), |view, modal| {
+                        view.child(modal)
+                    })
+                    .into_any_element(),
+            })
+            .unwrap_or_else(|_| Empty.into_any_element())
+    }
+}
+
+#[derive(Clone)]
+struct ClientSurfaces {
+    sidebar: Entity<ClientSurface>,
+    transcript: Entity<ClientSurface>,
+    editor: Entity<ClientSurface>,
+    modal: Entity<ClientSurface>,
+}
+
+impl ClientSurfaces {
+    fn new(owner: Entity<Client>, cx: &mut App) -> Self {
+        Self {
+            sidebar: cx.new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Sidebar, cx)),
+            transcript: cx
+                .new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Transcript, cx)),
+            editor: cx.new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Editor, cx)),
+            modal: cx.new(|cx| ClientSurface::new(owner, ClientSurfaceKind::Modal, cx)),
+        }
+    }
+
+    fn sync(
+        &self,
+        environment: SurfaceEnvironment,
+        transcript: TranscriptPresentation,
+        editor: EditorPresentation,
+        cx: &mut App,
+    ) {
+        for view in [&self.sidebar, &self.transcript, &self.editor, &self.modal] {
+            view.update(cx, |view, _| {
+                view.fresh = view.environment != Some(environment);
+                view.environment = Some(environment);
+            });
+        }
+        self.transcript.update(cx, |view, _| {
+            view.fresh |= view.transcript.as_ref() != Some(&transcript);
+            view.transcript = Some(transcript);
+        });
+        self.editor.update(cx, |view, _| {
+            view.fresh |= view.editor.as_ref() != Some(&editor);
+            view.editor = Some(editor);
+        });
+    }
+
+    fn element(view: &Entity<ClientSurface>, cx: &App) -> AnyElement {
+        // Inputs are transferred during parent render. notify() at that phase
+        // is too late for the current frame's dirty-view snapshot. Render fresh
+        // inputs directly once; subsequent frames use GPUI's retained boundary.
+        // This uses GPUI's supported uncached/cached paths, never stale output.
+        if view.read(cx).fresh {
+            div()
+                .absolute()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(view.clone())
+                .into_any_element()
+        } else {
+            view.clone()
+                .cached(StyleRefinement::default().absolute().size_full())
+                .into_any_element()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -591,6 +822,7 @@ fn trace_input(action: TraceAction, cx: &mut App) {
 }
 
 struct Client {
+    surfaces: Option<ClientSurfaces>,
     latency: LatencyCapture,
     dark: bool,
     api: Option<ApiHandle>,
@@ -642,6 +874,7 @@ struct Client {
     projects: Vec<Project>,
     active: String,
     transcript: HashMap<String, Vec<TranscriptRow>>,
+    transcript_revisions: HashMap<String, u64>,
     transcript_scrolls: HashMap<String, ScrollHandle>,
     transcript_spans: HashMap<String, Vec<MessageSpan>>,
     attachments: ImageCache,
@@ -2330,6 +2563,7 @@ impl Client {
             projects: Vec::new(),
             active: String::new(),
             transcript: HashMap::new(),
+            transcript_revisions: HashMap::new(),
             transcript_spans: HashMap::new(),
             transcript_scrolls: HashMap::new(),
             attachments: ImageCache::default(),
@@ -2367,6 +2601,7 @@ impl Client {
             statuses: HashMap::new(),
             jobs: Vec::new(),
             background_requests: background::Requests::default(),
+            surfaces: None,
             latency: LatencyCapture::default(),
             background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
@@ -3108,6 +3343,7 @@ impl Client {
         self.message_events_during_load.remove(id);
         self.reload_after_load.remove(id);
         self.transcript.remove(id);
+        self.transcript_revisions.remove(id);
         self.transcript_spans.remove(id);
         self.attachments.remove_session(id);
         self.transcript_scrolls.remove(id);
@@ -3546,6 +3782,7 @@ impl Client {
         self.deferred_abort.clear();
         self.abort_timeout_tokens.clear();
         self.transcript.clear();
+        self.transcript_revisions.clear();
         self.transcript_spans.clear();
         self.attachments = ImageCache::default();
         self.transcript_scrolls.clear();
@@ -4824,7 +5061,7 @@ impl Client {
             .entry(session_id.to_owned())
             .or_default();
         let rows = self.transcript.entry(session_id.to_owned()).or_default();
-        update_session_projection(
+        let change = update_session_projection(
             session_id,
             conversation,
             rows,
@@ -4832,6 +5069,13 @@ impl Client {
             &mut self.attachments,
             tail_delta,
         );
+        if change.is_some() {
+            let revision = self
+                .transcript_revisions
+                .entry(session_id.to_owned())
+                .or_default();
+            *revision = revision.wrapping_add(1);
+        }
         latency.units(rows.len());
     }
 
@@ -5518,6 +5762,7 @@ impl Client {
                             self.conversations.remove(&id);
                             self.background_requests.remove(&id);
                             self.transcript.remove(&id);
+                            self.transcript_revisions.remove(&id);
                             self.transcript_spans.remove(&id);
                             self.attachments.remove_session(&id);
                             self.transcript_scrolls.remove(&id);
@@ -5841,6 +6086,7 @@ impl Client {
             projects,
             active: active.clone(),
             transcript,
+            transcript_revisions: HashMap::new(),
             transcript_spans,
             transcript_scrolls: HashMap::from([(active, scroll.clone())]),
             attachments,
@@ -5886,6 +6132,7 @@ impl Client {
             statuses: bootstrap.statuses,
             jobs,
             background_requests: background::Requests::default(),
+            surfaces: None,
             latency: LatencyCapture::default(),
             background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
@@ -6062,6 +6309,7 @@ impl Client {
         client.saved_active = Some(client.active.clone());
         client.sessions.clear();
         client.transcript.clear();
+        client.transcript_revisions.clear();
         client.transcript_spans.clear();
         client.attachments = ImageCache::default();
         client.conversations.clear();
@@ -6595,15 +6843,15 @@ impl Client {
             "Continue without waiting — send foreground tasks to background"
         };
         let glyph = if pending {
-            Icon::default()
-                .data(include_bytes!("icons/spinner.svg"))
-                .with_size(self.scaled(20.))
-                .with_animation(
-                    format!("background-pending-{}", self.active),
-                    Animation::new(Duration::from_secs(1)).repeat(),
-                    |icon, phase| icon.transform(Transformation::rotate(percentage(phase))),
-                )
-                .into_any_element()
+            AnimatedIcon {
+                id: format!("background-pending-{}", self.active),
+                props: AnimatedIconProps {
+                    spinner: true,
+                    size: self.scaled(20.),
+                    color: None,
+                },
+            }
+            .into_any_element()
         } else {
             Icon::default()
                 .data(include_bytes!("icons/send-to-background.svg"))
@@ -7821,6 +8069,30 @@ impl Client {
         .right_0()
     }
 
+    fn composer_editor(&self, cx: &Context<Self>) -> AnyElement {
+        let paste_owner = cx.entity().downgrade();
+        let paste_session = self.active.clone();
+        Textarea::new(&self.composer)
+            .aria_label("Ask OpenCode anything…")
+            .editor_padding_left(self.scaled(14.))
+            // Insets belong outside the editor's native scrollbar viewport.
+            .editor_padding_top(px(0.))
+            .editor_padding_bottom(px(0.))
+            .py(self.scaled(8.))
+            .on_paste(move |item, _, app| {
+                paste_owner
+                    .update(app, |this, cx| {
+                        this.paste_attachments(&paste_session, item, cx)
+                    })
+                    .unwrap_or(false)
+            })
+            .bordered(false)
+            .appearance(false)
+            .h(self.scaled(89.))
+            .overflow_hidden()
+            .into_any_element()
+    }
+
     fn composer(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let can_send = self.can_send(cx);
         let selected_model = self.selected_model();
@@ -7882,8 +8154,6 @@ impl Client {
                     ),
             );
         }
-        let paste_owner = cx.entity();
-        let paste_session = self.active.clone();
         div()
             .mx(self.scaled(16.))
             .mb(self.scaled(17.))
@@ -7892,28 +8162,18 @@ impl Client {
             .border_color(self.tone(0xc8c3ba, 0x30353a))
             .bg(self.tone(0xffffff, 0x191c1f))
             .child(
-                Textarea::new(&self.composer)
-                    .aria_label("Ask OpenCode anything…")
-                    .editor_padding_left(self.scaled(14.))
-                    // Base's scrollbar includes editor padding in its viewport
-                    // but not its content extent. Put vertical insets on the
-                    // frame instead so thumb and text share the same viewport.
-                    .editor_padding_top(px(0.))
-                    .editor_padding_bottom(px(0.))
-                    .py(self.scaled(8.))
-                    .on_paste(move |item, _, app| {
-                        paste_owner.update(app, |this, cx| {
-                            this.paste_attachments(&paste_session, item, cx)
-                        })
-                    })
-                    .bordered(false)
-                    // The outer composer owns the background for both editor
-                    // and toolbar; borderless alone still paints an input fill.
-                    .appearance(false)
-                    // Keep the editor's viewport separate from the toolbar;
-                    // content overflow uses the input engine's own scrollbar.
+                div()
+                    .relative()
+                    .w_full()
                     .h(self.scaled(89.))
-                    .overflow_hidden(),
+                    .child(ClientSurfaces::element(
+                        &self
+                            .surfaces
+                            .as_ref()
+                            .expect("render surfaces initialized")
+                            .editor,
+                        cx,
+                    )),
             )
             .when(!self.attachments_draft.is_empty(), |composer| {
                 composer.child(files)
@@ -9833,6 +10093,9 @@ impl Render for Client {
         let floating = matches!(window.window_decorations(), Decorations::Client { tiling } if !tiling.is_tiled())
             && !window.is_maximized()
             && !window.is_fullscreen();
+        if self.surfaces.is_none() {
+            self.surfaces = Some(ClientSurfaces::new(cx.entity(), cx));
+        }
         let controls = window.window_controls();
         let title_offset = if client_decorated {
             TITLE_BAR_HEIGHT
@@ -9842,6 +10105,8 @@ impl Render for Client {
         };
         self.transcript_content_width =
             (self.transcript_width(window) - self.scaled(56.)).max(px(1.));
+        let editor_transition =
+            self.composer_session != self.active || !self.draft_actions.is_empty();
         self.sync_composer(window, cx);
         if self.focus_composer_pending
             && self.modal.is_none()
@@ -10036,6 +10301,44 @@ impl Render for Client {
         } else if self.permission_presented.take().is_some() && self.modal.is_none() {
             let focus = self.composer.focus_handle(cx);
             window.on_next_frame(move |window, cx| focus.focus(window, cx));
+        }
+        // Transfer presentation only after session/draft/focus reconciliation.
+        let surfaces = self.surfaces.as_ref().unwrap().clone();
+        surfaces.sync(
+            SurfaceEnvironment {
+                dark: self.dark,
+                zoom: self.zoom(),
+                floating,
+            },
+            TranscriptPresentation {
+                session: self.active.clone(),
+                connection: self.connection_generation,
+                revision: self
+                    .transcript_revisions
+                    .get(&self.active)
+                    .copied()
+                    .unwrap_or_default(),
+                cursor: self
+                    .conversations
+                    .get(&self.active)
+                    .and_then(|c| c.next_cursor.clone()),
+                loading: self.loading_messages.contains_key(&self.active),
+                following: self.follow_bottom,
+                pointer_down: self.transcript_pointer_down,
+                autoscrolling: self.autoscroll.is_some(),
+                scroll_offset: self.scroll.offset(),
+                logical_top: self.scroll.logical_scroll_top(),
+                copied: self.copy_feedback.as_ref().map(|f| f.key.clone()),
+            },
+            EditorPresentation {
+                session: self.active.clone(),
+                input: self.composer.entity_id(),
+                focused: self.composer_placeholder_focused,
+            },
+            cx,
+        );
+        if editor_transition {
+            surfaces.editor.update(cx, |view, _| view.fresh = true);
         }
         let composer_slot = self
             .permission_card(cx)
@@ -10233,7 +10536,14 @@ impl Render for Client {
                     .min_h_0()
                     .flex()
                     .when(self.sidebar_visible, |view| {
-                        view.child(self.sidebar(floating, cx))
+                        view.child(
+                            div()
+                                .w(self.scaled(SIDEBAR_WIDTH))
+                                .h_full()
+                                .flex_shrink_0()
+                                .relative()
+                                .child(ClientSurfaces::element(&surfaces.sidebar, cx)),
+                        )
                     })
                     .child(
                         div()
@@ -10251,7 +10561,14 @@ impl Render for Client {
                                 }
                             })
                             .when_some(self.session_header(cx), |view, header| view.child(header))
-                            .child(self.chat(window, cx))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .relative()
+                                    .overflow_hidden()
+                                    .child(ClientSurfaces::element(&surfaces.transcript, cx)),
+                            )
                             .when_some(self.overlay.as_ref(), |view, overlay| {
                                 view.child(overlay.clone())
                             })
@@ -10290,7 +10607,9 @@ impl Render for Client {
                     ),
             )
             .when_some(self.autoscroll_marker(), |view, marker| view.child(marker))
-            .when_some(self.modal_view(window, cx), |view, modal| view.child(modal))
+            .when_some(self.modal, |view, _| {
+                view.child(ClientSurfaces::element(&surfaces.modal, cx))
+            })
             .when_some(self.link_menu_view(window, cx), |view, menu| {
                 view.child(menu)
             })
@@ -10572,6 +10891,112 @@ mod tests {
     use opencode_gpui::persist::PersistedState;
     use opencode_gpui::protocol;
     use serde_json::json;
+
+    fn transcript_presentation() -> super::TranscriptPresentation {
+        super::TranscriptPresentation {
+            session: "ses_a".into(),
+            connection: 1,
+            revision: 7,
+            cursor: None,
+            loading: false,
+            following: false,
+            pointer_down: false,
+            autoscrolling: false,
+            scroll_offset: point(px(0.), px(0.)),
+            logical_top: (0, px(0.)),
+            copied: None,
+        }
+    }
+
+    #[test]
+    fn transcript_boundary_tracks_content_not_row_count_or_unrelated_chrome() {
+        let before = transcript_presentation();
+        assert!(before == before.clone());
+        // Revisions change for same-count streamed/tool/image replacements.
+        let mut streamed = before.clone();
+        streamed.revision += 1;
+        assert!(streamed != before);
+        // Job elapsed time, dialog searches, busy-tab rotation and composer
+        // editing deliberately aren't inputs to this view.
+        let mut reconnected = before.clone();
+        reconnected.connection += 1;
+        assert!(reconnected != before);
+    }
+
+    #[test]
+    fn transcript_boundary_tracks_pagination_scroll_follow_and_copy_transitions() {
+        let before = transcript_presentation();
+        let changes: [fn(&mut super::TranscriptPresentation); 9] = [
+            |p| p.session = "ses_b".into(),
+            |p| p.cursor = Some("older".into()),
+            |p| p.loading = true,
+            |p| p.following = true,
+            |p| p.pointer_down = true,
+            |p| p.autoscrolling = true,
+            |p| p.scroll_offset.y = px(-20.),
+            |p| p.logical_top = (1, px(-3.)),
+            |p| p.copied = Some("code-a".into()),
+        ];
+        for change in changes {
+            let mut after = before.clone();
+            change(&mut after);
+            assert!(after != before);
+        }
+    }
+
+    #[test]
+    fn surface_environment_tracks_theme_zoom_and_window_chrome() {
+        let before = super::SurfaceEnvironment {
+            dark: false,
+            zoom: 1.,
+            floating: false,
+        };
+        for after in [
+            super::SurfaceEnvironment {
+                dark: true,
+                ..before
+            },
+            super::SurfaceEnvironment {
+                zoom: 1.75,
+                ..before
+            },
+            super::SurfaceEnvironment {
+                floating: true,
+                ..before
+            },
+        ] {
+            assert!(after != before);
+        }
+    }
+
+    #[test]
+    fn animated_icon_props_keep_gear_size_and_update_color_spinner_and_zoom() {
+        let gear = super::AnimatedIconProps {
+            spinner: false,
+            size: px(14.),
+            color: Some(gpui_kit::rgb(0xa46910)),
+        };
+        assert_eq!(gear.size, px(14.));
+        assert!(
+            gear != super::AnimatedIconProps {
+                color: Some(gpui_kit::rgb(0xe5b567)),
+                ..gear
+            }
+        );
+        assert!(
+            gear != super::AnimatedIconProps {
+                spinner: true,
+                size: px(20.),
+                color: None
+            }
+        );
+        assert!(
+            gear != super::AnimatedIconProps {
+                size: px(24.5),
+                ..gear
+            }
+        );
+    }
 
     #[test]
     fn autoscroll_dead_zone_and_sensitivity_scale_with_zoom() {

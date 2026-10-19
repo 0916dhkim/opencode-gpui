@@ -43,10 +43,13 @@ pub enum Operation {
     ImagePrepare,
     UiBuild,
     TraceCollect,
+    SidebarBuild,
+    TranscriptBuild,
+    EditorBuild,
 }
 
 impl Operation {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 12] = [
         Self::InputHandler,
         Self::EventApply,
         Self::HistoryReconcile,
@@ -56,6 +59,9 @@ impl Operation {
         Self::ImagePrepare,
         Self::UiBuild,
         Self::TraceCollect,
+        Self::SidebarBuild,
+        Self::TranscriptBuild,
+        Self::EditorBuild,
     ];
 }
 
@@ -174,7 +180,7 @@ struct Data {
     dropped_inputs: u64,
     journal_lost: u64,
     last_context: Option<Context>,
-    operations: [Totals; 9],
+    operations: [Totals; 12],
 }
 
 impl Default for Data {
@@ -189,7 +195,7 @@ impl Default for Data {
             dropped_inputs: 0,
             journal_lost: 0,
             last_context: None,
-            operations: [Totals::default(); 9],
+            operations: [Totals::default(); 12],
         }
     }
 }
@@ -651,7 +657,7 @@ pub struct Report {
     unix_ms: u64,
     duration_us: u64,
     events: VecDeque<Event>,
-    operations: [Totals; 9],
+    operations: [Totals; 12],
     dropped_events: u64,
     dropped_inputs: u64,
     journal_lost: u64,
