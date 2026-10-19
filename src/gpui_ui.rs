@@ -880,6 +880,16 @@ enum MarkdownBlock {
 
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
 const LONG_BULLET_OVERFLOW_PREVIEW: &str = "- The parent session (`opencode-gpui`) is waiting on an explore subagent, \"Audit idle send queue flash\" (`ses_ece0a1bdfffes1R6C9nEGp5Z77`).\n\n- The subagent's last model request started at 17:13:47 and never got a single token back. [Open log](https://example.com/log).";
+const LINK_TOOLTIP_PREVIEW: &str = r#"# Link destinations
+
+[Open docs](https://example.com/docs?view=full#details "A friendly title") · [Other docs](https://example.org/other)
+
+A [wrapped link label with **bold text** and `inline code` that continues across multiple lines](https://example.com/wrapped-label).
+
+[Long destination](https://example.com/very/long/path/with/many/segments?mode=preview&source=opencode-gpui&selection=underlying-destination&note=show-the-whole-url-without-ellipsis#details)
+
+[Vault note](obsidian://open?vault=obsidian&file=opencode%2Fsample.md&paneType=tab) · Plain text has no URL tooltip."#;
+
 const LONG_ORDERED_LIST_PREVIEW: &str = r#"A long answer with rich list items and linked source locations. The remaining differences are:
 
 1. **User-row entry edge is missing.** GTK gives every `.user-message` a 1px *top* border as well as its bottom border. See [GPUI row rendering](/test/worktrees/really-long-reproduction-project/source/tree/src/gpui_ui.rs#L6576) versus `reference:src/style.css`.
@@ -5698,6 +5708,7 @@ impl Client {
             );
         }
         let preview_markdown = match overlay.as_deref() {
+            Some("link-tooltips") => Some(LINK_TOOLTIP_PREVIEW),
             Some("complex-markdown") => Some(COMPLEX_MARKDOWN_PREVIEW),
             Some("long-ordered-list") => Some(LONG_ORDERED_LIST_PREVIEW),
             Some("long-bullet") => Some(LONG_BULLET_OVERFLOW_PREVIEW),
@@ -10436,6 +10447,15 @@ pub fn run(args: Args) {
                 );
             }
             gpui_kit::init(cx);
+            gpui_kit::base::text::LinkTooltip::install(
+                |url, window, cx| {
+                    Tooltip::new(url.clone())
+                        .max_w(px(520.).min(window.bounds().size.width - px(48.)))
+                        .whitespace_normal()
+                        .build(window, cx)
+                },
+                cx,
+            );
             let theme_override = match std::env::var("OPENCODE_GPUI_THEME").as_deref() {
                 Ok("dark") => Some(ThemeMode::Dark),
                 Ok("light") => Some(ThemeMode::Light),

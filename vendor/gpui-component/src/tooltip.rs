@@ -125,7 +125,9 @@ impl Render for Tooltip {
                 .gap_3()
                 .refine_style(&self.style)
                 .map(|this| {
-                    this.child(div().map(|this| match self.content {
+                    // Let constrained tooltip content wrap instead of keeping
+                    // its unbroken URL's intrinsic minimum width.
+                    this.child(div().min_w_0().map(|this| match self.content {
                         TooltipContext::Text(ref text) => this.child(text.clone()),
                         TooltipContext::Element(ref builder) => this.child(builder(window, cx)),
                     }))

@@ -130,6 +130,18 @@ if [[ "${INTERACTION:-}" == toggle-sidebar ]]; then
   fi
   xdotool key ctrl+b
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == link-hover ]]; then
+  xdotool mousemove --window "$win" "${LINK_HOVER_X:-330}" "${LINK_HOVER_Y:-353}"
+  sleep 1.5
+  if [[ "${LINK_HOVER_LEAVE:-0}" == 1 ]]; then
+    xdotool mousemove --window "$win" 30 450
+    sleep 0.5
+  fi
+  if [[ "${LINK_CONTEXT_MENU:-0}" == 1 ]]; then
+    xdotool click 3
+    sleep 0.5
+  fi
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == zoom-in ]]; then
   if [[ "$case_name" != model && "$case_name" != level ]]; then
     xdotool mousemove --window "$win" 410 680 click 1
