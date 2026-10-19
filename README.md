@@ -6,6 +6,14 @@ The prototype currently renders a session sidebar, transcript, composer, model a
 
 ## Building & Running
 
+### Typography
+
+The client embeds **Manrope** for interface/transcript text and **Monaspace Neon v1.400** for code, tool output and technical fields. No separate installation of these fonts is required. Existing font sizes and app zoom scaling are unchanged; system fonts still supply fallback glyphs not covered by the bundled faces.
+
+`assets/fonts/` contains Manrope regular/medium/semibold/bold and Neon regular/medium/semibold/bold/italic/bold italic, with each upstream SIL Open Font License. Run `opencode-gpui --font-licenses` to read the full notices from the standalone executable without opening the app.
+
+Manrope uses the static Google Fonts faces from the approved preview (WOFF containers unpacked to TTF without changing outlines). Their legacy internal family is `Manrope ExtraLight` despite their correct 400/500/600/700 weights; this is a lookup name, not the chosen weight. Neon uses the unmodified [v1.400 static release](https://github.com/githubnext/monaspace/releases/tag/v1.400). Manrope's [upstream license](https://github.com/google/fonts/blob/main/ofl/manrope/OFL.txt) and Neon's release license are preserved alongside the fonts and embedded in `--font-licenses`.
+
 ### Transcript scrolling and history
 
 The transcript is a normal GPUI overflow-scrolling column containing **every loaded row**. It has no virtual list, detached row measurement, height cache, estimated spacers or custom layout/scroll-correction engine. GPUI handles natural layout and clipping; a plain `ScrollHandle` supplies bottom scrolling, item positions and the scrollbar.
@@ -68,6 +76,7 @@ For targeted long-label inspection, set `OPENCODE_PREVIEW_MODEL_NAME="GPT-5.6 Lo
 
 ```
 --server <URL>               OpenCode server URL
+--font-licenses              Print bundled font notices and exit (no GUI)
 --username <USER>            HTTP Basic Auth username (default: opencode)
 --password <PASS>            HTTP Basic Auth password
 --cf-access-client-id <ID>   Cloudflare Access client ID

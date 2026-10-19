@@ -5008,6 +5008,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "ttf-parser",
  "url",
  "zbus 5.19.0",
 ]

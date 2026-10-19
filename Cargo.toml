@@ -33,6 +33,7 @@ tempfile = "3.14"
 url = "2.5"
 
 [dev-dependencies]
+ttf-parser = "0.25"
 zbus = { version = "5.19", default-features = false, features = ["async-io"] }
 
 [patch.crates-io]

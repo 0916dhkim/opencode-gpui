@@ -24,6 +24,7 @@ use opencode_gpui::{
     api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ServerEnvelope, UiEvent},
     background,
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
+    fonts::{self, MONO_FONT_FAMILY, UI_FONT_FAMILY},
     jobs::{self, JobKind, JobRow, Jobs},
     latency::{self, Action as TraceAction, Operation as TraceOperation},
     model::{
@@ -1265,7 +1266,7 @@ fn permission_detail(text: String, dark: bool) -> AnyElement {
         .rounded(px(5.))
         .bg(rgb(if dark { 0x15191c } else { 0xefede8 }))
         .text_color(rgb(if dark { 0xd2cec7 } else { 0x34312d }))
-        .font_family("DejaVu Sans Mono")
+        .font_family(MONO_FONT_FAMILY)
         .text_size(px(11.))
         .child(text)
         .into_any_element()
@@ -1277,7 +1278,7 @@ fn permission_metadata(text: String, dark: bool) -> AnyElement {
         .rounded(px(5.))
         .bg(rgb(if dark { 0x15191c } else { 0xefede8 }))
         .text_color(rgb(if dark { 0x9da4aa } else { 0x626764 }))
-        .font_family("DejaVu Sans Mono")
+        .font_family(MONO_FONT_FAMILY)
         .text_size(px(11.))
         .child(text)
         .into_any_element()
@@ -1954,7 +1955,7 @@ impl Client {
                     .test_support()
                     .min_h(self.scaled(65.))
                     .p(self.scaled(12.))
-                    .font_family("monospace")
+                    .font_family(MONO_FONT_FAMILY)
                     .text_size(self.scaled(12.))
                     .child(code),
             )
@@ -6847,7 +6848,7 @@ impl Client {
         let mut body = div().flex().flex_col().gap(self.scaled(10.));
         match row.kind {
             TranscriptRowKind::Tool => {
-                body = body.child(div().font_family("monospace").child(row.body.clone()))
+                body = body.child(div().font_family(MONO_FONT_FAMILY).child(row.body.clone()))
             }
             TranscriptRowKind::Error => {
                 body = body.child(
@@ -6932,7 +6933,7 @@ impl Client {
         div()
             .id(("message", index))
             .w_full()
-            .font_family("Noto Sans")
+            .font_family(UI_FONT_FAMILY)
             .text_size(self.scaled(13.))
             .flex_shrink_0()
             .flex()
@@ -6981,7 +6982,7 @@ impl Client {
         let key_cursor = cursor.clone();
         div()
             .id("load-earlier")
-            .font_family("Noto Sans")
+            .font_family(UI_FONT_FAMILY)
             .text_size(px(13.))
             .flex_shrink_0()
             .mx(px(28.))
@@ -8661,7 +8662,7 @@ impl Client {
                             .border_color(self.tone(0xded8cb, 0x3f3f46))
                             .bg(self.tone(0xf1efec, 0x27272a))
                             .text_color(self.tone(0x666b70, 0xd4d4d8))
-                            .font_family("monospace")
+                            .font_family(MONO_FONT_FAMILY)
                             .text_size(px(9.))
                             .child(label)
                     };
@@ -8842,7 +8843,7 @@ impl Client {
                         .child(
                             div()
                                 .flex_1()
-                                .font_family("monospace")
+                                .font_family(MONO_FONT_FAMILY)
                                 .child(rename_id.clone()),
                         )
                         .child(
@@ -10049,7 +10050,7 @@ impl Render for Client {
             }))
             .flex()
             .flex_col()
-            .font_family("Noto Sans")
+            .font_family(UI_FONT_FAMILY)
             .text_size(rems(13. / 16.))
             .text_color(self.tone(0x252829, 0xe8e5df))
             .when(!floating, |view| view.bg(self.tone(0xf4f1eb, 0x101214)))
@@ -10422,6 +10423,18 @@ pub fn run(args: Args) {
     application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
+            cx.text_system()
+                .add_fonts(fonts::bundled_fonts())
+                .expect("register bundled Manrope and Monaspace Neon fonts");
+            // The Linux backend can skip an invalid font while returning Ok.
+            // Do not silently substitute system typography if registration fails.
+            let families = cx.text_system().all_font_names();
+            for family in [UI_FONT_FAMILY, MONO_FONT_FAMILY] {
+                assert!(
+                    families.iter().any(|name| name == family),
+                    "missing bundled font: {family}"
+                );
+            }
             gpui_kit::init(cx);
             let theme_override = match std::env::var("OPENCODE_GPUI_THEME").as_deref() {
                 Ok("dark") => Some(ThemeMode::Dark),
@@ -10433,6 +10446,10 @@ pub fn run(args: Args) {
             } else {
                 Theme::sync_system_appearance(None, cx);
             }
+            Theme::update(cx, |theme| {
+                theme.font_family = UI_FONT_FAMILY.into();
+                theme.mono_font_family = MONO_FONT_FAMILY.into();
+            });
             let (handle, _) = gpui_kit::open_window(client_window_options(), cx, |window, cx| {
                 if theme_override.is_none() {
                     follow_system_appearance(window, cx);

@@ -2,6 +2,7 @@
 pub mod api;
 pub mod background;
 pub mod credentials;
+pub mod fonts;
 pub mod jobs;
 pub mod latency;
 pub mod model;

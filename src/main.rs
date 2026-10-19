@@ -5,6 +5,9 @@ use clap::Parser;
 #[derive(Clone, Debug, Parser)]
 #[command(version, about)]
 pub struct Args {
+    /// Print bundled font copyrights and licenses without opening a window.
+    #[arg(long)]
+    pub font_licenses: bool,
     /// OpenCode v2 server URL.
     #[arg(long, env = "OPENCODE_SERVER_URL")]
     pub server: Option<String>,
@@ -30,5 +33,9 @@ pub struct Args {
 fn main() {
     env_logger::init();
     let args = Args::parse();
+    if args.font_licenses {
+        print!("{}", opencode_gpui::fonts::LICENSES);
+        return;
+    }
     gpui_ui::run(args);
 }

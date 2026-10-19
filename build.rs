@@ -6,6 +6,7 @@ fn main() {
         "Cargo.toml",
         "Cargo.lock",
         "src",
+        "assets/fonts",
         "vendor/gpui-component",
     ] {
         fingerprint(std::path::Path::new(path), &mut hash);
