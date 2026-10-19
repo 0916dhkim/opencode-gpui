@@ -3,7 +3,7 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AccessibleAction, AnyElement, App, DefiniteLength, Edges, ElementId, Entity, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Rems, RenderOnce, Role,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Rems, RenderOnce, Role,
     SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, TouchPhase,
     Window, div, px, relative,
 };
@@ -502,6 +502,11 @@ impl Input {
             } else {
                 IconName::EyeOff
             })
+            .accessibility_label(if masked {
+                t!("Input.Show Password")
+            } else {
+                t!("Input.Hide Password")
+            })
             .xsmall()
             .text()
             .tab_stop(false)
@@ -703,7 +708,15 @@ impl RenderOnce for Input {
         let content_type = self.content_type;
         let disabled = self.disabled;
         let is_multi_line = presentation.is_multi_line();
-        let accessibility_role = accessibility_role(is_multi_line, content_type, self.role);
+        // Without a content type, a masked input is a password field to screen
+        // readers, so they announce it as one.
+        let accessibility_role = accessibility_role(
+            is_multi_line,
+            content_type.or(presentation
+                .is_masked()
+                .then_some(InputContentType::Password)),
+            self.role,
+        );
         let accessibility_state = state.clone();
         // Tests read the same accessibility value as assistive technology.
         // Avoid materializing the rope in normal builds without a client.
@@ -721,8 +734,9 @@ impl RenderOnce for Input {
             })
             .read(cx)
             .clone();
-        let focused = input_focused
-            || (frame_focus_handle.contains_focused(window, cx) && !presentation.is_disabled());
+        let focused = !presentation.is_disabled()
+            && (state.has_selection_focus(window, cx)
+                || frame_focus_handle.contains_focused(window, cx));
 
         let gap_x = match self.size {
             Size::Small => px(4.),
@@ -768,6 +782,15 @@ impl RenderOnce for Input {
             .focused(focused)
             .disabled(disabled)
             .track_focus(&frame_focus_handle)
+            .on_mouse_down(MouseButton::Right, {
+                let state = state.clone();
+                move |_, window, cx| {
+                    // The text element has already taken focus. Publish its state
+                    // before an outer ContextMenu resolves the selection owner;
+                    // render-time registration still names the previous input.
+                    sync_focused_input_registry(&state, window, cx);
+                }
+            })
             .when(disabled, |this| {
                 this.capture_any_mouse_down(|_, _, cx| cx.stop_propagation())
             })

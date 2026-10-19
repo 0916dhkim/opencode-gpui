@@ -227,29 +227,33 @@ impl SettingPage {
             )
             .child(
                 div()
-                    .px_4()
                     .relative()
                     .flex_1()
                     .w_full()
-                    .child(
+                    .child(gpui_base::ScrollBounce::new(
+                        "bounce",
+                        &list_state,
                         list(list_state.clone(), {
                             let query = query.clone();
                             let options = *options;
                             move |visible_ix, window, cx| {
                                 let (group_ix, group) = groups[visible_ix].clone();
-                                group
-                                    .py_4()
-                                    .render(
+                                // Keep horizontal padding inside the list's clip bounds
+                                // so focus rings can extend beyond the group's edges.
+                                div()
+                                    .w_full()
+                                    .px_4()
+                                    .child(group.py_4().render(
                                         &query,
                                         &options.with_page_ix(ix).with_group_ix(group_ix),
                                         window,
                                         cx,
-                                    )
+                                    ))
                                     .into_any_element()
                             }
                         })
                         .size_full(),
-                    )
+                    ))
                     .vertical_scrollbar(&list_state),
             )
     }

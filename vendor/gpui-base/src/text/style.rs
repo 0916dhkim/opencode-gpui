@@ -41,7 +41,8 @@ impl PartialEq for TextViewStyle {
             && self.selection == other.selection
             && self.code_background == other.code_background
             && self.border == other.border
-            && (1..=6).all(|level| (self.heading)(level) == (other.heading)(level))
+            && (Arc::ptr_eq(&self.heading, &other.heading)
+                || (1..=6).all(|level| (self.heading)(level) == (other.heading)(level)))
             && self.code_block == other.code_block
             && self.table == other.table
             && self.table_head == other.table_head
@@ -80,7 +81,7 @@ impl TextViewStyle {
             selection: colors.selection,
             code_background: colors.accent,
             border: colors.border,
-            paragraph_gap: rems(1.),
+            paragraph_gap: rems(0.75),
             heading: Arc::new(|_| StyleRefinement::default()),
             code_block: StyleRefinement::default(),
             table: StyleRefinement::default(),
@@ -134,7 +135,7 @@ impl TextViewStyle {
         self
     }
 
-    /// Sets the gap between paragraphs. Defaults to 1 rem.
+    /// Sets the gap between paragraphs. Defaults to 0.75 rem.
     pub fn with_paragraph_gap(mut self, gap: Rems) -> Self {
         self.paragraph_gap = gap;
         self
@@ -385,10 +386,34 @@ mod tests {
     }
 
     #[test]
-    fn cloning_preserves_the_same_heading_callback_fingerprint() {
-        let style = TextViewStyle::default()
-            .with_heading(|_| StyleRefinement::default().text_size(px(14.)));
+    fn heading_equality_skips_shared_callbacks_and_compares_distinct_ones() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_heading = calls.clone();
+        let style = TextViewStyle::default().with_heading(move |_| {
+            calls_for_heading.fetch_add(1, Ordering::Relaxed);
+            StyleRefinement::default().text_size(px(14.))
+        });
+
         assert!(style == style.clone());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(style != style.clone().with_paragraph_gap(rems(1.)));
+        assert!(style != style.clone().with_dark(!style.is_dark()));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let equal = style
+            .clone()
+            .with_heading(|_| StyleRefinement::default().text_size(px(14.)));
+        assert!(style == equal);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+
+        calls.store(0, Ordering::Relaxed);
+        let different = style.clone().with_heading(|level| {
+            StyleRefinement::default().text_size(px(if level == 6 { 28. } else { 14. }))
+        });
+        assert!(style != different);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
     }
 
     #[test]

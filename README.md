@@ -30,7 +30,9 @@ The latency report's legacy `measured_rows` field is always zero with this rende
 
 Hover a rendered Markdown link to see its underlying URL, including its query and fragment, in a plain-text tooltip. Link labels, wrapping, selection, opening policy and the right-click Open/Copy menu are unchanged. The tooltip wraps long destinations to the window width rather than abbreviating them.
 
-The published `gpui-base` 0.7.1 source is vendored alongside Component because its inline renderer owns the shaped link ranges but exposes no hover hook. The small opt-in `text::LinkTooltip` extension adds transparent native tooltip targets over those existing ranges (including linked inline objects), without replacing or remeasuring text. All upstream Base files and license are retained; its upstream GUI tests are not part of this application's validation suite.
+GPUI Kit **0.8.0** uses the standard **gpui-pre 0.3.9** backend; the optional GPUI Fast backend is not enabled. Published `gpui-base` and `gpui-component` 0.8.0 sources are vendored with their licenses and retain the upstream selection-state/per-frame-update fixes. App-local extensions preserve transparent client framing, composer editor insets and constrained tooltip wrapping.
+
+Base's inline renderer owns the shaped link ranges but exposes no hover hook. The small opt-in `text::LinkTooltip` extension adds transparent native tooltip targets over those existing ranges (including linked inline objects), without replacing or remeasuring text. Its port preserves upstream's split background/selection/foreground painting order. Upstream GUI tests remain dependency source, not part of this application's validation suite.
 
 Use `--preview --drawer link-tooltips` for targeted URL/label, wrapped-label, long-destination and custom-scheme inspection. The visual-capture helper's `INTERACTION=link-hover` accepts `LINK_HOVER_X/Y`, `LINK_HOVER_LEAVE=1` and `LINK_CONTEXT_MENU=1`; it is inspection tooling, not an automated GUI test suite.
 
