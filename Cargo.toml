@@ -36,6 +36,13 @@ url = "2.5"
 ttf-parser = "0.25"
 zbus = { version = "5.19", default-features = false, features = ["async-io"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))'.dependencies]
+# Includes upstream's SIGPROF restoration and preinitialized framehop fixes.
+pprof = { git = "https://github.com/tikv/pprof-rs", rev = "01cff82dbe6fe110a707bf2b38d8ebb1d14a18f8", default-features = false, features = ["framehop-unwinder"] }
+
 [patch.crates-io]
 # Base's inline renderer owns the shaped link ranges. Add opt-in native URL
 # tooltips there without replacing link text or changing selection/clicks.
@@ -48,4 +55,6 @@ gpui-component = { path = "vendor/gpui-component" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = true
+# Self-symbolize native profiles from the deployed optimized executable.
+strip = "none"
+debug = "line-tables-only"

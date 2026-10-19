@@ -1,3 +1,4 @@
+mod gpui_profile;
 mod gpui_ui;
 
 use clap::Parser;

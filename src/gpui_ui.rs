@@ -22,7 +22,7 @@ use gpui_kit::*;
 use gpui_kit::{Animation, Transformation, percentage};
 use opencode_gpui::{
     api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ServerEnvelope, UiEvent},
-    background,
+    background, cpu_profile,
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
     fonts::{self, MONO_FONT_FAMILY, UI_FONT_FAMILY},
     jobs::{self, JobKind, JobRow, Jobs},
@@ -520,6 +520,9 @@ fn may_open_link(url: &str) -> bool {
 
 #[derive(Default)]
 struct LatencyCapture {
+    cpu: Option<cpu_profile::Capture>,
+    cpu_status: cpu_profile::Status,
+    saved_cpu_status: Option<&'static str>,
     collector: Option<Rc<RefCell<profiler::journal::ForegroundJournalCollector>>>,
     task: Option<Task<()>>,
     window_id: Option<WindowId>,
@@ -1728,6 +1731,9 @@ impl Client {
             self.save_latency_report(report, cx);
         } else {
             latency::global().start();
+            self.latency.cpu = latency::global().origin().map(cpu_profile::Capture::start);
+            self.latency.cpu_status = cpu_profile::Status::Starting;
+            self.latency.saved_cpu_status = None;
             self.latency.report = None;
             self.latency.copied = false;
             let window_id = window.window_handle().window_id();
@@ -1735,7 +1741,7 @@ impl Client {
             self.latency.collector = Some(collector.clone());
             self.latency.window_id = Some(window_id);
             let bg = cx.background_executor().clone();
-            self.latency.task = Some(cx.spawn(async move |_, _| {
+            self.latency.task = Some(cx.spawn(async move |this, cx| {
                 loop {
                     let due = Instant::now() + latency::PROBE_INTERVAL;
                     let worker = bg.clone();
@@ -1751,7 +1757,16 @@ impl Client {
                     }
                     latency::global().probe(due, posted, Instant::now());
                     collect_latency(&mut collector.borrow_mut(), window_id);
-                    // No notify, refresh, window update or next-frame callback here.
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(cpu) = &this.latency.cpu {
+                            let status = cpu.status();
+                            if status != this.latency.cpu_status {
+                                this.latency.cpu_status = status;
+                                // Only a sampler-state TRANSITION redraws, not each probe.
+                                cx.notify();
+                            }
+                        }
+                    });
                 }
             }));
         }
@@ -1760,15 +1775,32 @@ impl Client {
 
     fn save_latency_report(&mut self, report: latency::Report, cx: &mut Context<Self>) {
         self.latency.saving = true;
+        let cpu = self.latency.cpu.take();
+        if let Some(cpu) = &cpu {
+            cpu.request_stop();
+        }
         let worker = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let result = worker
                 .spawn(async move {
+                    let mut report = report;
+                    if let Some(cpu) = cpu {
+                        report.cpu_profile = Some(cpu.finish());
+                    }
                     let directory = dirs::data_local_dir()
                         .unwrap_or_else(std::env::temp_dir)
                         .join("opencode-gpui/diagnostics");
                     match report.write(&directory) {
-                        Ok(path) => Ok(path),
+                        Ok(path) => Ok((
+                            path,
+                            report.cpu_profile.as_ref().map(|profile| {
+                                if profile.has_ui_stacks() {
+                                    "CPU stacks saved"
+                                } else {
+                                    "No UI CPU stacks; see report status"
+                                }
+                            }),
+                        )),
                         Err(_) => Err(report),
                     }
                 })
@@ -1776,7 +1808,10 @@ impl Client {
             let _ = this.update(cx, |this, cx| {
                 this.latency.saving = false;
                 match result {
-                    Ok(path) => this.latency.report = Some(path),
+                    Ok((path, summary)) => {
+                        this.latency.report = Some(path);
+                        this.latency.saved_cpu_status = summary;
+                    }
                     Err(report) => this.latency.failed = Some(report),
                 }
                 cx.notify();
@@ -1805,7 +1840,7 @@ impl Client {
                 .disabled(self.latency.saving)
                 .when(recording, |button| button.text_color(self.tone(0xb84b45, 0xe79b96)))
                 .tooltip(|window, cx| Tooltip::new(
-                    "Start/stop latency capture (Ctrl+Shift+L). Timings and counts only; no conversation contents."
+                    "Start/stop lag capture (Ctrl+Shift+L). Includes up to 30s of native CPU stacks and wall/CPU phase timings; function names, no conversation contents. Capture slow/fast sessions separately."
                 ).build(window, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_latency_capture(window, cx)))
                 .child(
@@ -1821,6 +1856,13 @@ impl Client {
                         .child(label),
                 ),
         );
+        if recording {
+            view = view.child(
+                div()
+                    .text_size(self.scaled(10.))
+                    .child(self.latency.cpu_status.label()),
+            );
+        }
         if !recording && !self.latency.saving {
             if self.latency.failed.is_some() {
                 view = view.child(
@@ -1837,6 +1879,9 @@ impl Client {
                             .text_size(self.scaled(10.))
                             .child("Lag report saved locally"),
                     )
+                    .when_some(self.latency.saved_cpu_status, |view, summary| {
+                        view.child(div().text_size(self.scaled(10.)).child(summary))
+                    })
                     .child(
                         BaseButton::new("latency-copy-path")
                             .accessibility_label("Copy saved lag report path")
@@ -9742,9 +9787,20 @@ impl Client {
 impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _latency = latency::global().span(TraceOperation::UiBuild, 1);
+        let view_slot = latency::global().view_slot(&self.active);
         if latency::global().enabled() {
             let viewport = window.viewport_size();
             latency::global().context(latency::Context {
+                view_slot,
+                active_busy: self
+                    .statuses
+                    .get(&self.active)
+                    .is_some_and(RunStatus::is_busy)
+                    || self.local_busy.contains(&self.active),
+                transcript_bytes: self
+                    .transcript
+                    .get(&self.active)
+                    .map_or(0, |rows| rows.iter().map(|r| r.body.len()).sum()),
                 transcript_rows: self.transcript.get(&self.active).map_or(0, Vec::len),
                 // Legacy trace field; natural overflow has no app-owned measurements.
                 measured_rows: 0,
@@ -10257,7 +10313,12 @@ impl Render for Client {
                         .child(feedback.label),
                 )
             });
-        client_frame(root.into_any_element(), window, self.dark)
+        let root = client_frame(root.into_any_element(), window, self.dark);
+        if latency::global().enabled() {
+            crate::gpui_profile::wrap(root, view_slot)
+        } else {
+            root
+        }
     }
 }
 

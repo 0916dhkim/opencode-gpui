@@ -425,7 +425,7 @@ sleep 6
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == latency-* ]]; then
   # Manual agent inspection of the real button/shortcut/export, not a GUI suite.
   xdotool mousemove --window "$win" 65 "$((window_h - 90))" click 1
-  sleep 0.4
+  sleep "${LATENCY_START_WAIT_SECONDS:-0.4}"
   xdotool mousemove --window "$win" "$((window_w / 2))" "$((window_h - 125))" click 1
   xdotool type --clearmodifiers --delay 50 'latency sample'
   xdotool key ctrl+p
@@ -435,7 +435,7 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == latency-* ]]; then
   sleep 1
   if [[ "$INTERACTION" == latency-report ]]; then
     xdotool key ctrl+shift+l
-    sleep 2
+    sleep "${LATENCY_SAVE_WAIT_SECONDS:-2}"
     xdotool mousemove --window "$win" 65 "$((window_h - 90))" click 1
   fi
   xdotool mousemove --window "$win" 140 400

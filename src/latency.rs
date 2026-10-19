@@ -1,5 +1,5 @@
 //! Opt-in, content-free latency records. No GPUI dependency or work while disabled.
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +61,10 @@ impl Operation {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq)]
 pub struct Context {
+    /// Capture-local ordinal, never a server session ID or title.
+    pub view_slot: u64,
+    pub active_busy: bool,
+    pub transcript_bytes: usize,
     pub transcript_rows: usize,
     pub measured_rows: usize,
     pub busy_tabs: usize,
@@ -76,6 +80,13 @@ pub struct Context {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Event {
+    Phase {
+        at_us: u64,
+        end_us: u64,
+        phase: Phase,
+        view_slot: u64,
+        cpu_us: Option<u64>,
+    },
     Input {
         at_us: u64,
         id: u64,
@@ -154,6 +165,7 @@ struct PendingInput {
 }
 
 struct Data {
+    views: HashMap<String, u64>,
     events: VecDeque<Event>,
     pending: VecDeque<PendingInput>,
     paints: VecDeque<Instant>,
@@ -168,6 +180,7 @@ struct Data {
 impl Default for Data {
     fn default() -> Self {
         Self {
+            views: HashMap::new(),
             events: VecDeque::with_capacity(MAX_EVENTS),
             pending: VecDeque::new(),
             paints: VecDeque::new(),
@@ -227,6 +240,78 @@ pub struct Span {
     units: usize,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    RootLayoutRequest,
+    /// Includes solver work AND surrounding framework work between callbacks.
+    RootLayoutGap,
+    RootPrepaint,
+    RootPaint,
+}
+
+pub struct PhaseSpan {
+    session: Option<Arc<Session>>,
+    start: Option<Instant>,
+    cpu_start: Option<u64>,
+    thread: Option<std::thread::ThreadId>,
+    phase: Phase,
+    view_slot: u64,
+}
+
+impl PhaseSpan {
+    /// An element that never enters prepaint did not complete a layout gap.
+    pub fn discard(mut self) {
+        self.start = None;
+    }
+}
+
+fn thread_cpu_ns() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: valid timespec output storage; only read after success.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let time = unsafe { time.assume_init() };
+        Some(
+            (time.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(time.tv_nsec as u64),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+impl Drop for PhaseSpan {
+    fn drop(&mut self) {
+        let (Some(session), Some(start)) = (&self.session, self.start) else {
+            return;
+        };
+        let end = Instant::now();
+        let cpu_us = self.cpu_start.and_then(|begin| {
+            (self.thread == Some(std::thread::current().id()))
+                .then(thread_cpu_ns)
+                .flatten()
+                .and_then(|end| end.checked_sub(begin))
+                .map(|ns| ns / 1000)
+        });
+        session.update(|data| {
+            data.push(Event::Phase {
+                at_us: session.at(start),
+                end_us: session.at(end),
+                phase: self.phase,
+                view_slot: self.view_slot,
+                cpu_us,
+            })
+        });
+    }
+}
+
 impl Span {
     pub fn units(&mut self, units: usize) {
         self.units = units;
@@ -259,6 +344,41 @@ impl Drop for Span {
 }
 
 impl Trace {
+    pub fn origin(&self) -> Option<Instant> {
+        self.session().map(|s| s.origin)
+    }
+
+    pub fn view_slot(&self, key: &str) -> u64 {
+        let Some(session) = self.session() else {
+            return 0;
+        };
+        let mut data = session.data.lock().unwrap();
+        if let Some(slot) = data.views.get(key) {
+            return *slot;
+        }
+        // Also bounds capture-local identifiers in memory. Zero means overflow.
+        if data.views.len() == 32 {
+            return 0;
+        }
+        let slot = data.views.len() as u64 + 1;
+        data.views.insert(key.to_owned(), slot);
+        slot
+    }
+
+    pub fn phase(&self, phase: Phase, view_slot: u64) -> PhaseSpan {
+        let session = self.session();
+        let start = session.as_ref().map(|_| Instant::now());
+        let cpu_start = session.as_ref().and_then(|_| thread_cpu_ns());
+        let thread = session.as_ref().map(|_| std::thread::current().id());
+        PhaseSpan {
+            session,
+            start,
+            cpu_start,
+            thread,
+            phase,
+            view_slot,
+        }
+    }
     pub fn enabled(&self) -> bool {
         self.0.enabled.load(Ordering::Relaxed)
     }
@@ -516,6 +636,7 @@ impl Trace {
             journal_lost: data.journal_lost,
             pending_inputs: data.pending.len(),
             last_context: data.last_context,
+            cpu_profile: None,
         })
     }
 }
@@ -526,6 +647,7 @@ pub struct InputToken {
 }
 
 pub struct Report {
+    pub cpu_profile: Option<crate::cpu_profile::Profile>,
     unix_ms: u64,
     duration_us: u64,
     events: VecDeque<Event>,
@@ -558,6 +680,8 @@ impl Report {
                 "dropped_events": self.dropped_events, "dropped_inputs": self.dropped_inputs,
                 "journal_lost": self.journal_lost, "pending_inputs_at_stop": self.pending_inputs,
                 "last_context": self.last_context,
+                "deep_profile_version": 1,
+                "release_symbols": "retained with line tables; export contains function names only",
                 "semantics": {
                     "input": "app receipt, never physical key-press time; action categories only",
                     "state": "confirmed=true is an edit notification; false is post-dispatch only",
@@ -572,11 +696,22 @@ impl Report {
                     "transcript_layout": "all loaded rows use natural overflow layout; no virtualization or detached height measurement",
                     "measured_rows": "legacy field is always zero; it does not count rendered rows",
                     "limits": "bounded rolling event buffer; no correlation across journal gaps",
-                    "disabled": "custom recording/probes disabled; compiled GPUI journal retains its own bounded bookkeeping"
+                    "disabled": "custom recording/probes disabled; compiled GPUI journal retains its own bounded bookkeeping",
+                    "phases": "root callbacks measure inclusive wall and Linux current-thread CPU time; layout_gap also includes surrounding framework work, not exclusive layout-solver time; phase records roll with the event buffer; compare CPU against wall to identify non-CPU elapsed time, not its specific wait cause",
+                    "view_slot": "capture-local ordinal only; zero means unavailable/over 32 distinct views; CPU stacks aggregate across all views, use separate slow/fast captures"
                 }
             });
             serde_json::to_writer(&mut output, &header)?;
             writeln!(output)?;
+            if let Some(profile) = &self.cpu_profile {
+                serde_json::to_writer(
+                    &mut output,
+                    &serde_json::json!({
+                        "type": "cpu_profile", "profile": profile,
+                    }),
+                )?;
+                writeln!(output)?;
+            }
             for (operation, totals) in Operation::ALL.into_iter().zip(self.operations) {
                 serde_json::to_writer(
                     &mut output,
@@ -820,5 +955,41 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn phase_records_are_scoped_and_view_identifiers_are_anonymous() {
+        let trace = Trace::default();
+        assert_eq!(trace.view_slot("private-session-key"), 0);
+        drop(trace.phase(Phase::RootPaint, 0));
+        trace.start();
+        let slot = trace.view_slot("private-session-key");
+        assert_eq!(slot, 1);
+        assert_eq!(trace.view_slot("private-session-key"), slot);
+        assert_eq!(trace.view_slot("another-private-key"), 2);
+        {
+            let _phase = trace.phase(Phase::RootPrepaint, slot);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let stale = trace.phase(Phase::RootPaint, slot);
+        let report = trace.stop().unwrap();
+        trace.start();
+        drop(stale);
+        assert!(trace.stop().unwrap().events.is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        let path = report.write(directory.path()).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("private-session-key"));
+        assert!(!text.contains("another-private-key"));
+        let phase: serde_json::Value = text
+            .lines()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .find(|v| v["type"] == "phase")
+            .unwrap();
+        let wall = phase["end_us"].as_u64().unwrap() - phase["at_us"].as_u64().unwrap();
+        assert!(wall >= 15_000);
+        #[cfg(target_os = "linux")]
+        assert!(phase["cpu_us"].as_u64().unwrap() < wall);
+        assert_eq!(phase["view_slot"], 1);
     }
 }
