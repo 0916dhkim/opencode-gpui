@@ -787,6 +787,13 @@ struct TranscriptAutoscroll {
     token: u64,
 }
 
+fn release_transcript_autoscroll(
+    button: MouseButton,
+    state: &mut Option<TranscriptAutoscroll>,
+) -> bool {
+    button == MouseButton::Middle && state.take().is_some()
+}
+
 fn autoscroll_step(distance: Pixels, zoom: f32) -> Pixels {
     let distance = distance.as_f32();
     let beyond_dead_zone = (distance.abs() - 16. * zoom).max(0.);
@@ -2895,12 +2902,11 @@ impl Client {
         }
     }
 
-    fn toggle_transcript_autoscroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.autoscroll.take().is_some() {
-            cx.notify();
-            return;
-        }
-        if self.modal.is_some() || !self.scroll.bounds().contains(&position) {
+    fn start_transcript_autoscroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.autoscroll.is_some()
+            || self.modal.is_some()
+            || !self.scroll.bounds().contains(&position)
+        {
             return;
         }
         self.next_autoscroll_token = self.next_autoscroll_token.wrapping_add(1);
@@ -10510,15 +10516,31 @@ impl Render for Client {
                         window.on_mouse_event::<MouseUpEvent>(move |event, phase, _, cx| {
                             if phase.capture() {
                                 trace_input(TraceAction::Pointer, cx);
-                                // Window-wide release also covers a thumb released
-                                // outside the transcript or over an opaque child.
-                                if event.button == MouseButton::Left {
-                                    let _ = client.update(cx, |this, cx| {
-                                        if this.transcript_pointer_down {
-                                            this.transcript_pointer_down = false;
-                                            cx.notify();
-                                        }
-                                    });
+                                // Window-wide capture also covers release outside
+                                // the transcript or over an opaque child.
+                                if matches!(event.button, MouseButton::Left | MouseButton::Middle) {
+                                    let stopped = client
+                                        .update(cx, |this, cx| {
+                                            let released_pointer = event.button
+                                                == MouseButton::Left
+                                                && std::mem::take(
+                                                    &mut this.transcript_pointer_down,
+                                                );
+                                            let stopped_autoscroll = release_transcript_autoscroll(
+                                                event.button,
+                                                &mut this.autoscroll,
+                                            );
+                                            if released_pointer || stopped_autoscroll {
+                                                cx.notify();
+                                            }
+                                            stopped_autoscroll
+                                        })
+                                        .unwrap_or(false);
+                                    if stopped {
+                                        // A held autoscroll release must not also
+                                        // middle-close the sidebar tab under it.
+                                        cx.stop_propagation();
+                                    }
                                 }
                             }
                         });
@@ -10549,7 +10571,7 @@ impl Render for Client {
                     && this.link_menu.is_none()
                     && this.scroll.bounds().contains(&event.position)
                 {
-                    this.toggle_transcript_autoscroll(event.position, cx);
+                    this.start_transcript_autoscroll(event.position, cx);
                     cx.stop_propagation();
                 } else if this.autoscroll.take().is_some() {
                     cx.notify();
@@ -11189,6 +11211,29 @@ mod tests {
                 ..gear
             }
         );
+    }
+
+    #[test]
+    fn autoscroll_stops_only_on_middle_button_release() {
+        let mut state = Some(super::TranscriptAutoscroll {
+            session: "session".into(),
+            origin: point(px(500.), px(350.)),
+            pointer: point(px(500.), px(200.)),
+            token: 1,
+        });
+        for button in [gpui_kit::MouseButton::Left, gpui_kit::MouseButton::Right] {
+            assert!(!super::release_transcript_autoscroll(button, &mut state));
+            assert!(state.is_some());
+        }
+        assert!(super::release_transcript_autoscroll(
+            gpui_kit::MouseButton::Middle,
+            &mut state,
+        ));
+        assert!(state.is_none());
+        assert!(!super::release_transcript_autoscroll(
+            gpui_kit::MouseButton::Middle,
+            &mut state,
+        ));
     }
 
     #[test]

@@ -274,10 +274,15 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == transcript-autoscroll ]]; then
     xdotool mousemove --window "$win" 410 680 click 1
     for ((i = 0; i < AUTOSCROLL_ZOOM_STEPS; i++)); do xdotool key ctrl+equal; sleep 0.15; done
   fi
-  xdotool mousemove --window "$win" 550 350 click 2
+  xdotool mousemove --window "$win" 550 350 mousedown 2
   sleep 0.2
   import -window "$win" "${OUTPUT%.png}-marker.png"
   xdotool mousemove --window "$win" 550 200
+  sleep 1.2
+  import -window "$win" "${OUTPUT%.png}-held.png"
+  xdotool mousemove --window "$win" "${AUTOSCROLL_RELEASE_X:-550}" "${AUTOSCROLL_RELEASE_Y:-200}" mouseup 2
+  sleep 0.5
+  import -window "$win" "${OUTPUT%.png}-released.png"
   sleep 1.2
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == drag-reorder ]]; then
