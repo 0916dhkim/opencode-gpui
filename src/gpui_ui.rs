@@ -35,6 +35,7 @@ use opencode_gpui::{
     pending::{self, Forms, PendingRequest},
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
     preview, protocol,
+    sidebar_motion::SidebarMotion,
     tab_drag::TabDragState,
     tray,
 };
@@ -572,6 +573,7 @@ struct ClientSurface {
     environment: Option<SurfaceEnvironment>,
     transcript: Option<TranscriptPresentation>,
     editor: Option<EditorPresentation>,
+    sidebar_phase: Option<f32>,
     fresh: bool,
     _subscription: Option<Subscription>,
 }
@@ -586,6 +588,7 @@ impl ClientSurface {
             environment: None,
             transcript: None,
             editor: None,
+            sidebar_phase: None,
             fresh: true,
             _subscription: subscription,
         }
@@ -941,6 +944,9 @@ struct Client {
     sessions: Vec<Session>,
     open_tabs: Vec<String>,
     sidebar_visible: bool,
+    sidebar_motion: SidebarMotion,
+    sidebar_frame_pending: bool,
+    sidebar_focus: FocusHandle,
     sidebar_auto_hidden: bool,
     sidebar_zoom_initialized: bool,
     sidebar_zoom_width: Pixels,
@@ -2631,6 +2637,9 @@ impl Client {
             sessions: Vec::new(),
             open_tabs: Vec::new(),
             sidebar_visible: true,
+            sidebar_motion: SidebarMotion::new(true),
+            sidebar_frame_pending: false,
+            sidebar_focus: cx.focus_handle(),
             sidebar_auto_hidden: false,
             sidebar_zoom_initialized: false,
             sidebar_zoom_width: px(0.),
@@ -3016,11 +3025,7 @@ impl Client {
         };
         window.viewport_size().width
             - frame
-            - self.scaled(if self.sidebar_visible {
-                SIDEBAR_WIDTH
-            } else {
-                0.
-            })
+            - self.sidebar_width()
             - self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER)
     }
 
@@ -3030,6 +3035,16 @@ impl Client {
 
     fn scaled(&self, value: f32) -> Pixels {
         px(value * self.zoom())
+    }
+
+    fn sidebar_width(&self) -> Pixels {
+        let phase = self.sidebar_motion.position();
+        if phase > 0. {
+            // The solid divider is 1 physical layout pixel even near zero.
+            self.scaled(SIDEBAR_WIDTH * phase).max(px(1.))
+        } else {
+            px(0.)
+        }
     }
 
     fn set_zoom(&mut self, zoom: f64, window: &mut Window, cx: &mut Context<Self>) {
@@ -3057,11 +3072,17 @@ impl Client {
         // A zoomed fixed-width sidebar must not leave the chat narrower than
         // its controls. Auto-collapse it, but let Ctrl+B reopen it on demand.
         let cramped = window.viewport_size().width < self.scaled(SIDEBAR_WIDTH + 350.);
-        if cramped && self.sidebar_visible {
-            self.sidebar_visible = false;
-            self.sidebar_auto_hidden = true;
-        } else if !cramped && self.sidebar_auto_hidden {
+        if cramped {
+            if self.sidebar_visible {
+                self.sidebar_visible = false;
+                self.sidebar_auto_hidden = true;
+            }
+            // Also cancel an in-flight manual close when a resize/zoom needs
+            // the space immediately, without turning it into an auto-reopen.
+            self.sidebar_motion.snap(false);
+        } else if self.sidebar_auto_hidden {
             self.sidebar_visible = true;
+            self.sidebar_motion.snap(true);
             self.sidebar_auto_hidden = false;
         }
         self.sidebar_zoom_initialized = true;
@@ -3074,13 +3095,28 @@ impl Client {
         window.viewport_size().width >= self.scaled(SIDEBAR_WIDTH + 260.)
     }
 
-    fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.sidebar_visible && !self.can_open_sidebar(window) {
             return;
         }
         self.sidebar_visible = !self.sidebar_visible;
         self.sidebar_auto_hidden = false;
+        self.sidebar_motion
+            .retarget(self.sidebar_visible, Instant::now(), cx.reduce_motion());
+        self.reconcile_sidebar_interaction(window, cx);
         cx.notify();
+    }
+
+    fn reconcile_sidebar_interaction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sidebar_visible {
+            if self.sidebar_focus.contains_focused(window, cx) {
+                self.sidebar_toggle_focus.focus(window, cx);
+            }
+            if self.tab_drag.is_some() {
+                cx.stop_active_drag(window);
+                self.clear_tab_drag(cx);
+            }
+        }
     }
 
     fn request_newest(&mut self, id: &str) {
@@ -3190,7 +3226,8 @@ impl Client {
         cx: &mut Context<Self>,
     ) {
         let ids = self.visible_tab_ids();
-        if self.tab_shortcut_hint
+        if !self.sidebar_visible
+            || self.tab_shortcut_hint
             || self
                 .tab_drag
                 .as_ref()
@@ -6204,6 +6241,9 @@ impl Client {
             sessions,
             open_tabs: server.tabs.iter().map(|tab| tab.id.clone()).collect(),
             sidebar_visible: true,
+            sidebar_motion: SidebarMotion::new(true),
+            sidebar_frame_pending: false,
+            sidebar_focus: cx.focus_handle(),
             sidebar_auto_hidden: false,
             sidebar_zoom_initialized: false,
             sidebar_zoom_width: px(0.),
@@ -6751,7 +6791,8 @@ impl Client {
     }
 
     fn session_header(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.sidebar_visible {
+        let phase = 1. - self.sidebar_motion.position();
+        if phase <= 0. {
             return None;
         }
         let title = self
@@ -6789,7 +6830,9 @@ impl Client {
             div()
                 .id("session-header")
                 .test_support()
-                .h(self.scaled(50.))
+                .h(self.scaled(50. * phase))
+                .opacity(phase)
+                .overflow_hidden()
                 .w_full()
                 .flex_shrink_0()
                 .flex()
@@ -7179,14 +7222,13 @@ impl Client {
             }
         }
         div()
-            .w(self.scaled(SIDEBAR_WIDTH))
+            .w(self.scaled(SIDEBAR_WIDTH) - px(1.))
             .h_full()
             .flex()
             .flex_col()
+            .opacity(self.sidebar_motion.position())
             .bg(self.tone(0xf4f1eb, 0x0d0f11))
             .when(floating, |view| view.rounded_bl(px(FLOATING_CORNER_RADIUS)))
-            .border_r_1()
-            .border_color(self.tone(0xc8c3ba, 0x24282c))
             .child(
                 BaseButton::new("new-session")
                     .accessibility_label("New session")
@@ -8924,11 +8966,7 @@ impl Client {
             .min((window.viewport_size().width - self.scaled(16.)).max(self.scaled(180.)));
         let picker_anchor = if matches!(modal, Modal::Model | Modal::Level) {
             let model = modal == Modal::Model;
-            let sidebar = if self.sidebar_visible {
-                SIDEBAR_WIDTH
-            } else {
-                0.
-            };
+            let sidebar = SIDEBAR_WIDTH * self.sidebar_motion.position();
             let button_center = if model {
                 134.
             } else {
@@ -10260,6 +10298,23 @@ impl Render for Client {
             self.reconcile_zoom_sidebar(window);
         }
         window.set_rem_size(self.scaled(16.));
+        self.reconcile_sidebar_interaction(window, cx);
+        if cx.reduce_motion() {
+            self.sidebar_motion.snap(self.sidebar_visible);
+        }
+        self.sidebar_motion.advance(Instant::now());
+        if self.sidebar_motion.is_animating() && !self.sidebar_frame_pending {
+            self.sidebar_frame_pending = true;
+            let client = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = client.update(cx, |this, cx| {
+                    this.sidebar_frame_pending = false;
+                    if this.sidebar_motion.is_animating() {
+                        cx.notify();
+                    }
+                });
+            });
+        }
         let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
         let floating = matches!(window.window_decorations(), Decorations::Client { tiling } if !tiling.is_tiled())
             && !window.is_maximized()
@@ -10509,6 +10564,14 @@ impl Render for Client {
             self.scroll.clone(),
             cx,
         );
+        surfaces.sidebar.update(cx, |view, _| {
+            let phase = self.sidebar_motion.position();
+            // GPUI's retained-paint key omits opacity. Repaint this small
+            // boundary on EVERY changed phase, including final/reduced-motion
+            // and automatic-reopen endpoints, even if snapped before render.
+            view.fresh |= view.sidebar_phase != Some(phase);
+            view.sidebar_phase = Some(phase);
+        });
         if editor_transition {
             surfaces.editor.update(cx, |view, _| view.fresh = true);
         }
@@ -10683,11 +10746,7 @@ impl Render for Client {
                                     .left_0()
                                     .top_0()
                                     .h_full()
-                                    .w(self.scaled(if self.sidebar_visible {
-                                        SIDEBAR_WIDTH
-                                    } else {
-                                        48.
-                                    }))
+                                    .w(self.sidebar_width().max(self.scaled(48.)))
                                     .pl(self.scaled(16.))
                                     .flex()
                                     .items_center()
@@ -10737,14 +10796,36 @@ impl Render for Client {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .when(self.sidebar_visible, |view| {
+                    .when(self.sidebar_motion.position() > 0., |view| {
                         view.child(
                             div()
-                                .w(self.scaled(SIDEBAR_WIDTH))
+                                .id("sidebar-reveal")
+                                .track_focus(&self.sidebar_focus)
+                                .w(self.sidebar_width())
                                 .h_full()
                                 .flex_shrink_0()
                                 .relative()
-                                .child(ClientSurfaces::element(&surfaces.sidebar, cx)),
+                                .overflow_hidden()
+                                .bg(self.tone(0xf4f1eb, 0x0d0f11))
+                                .border_r_1()
+                                .border_color(self.tone(0xc8c3ba, 0x24282c))
+                                .when(floating, |view| view.rounded_bl(px(FLOATING_CORNER_RADIUS)))
+                                .when(!self.sidebar_visible, |view| {
+                                    view.capture_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                                        .capture_key_down(|_, _, cx| cx.stop_propagation())
+                                })
+                                .child(
+                                    div()
+                                        .w(self.scaled(SIDEBAR_WIDTH) - px(1.))
+                                        .h_full()
+                                        .relative()
+                                        .child(ClientSurfaces::element(&surfaces.sidebar, cx)),
+                                )
+                                .when(!self.sidebar_visible, |view| {
+                                    // A fading visual is not an active sidebar.
+                                    // Occlude child pointer/scroll/drop hitboxes.
+                                    view.child(div().absolute().inset_0().occlude())
+                                }),
                         )
                     })
                     .child(
@@ -10756,7 +10837,7 @@ impl Render for Client {
                             .bg(self.tone(0xf4f1eb, 0x101214))
                             .when(floating, |view| {
                                 let view = view.rounded_br(px(FLOATING_CORNER_RADIUS));
-                                if self.sidebar_visible {
+                                if self.sidebar_motion.position() > 0. {
                                     view
                                 } else {
                                     view.rounded_bl(px(FLOATING_CORNER_RADIUS))

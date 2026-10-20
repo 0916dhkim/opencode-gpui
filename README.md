@@ -28,6 +28,10 @@ The latency report's legacy `measured_rows` field is always zero with this rende
 
 `--preview --drawer layout-profile` supplies a fixed 102-row, 357-rich-paragraph document with inline code, links, code blocks and tables, with busy jobs/animations disabled. This uses the real renderer. The manual capture helper's `INTERACTION=layout-profile` runs normal Record lag collection around a repeatable wheel sequence; compare scroll-input-paired draws separately from the post-scroll scrollbar fade. Software-container timings are not native desktop FPS or GPU measurements.
 
+### Sidebar panel
+
+The sidebar toggle (or **Ctrl+B**) reveals/collapses the panel over 180 ms with cubic ease-out while its fixed-size contents fade. The background and divider remain solid; the chat resizes alongside it and the closed-sidebar session header changes height with the same phase. Rapid toggles reverse from the current position. GPUI's reduced-motion flag and automatic narrow-window/zoom collapse settle immediately. Closing cancels tab dragging and removes the fading controls from pointer and keyboard navigation. This is live width animation, so long transcripts still incur intermediate layout work; it is not an overlay or a layout-free optimization.
+
 ### Tab reordering
 
 Drag a tab's label to reorder it. One outlined insertion space follows the target while neighboring rows slide into place; the source row is represented by the floating preview rather than duplicated in the list. The list keeps its total extent, so dragging cannot expand gaps or displace the footer. Long lists scroll inside the sidebar.

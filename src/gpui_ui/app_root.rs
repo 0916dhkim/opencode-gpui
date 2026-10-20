@@ -159,10 +159,16 @@ impl Render for AppRoot {
         div()
             .id("opencode-root")
             .key_context("OpenCodeRoot")
-            .on_action(|_: &NextFocus, window, cx| advance_focus(window, cx, Window::focus_next))
-            .on_action(|_: &PreviousFocus, window, cx| {
-                advance_focus(window, cx, Window::focus_prev)
-            })
+            .on_action(cx.listener(|this, _: &NextFocus, window, cx| {
+                let client = this.client.read(cx);
+                let excluded = (!client.sidebar_visible).then(|| client.sidebar_focus.clone());
+                advance_focus(window, cx, Window::focus_next, excluded);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousFocus, window, cx| {
+                let client = this.client.read(cx);
+                let excluded = (!client.sidebar_visible).then(|| client.sidebar_focus.clone());
+                advance_focus(window, cx, Window::focus_prev, excluded);
+            }))
             .on_action(|_: &Copy, window, cx| {
                 let text = gpui_kit::base::TextSelection::selected_text(window, cx);
                 let text = text.trim();
@@ -200,17 +206,27 @@ impl Render for AppRoot {
     }
 }
 
-fn advance_focus(window: &mut Window, cx: &mut App, advance: fn(&mut Window, &mut App)) {
-    let Some(container) = gpui_kit::base::active_focus_trap(window, cx) else {
-        advance(window, cx);
-        return;
-    };
+fn advance_focus(
+    window: &mut Window,
+    cx: &mut App,
+    advance: fn(&mut Window, &mut App),
+    excluded: Option<FocusHandle>,
+) {
+    let container = gpui_kit::base::active_focus_trap(window, cx);
     advance(window, cx);
     let first = window.focused(cx);
-    while !container.contains_focused(window, cx) {
+    while container
+        .as_ref()
+        .is_some_and(|scope| !scope.contains_focused(window, cx))
+        || excluded
+            .as_ref()
+            .is_some_and(|scope| scope.contains_focused(window, cx))
+    {
         advance(window, cx);
         if window.focused(cx) == first {
-            container.focus(window, cx);
+            if let Some(container) = container {
+                container.focus(window, cx);
+            }
             break;
         }
     }
