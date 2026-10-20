@@ -41,6 +41,9 @@ use serde::Deserialize;
 
 use crate::Args;
 
+mod app_root;
+use app_root::{AppRoot, editor_context_menu};
+
 fn tab_number_key(key: &str) -> Option<usize> {
     match key {
         "1" | "numpad1" | "kp_1" => Some(0),
@@ -8169,12 +8172,10 @@ impl Client {
         let paste_owner = cx.entity().downgrade();
         let paste_session = self.active.clone();
         Textarea::new(&self.composer)
+            .context_menu(editor_context_menu(&self.composer, |state| {
+                state.context_menu_capabilities()
+            }))
             .aria_label("Ask OpenCode anything…")
-            .editor_padding_left(self.scaled(14.))
-            // Insets belong outside the editor's native scrollbar viewport.
-            .editor_padding_top(px(0.))
-            .editor_padding_bottom(px(0.))
-            .py(self.scaled(8.))
             .on_paste(move |item, _, app| {
                 paste_owner
                     .update(app, |this, cx| {
@@ -8734,7 +8735,14 @@ impl Client {
                             .with_size(px(16.))
                             .text_color(self.tone(0x8b918e, 0x71717a)),
                     )
-                    .child(Input::new(&self.settings.session_search).appearance(false)),
+                    .child(
+                        Input::new(&self.settings.session_search)
+                            .context_menu(editor_context_menu(
+                                &self.settings.session_search,
+                                |state| state.context_menu_capabilities(),
+                            ))
+                            .appearance(false),
+                    ),
             )
             .child(rows)
             .into_any_element()
@@ -8758,8 +8766,12 @@ impl Client {
             return None;
         }
         let menu = self.link_menu.as_ref()?;
-        let width = self.scaled(164.);
-        let height = self.scaled(82.);
+        let width = self
+            .scaled(420.)
+            .min((window.viewport_size().width - self.scaled(16.)).max(px(1.)));
+        let height = self
+            .scaled(202.)
+            .min((window.viewport_size().height - self.scaled(16.)).max(px(1.)));
         let margin = self.scaled(8.);
         let left = menu
             .position
@@ -8778,7 +8790,7 @@ impl Client {
             .left(left)
             .top(top)
             .w(width)
-            .h(height)
+            .max_h(height)
             .p(self.scaled(5.))
             .flex()
             .flex_col()
@@ -8786,7 +8798,20 @@ impl Client {
             .border_1()
             .border_color(self.tone(0xc8c3ba, 0x30353a))
             .bg(self.tone(0xfffdfa, 0x191c1f))
-            .shadow_lg();
+            .shadow_lg()
+            .child(
+                div()
+                    .id("link-menu-destination")
+                    .role(Role::Label)
+                    .aria_label(menu.url.clone())
+                    .max_h(self.scaled(110.))
+                    .flex_shrink_0()
+                    .overflow_y_scroll()
+                    .p(self.scaled(8.))
+                    .text_size(self.scaled(11.))
+                    .whitespace_normal()
+                    .child(menu.url.clone()),
+            );
         for (index, label, open) in [(0, "Open link", true), (1, "Copy link", false)] {
             popup = popup.child(
                 div()
@@ -8976,7 +9001,13 @@ impl Client {
                                     .with_size(px(16.))
                                     .text_color(self.tone(0x8b918e, 0x71717a)),
                             )
-                            .child(Input::new(&self.search).appearance(false)),
+                            .child(
+                                Input::new(&self.search)
+                                    .context_menu(editor_context_menu(&self.search, |state| {
+                                        state.context_menu_capabilities()
+                                    }))
+                                    .appearance(false),
+                            ),
                     );
                 if sessions {
                     let query = self.search.read(cx).value();
@@ -9232,7 +9263,13 @@ impl Client {
                         .border_1()
                         .border_color(self.tone(0x4f99ee, 0x62bceb))
                         .rounded(px(5.))
-                        .child(Input::new(&self.rename).appearance(false)),
+                        .child(
+                            Input::new(&self.rename)
+                                .context_menu(editor_context_menu(&self.rename, |state| {
+                                    state.context_menu_capabilities()
+                                }))
+                                .appearance(false),
+                        ),
                 )
                 .when_some(self.rename_error.clone(), |card, error| {
                     card.child(
@@ -9428,7 +9465,13 @@ impl Client {
                             ))
                             .bg(self.tone(0xffffff, 0x2e2e2e))
                             .text_color(self.tone(0x5a6261, 0xf0ede7))
-                            .child(Input::new(input).appearance(false)),
+                            .child(
+                                Input::new(input)
+                                    .context_menu(editor_context_menu(input, |state| {
+                                        state.context_menu_capabilities()
+                                    }))
+                                    .appearance(false),
+                            ),
                     );
                     if index == 2 {
                         let owner = cx.entity().downgrade();
@@ -9923,7 +9966,13 @@ impl Client {
                                     .with_size(self.scaled(16.))
                                     .text_color(self.tone(0x8b918e, 0x71717a)),
                             )
-                            .child(Input::new(&self.search).appearance(false)),
+                            .child(
+                                Input::new(&self.search)
+                                    .context_menu(editor_context_menu(&self.search, |state| {
+                                        state.context_menu_capabilities()
+                                    }))
+                                    .appearance(false),
+                            ),
                     );
                 let mut rows = div()
                     .id("model-level-picker-list")
@@ -10926,15 +10975,7 @@ pub fn run(args: Args) {
                 );
             }
             gpui_kit::init(cx);
-            gpui_kit::base::text::LinkTooltip::install(
-                |url, window, cx| {
-                    Tooltip::new(url.clone())
-                        .max_w(px(520.).min(window.bounds().size.width - px(48.)))
-                        .whitespace_normal()
-                        .build(window, cx)
-                },
-                cx,
-            );
+            app_root::init(cx);
             let theme_override = match std::env::var("OPENCODE_GPUI_THEME").as_deref() {
                 Ok("dark") => Some(ThemeMode::Dark),
                 Ok("light") => Some(ThemeMode::Light),
@@ -10949,11 +10990,11 @@ pub fn run(args: Args) {
                 theme.font_family = UI_FONT_FAMILY.into();
                 theme.mono_font_family = MONO_FONT_FAMILY.into();
             });
-            let (handle, _) = gpui_kit::open_window(client_window_options(), cx, |window, cx| {
+            cx.open_window(client_window_options(), |window, cx| {
                 if theme_override.is_none() {
                     follow_system_appearance(window, cx);
                 }
-                cx.new(|cx| {
+                let client = cx.new(|cx| {
                     if args.preview {
                         Client::from_preview(window, cx, args.drawer.clone())
                     } else if args.preview_api {
@@ -10961,14 +11002,10 @@ pub fn run(args: Args) {
                     } else {
                         Client::from_live(window, cx, &args)
                     }
-                })
+                });
+                cx.new(|cx| AppRoot::new(client, window, cx))
             })
             .expect("open GPUI window");
-            handle
-                .update(cx, |_, window, cx| {
-                    gpui_kit::component::use_client_frame(window, cx);
-                })
-                .expect("configure GPUI client frame");
         });
 }
 

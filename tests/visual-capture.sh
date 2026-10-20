@@ -140,6 +140,13 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == link-hover ]]; then
   if [[ "${LINK_CONTEXT_MENU:-0}" == 1 ]]; then
     xdotool click 3
     sleep 0.5
+    if [[ "${LINK_MENU_COPY_PASTE:-0}" == 1 ]]; then
+      xdotool key Tab Return
+      sleep 0.3
+      xdotool mousemove --window "$win" "$((window_w / 2))" "$((window_h - 130))" click 1
+      xdotool key ctrl+v
+      sleep 0.5
+    fi
   fi
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == zoom-in ]]; then
@@ -546,6 +553,46 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == model-search ]]; then
   xdotool mousemove --window "$win" 330 568 click 1
   xdotool type --clearmodifiers --delay 100 'Claude'
   sleep 1
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == root-editor-menu ]]; then
+  # Agent-directed inspection of the app-owned Linux editor menu and action
+  # routing. Not an automated GUI test case or a live-machine interaction.
+  editor_x="${EDITOR_X:-$((window_w / 2))}"
+  editor_y="${EDITOR_Y:-$((window_h - 130))}"
+  xdotool mousemove --window "$win" "$editor_x" "$editor_y" click 1
+  xdotool key ctrl+a
+  xdotool type --clearmodifiers --delay 35 'Native editor menu retains selection.'
+  xdotool key ctrl+a
+  xdotool click 3
+  sleep 1
+  if [[ "${EDITOR_MENU_COPY_PASTE:-0}" == 1 ]]; then
+    xdotool mousemove --window "$win" "$((editor_x + 30))" "$((editor_y + 45))" click 1
+    sleep 0.3
+    xdotool key ctrl+a BackSpace ctrl+v
+    sleep 0.5
+  fi
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == root-tooltip ]]; then
+  xdotool mousemove --window "$win" 65 "$((window_h - 90))"
+  sleep 1.5
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == root-selection-copy ]]; then
+  xdotool mousemove --window "$win" 300 306 mousedown 1
+  xdotool mousemove --window "$win" 570 372
+  sleep 0.3
+  xdotool mouseup 1
+  xdotool key ctrl+c
+  xdotool mousemove --window "$win" "$((window_w / 2))" "$((window_h - 130))" click 1
+  xdotool key ctrl+v
+  sleep 0.5
+fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == root-modal-tab ]]; then
+  # Model-picker search: a round trip through native focus order must return
+  # to the same editor, staying inside the app's active modal focus trap.
+  xdotool mousemove --window "$win" 330 568 click 1
+  xdotool key Tab shift+Tab
+  xdotool type --clearmodifiers --delay 80 'Claude'
+  sleep 0.5
 fi
 if [[ "$CLIENT" == gpui ]]; then
   import -window "$win" "$OUTPUT"

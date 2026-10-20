@@ -43,15 +43,6 @@ libc = "0.2"
 # Includes upstream's SIGPROF restoration and preinitialized framehop fixes.
 pprof = { git = "https://github.com/tikv/pprof-rs", rev = "01cff82dbe6fe110a707bf2b38d8ebb1d14a18f8", default-features = false, features = ["framehop-unwinder"] }
 
-[patch.crates-io]
-# Base's inline renderer owns the shaped link ranges. Add opt-in native URL
-# tooltips there without replacing link text or changing selection/clicks.
-gpui-base = { path = "vendor/gpui-base" }
-# Component's stock Root paints an opaque surface and adds a 20px window
-# border outside every Client window. Keep its plugins, but allow this app to
-# provide the transparent, rounded client frame instead.
-gpui-component = { path = "vendor/gpui-component" }
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
