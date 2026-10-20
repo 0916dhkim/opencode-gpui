@@ -10708,6 +10708,10 @@ impl Render for Client {
                                                 style.border_color(self.tone(0x2356a8, 0x78baff))
                                             })
                                             .cursor_pointer()
+                                            // This control is not draggable title-bar chrome.
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
                                             .on_key_down(cx.listener(
                                                 |this, event: &KeyDownEvent, window, cx| {
                                                     if matches!(
@@ -10720,7 +10724,8 @@ impl Render for Client {
                                                 },
                                             ))
                                             .on_click(cx.listener(|this, _, window, cx| {
-                                                this.toggle_sidebar(window, cx)
+                                                cx.stop_propagation();
+                                                this.toggle_sidebar(window, cx);
                                             }))
                                             .child("◫"),
                                     ),
