@@ -240,6 +240,10 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == working-pill ]]; then
   xdotool mousemove --window "$win" 100 227 click 1
   sleep 0.5
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == error-session ]]; then
+  xdotool mousemove --window "$win" 92 148 click 1
+  sleep 0.5
+fi
 if [[ "$CLIENT" == gpui && "$case_name" == many-projects && "${INTERACTION:-}" == picker-last ]]; then
   xdotool key --repeat 8 --delay 50 Down
   sleep 0.4

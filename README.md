@@ -16,7 +16,7 @@ Manrope uses the static Google Fonts faces from the approved preview (WOFF conta
 
 ### Transcript scrolling and history
 
-The transcript is a normal GPUI overflow-scrolling column containing **every loaded row**. It has no virtual list, detached row measurement, height cache, estimated spacers or custom layout/scroll-correction engine. GPUI handles natural layout and clipping; a plain `ScrollHandle` supplies bottom scrolling, item positions and the scrollbar.
+The transcript is a normal GPUI overflow-scrolling container containing **every loaded row**. It has no virtual list, detached row measurement, height cache, estimated spacers or custom layout/scroll-correction engine. GPUI handles natural layout and clipping; a plain `ScrollHandle` supplies bottom scrolling, item positions and the scrollbar. Non-flexing vertical row/header stacks use block flow, and rows receive the already-known viewport width instead of repeatedly resolving percentage widths during intrinsic sizing. Their heights still come entirely from natural layout.
 
 Opening a session still requests only its newest history page. **Load earlier messages** requests one older page on demand, with the existing loading, duplicate-request and retry handling. Rendering loaded content does not trigger further history requests, and no loaded-row cap or automatic eviction is imposed.
 
@@ -26,9 +26,13 @@ The latency report's legacy `measured_rows` field is always zero with this rende
 
 `--preview --drawer long-transcript` supplies 1,200 already-loaded user/Markdown rows for manual top/bottom, scroll, scrollbar and resize inspection. It neither changes the normal page size nor fetches server history. Use `--preview-api` with `OPENCODE_PREVIEW_HISTORY_PAGES=1` to inspect actual on-demand page loading against the in-process fixture.
 
+`--preview --drawer layout-profile` supplies a fixed 102-row, 357-rich-paragraph document with inline code, links, code blocks and tables, with busy jobs/animations disabled. This uses the real renderer. The manual capture helper's `INTERACTION=layout-profile` runs normal Record lag collection around a repeatable wheel sequence; compare scroll-input-paired draws separately from the post-scroll scrollbar fade. Software-container timings are not native desktop FPS or GPU measurements.
+
 ### View ownership and redraw
 
 Repeating gear and pending-background spinner animations have persistent, keyed view entities; their frame requests notify the icon rather than the application controller. Definite-size transcript, sidebar, editor and modal-layer views use GPUI's native retained-view API. Message rows, attachment strips, notices and other naturally sized content do not have application geometry/height caches.
+
+The transcript scrollbar is an independent sibling view of the retained content. Its native fade/hover/idle notifications repaint the thumb without rebuilding the document. An observer forwards actual native offset changes (track clicks and thumb dragging) to the controller, preserving sticky context and scroll-follow behavior. Wheel scrolling continues to use the ordinary scroll container; this does not promise layout-free active scrolling.
 
 The controller still owns application state. Transcript presentation inputs cover active session/connection, projection revision (including same-row-count streaming updates), history cursor/loading, native scrolling/follow state and code-copy feedback. The editor retains its existing input entity and tracks session/focus transitions. Sidebar and modal layers conservatively observe controller notifications. Native descendant notifications still invalidate cached ancestors for parsing, image readiness, selection, scrolling and cursor blinking. Changed inputs render immediately through GPUI's uncached path before returning to retained rendering; no arbitrary state hash or pixel-height estimate is used. Cheap application chrome and layout-changing animations remain live.
 

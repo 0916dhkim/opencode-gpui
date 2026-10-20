@@ -1162,6 +1162,23 @@ mod tests {
     use crate::model::Conversation;
 
     #[test]
+    fn heavy_layout_fixture_has_stable_rich_loaded_content() {
+        let messages = layout_profile_messages();
+        assert_eq!(messages.len(), 102);
+        let mut conversation = Conversation::default();
+        conversation.replace_from_api(&messages, None);
+        let rows = conversation.transcript_rows();
+        assert_eq!(rows.len(), 102);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("`inline_code`"))
+                .count(),
+            51
+        );
+        assert!(rows.last().unwrap().contains("fn diagnostic_51()"));
+    }
+
+    #[test]
     fn background_handoff_releases_foreground_tools_without_stopping_jobs() {
         let mut state = State::new();
         state.enable_foreground_tools();

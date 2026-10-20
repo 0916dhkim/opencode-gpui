@@ -489,6 +489,35 @@ impl Render for AnimatedIconView {
     }
 }
 
+/// A sibling of the retained transcript, never its descendant. Toolkit thumb
+/// fades/hover transitions notify this small view, not the document's layout.
+struct TranscriptScrollbar {
+    scroll: ScrollHandle,
+    key: String,
+    seen_offset: Point<Pixels>,
+}
+
+impl TranscriptScrollbar {
+    fn take_scroll_change(&mut self) -> bool {
+        let offset = self.scroll.offset();
+        let changed = offset != self.seen_offset;
+        self.seen_offset = offset;
+        changed
+    }
+}
+
+impl Render for TranscriptScrollbar {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // Match ScrollableElement's overlay bounds and inspector behavior. The
+        // helper's frame requests now belong to this entity's view context.
+        div()
+            .relative()
+            .size_full()
+            .id(self.key.clone())
+            .vertical_scrollbar(&self.scroll)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ClientSurfaceKind {
     Sidebar,
@@ -608,16 +637,35 @@ struct ClientSurfaces {
     transcript: Entity<ClientSurface>,
     editor: Entity<ClientSurface>,
     modal: Entity<ClientSurface>,
+    scrollbar: Entity<TranscriptScrollbar>,
+    _scrollbar_subscription: Rc<Subscription>,
 }
 
 impl ClientSurfaces {
-    fn new(owner: Entity<Client>, cx: &mut App) -> Self {
+    fn new(owner: Entity<Client>, scroll: ScrollHandle, cx: &mut App) -> Self {
+        let seen_offset = scroll.offset();
+        let scrollbar = cx.new(|_| TranscriptScrollbar {
+            scroll,
+            key: String::new(),
+            seen_offset,
+        });
+        let controller = owner.downgrade();
+        let subscription = cx.observe(&scrollbar, move |scrollbar, cx| {
+            // Track clicks/thumb drags must update content.
+            // Opacity/width animation notifications must not. The notification
+            // observer runs with input effects, before the next frame is drawn.
+            if scrollbar.update(cx, |bar, _| bar.take_scroll_change()) {
+                let _ = controller.update(cx, |_, cx| cx.notify());
+            }
+        });
         Self {
             sidebar: cx.new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Sidebar, cx)),
             transcript: cx
                 .new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Transcript, cx)),
             editor: cx.new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Editor, cx)),
             modal: cx.new(|cx| ClientSurface::new(owner, ClientSurfaceKind::Modal, cx)),
+            scrollbar,
+            _scrollbar_subscription: Rc::new(subscription),
         }
     }
 
@@ -626,8 +674,20 @@ impl ClientSurfaces {
         environment: SurfaceEnvironment,
         transcript: TranscriptPresentation,
         editor: EditorPresentation,
+        scroll: ScrollHandle,
         cx: &mut App,
     ) {
+        self.scrollbar.update(cx, |bar, _| {
+            bar.key = format!(
+                "transcript-scrollbar/{}/{}",
+                transcript.connection, transcript.session
+            );
+            // Client is presenting this position already. A later notification
+            // forwards only a new offset; stale fade timers/session switches
+            // cannot manufacture a document update.
+            bar.seen_offset = scroll.offset();
+            bar.scroll = scroll;
+        });
         for view in [&self.sidebar, &self.transcript, &self.editor, &self.modal] {
             view.update(cx, |view, _| {
                 view.fresh = view.environment != Some(environment);
@@ -733,6 +793,14 @@ fn autoscroll_step(distance: Pixels, zoom: f32) -> Pixels {
         // Linear from zero outside the dead zone, without a speed floor or cap.
         let speed = beyond_dead_zone / 8.;
         px(-speed.copysign(distance))
+    }
+}
+
+fn client_tiling(tiling: Tiling, maximized: bool, fullscreen: bool) -> Tiling {
+    if maximized || fullscreen {
+        Tiling::tiled()
+    } else {
+        tiling
     }
 }
 
@@ -2927,6 +2995,7 @@ impl Client {
                 // The client border has no shadow inset, only a 1px frame on
                 // untiled sides. Do not use window_paddings here: it assumes
                 // the default 20px shadow before the first rendered frame.
+                let tiling = client_tiling(tiling, window.is_maximized(), window.is_fullscreen());
                 px(if tiling.left { 0. } else { 1. }) + px(if tiling.right { 0. } else { 1. })
             }
             Decorations::Server => px(0.),
@@ -7152,8 +7221,8 @@ impl Client {
             .into_any_element()
     }
 
-    // Keep the actual row and the detached measurement probe on this same
-    // renderer. A text-length estimate cannot model GPUI's Markdown wrapping.
+    // Natural-height rows; give the solver the already-known viewport width
+    // rather than resolving percentages repeatedly in intrinsic-size passes.
     fn message_row(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> Stateful<Div> {
         let user = row.role.label() == "YOU";
         let last = self
@@ -7167,6 +7236,7 @@ impl Client {
             self.tone(0xf4f1eb, 0x101214)
         };
         let mut body = div().flex().flex_col().gap(self.scaled(10.));
+        let mut direct_body = None;
         match row.kind {
             TranscriptRowKind::Tool => {
                 body = body.child(div().font_family(MONO_FONT_FAMILY).child(row.body.clone()))
@@ -7209,7 +7279,14 @@ impl Client {
                 )
             }
             TranscriptRowKind::Normal if !user => {
-                body = body.child(self.markdown_body(row, index, cx))
+                let markdown = self.markdown_body(row, index, cx);
+                if row.images.is_empty() {
+                    // One child has no inter-child gap. Avoid an additional
+                    // nested flex formatting context around every document.
+                    direct_body = Some(markdown);
+                } else {
+                    body = body.child(markdown);
+                }
             }
             _ => body = body.child(row.body.clone()),
         }
@@ -7253,13 +7330,14 @@ impl Client {
         }
         div()
             .id(("message", index))
-            .w_full()
+            .w(self.transcript_content_width + self.scaled(56.))
             .font_family(UI_FONT_FAMILY)
             .text_size(self.scaled(13.))
             .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .gap(self.scaled(if user { 10. } else { 6. }))
+            // Header and body only stack vertically; flex's basis/minimum
+            // sizing passes add no behavior here. Keep the same gap as the
+            // header's bottom margin in normal block flow.
+            .block()
             .px(self.scaled(28.))
             .pt(self.scaled(18.))
             // Agent segments stay continuous. A final user row replaces its
@@ -7278,6 +7356,7 @@ impl Client {
                 div()
                     .flex()
                     .items_center()
+                    .mb(self.scaled(if user { 10. } else { 6. }))
                     .text_size(self.scaled(11.))
                     .font_weight(FontWeight::BOLD)
                     .text_color(if user {
@@ -7294,7 +7373,7 @@ impl Client {
                             .child(timestamp(row.time)),
                     ),
             )
-            .child(body)
+            .child(direct_body.unwrap_or_else(|| body.into_any_element()))
     }
 
     fn load_earlier_row(&self, cursor: String, loading: bool, cx: &Context<Self>) -> Stateful<Div> {
@@ -7792,8 +7871,9 @@ impl Client {
             }))
             .w_full()
             .pr(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
-            .flex()
-            .flex_col();
+            // Overflow itself establishes the block formatting context. Rows
+            // have natural heights and do not need flex size distribution.
+            .block();
         let sticky = self.sticky_user_row().map(|row| {
             div()
                 .id("sticky-user")
@@ -7863,7 +7943,6 @@ impl Client {
             .overflow_hidden()
             .child(rows)
             .when_some(sticky, |view, sticky| view.child(sticky))
-            .vertical_scrollbar(&self.scroll)
             .into_any_element()
     }
 
@@ -10111,7 +10190,7 @@ impl Render for Client {
             && !window.is_maximized()
             && !window.is_fullscreen();
         if self.surfaces.is_none() {
-            self.surfaces = Some(ClientSurfaces::new(cx.entity(), cx));
+            self.surfaces = Some(ClientSurfaces::new(cx.entity(), self.scroll.clone(), cx));
         }
         let controls = window.window_controls();
         let title_offset = if client_decorated {
@@ -10352,6 +10431,7 @@ impl Render for Client {
                 input: self.composer.entity_id(),
                 focused: self.composer_placeholder_focused,
             },
+            self.scroll.clone(),
             cx,
         );
         if editor_transition {
@@ -10584,7 +10664,13 @@ impl Render for Client {
                                     .min_h_0()
                                     .relative()
                                     .overflow_hidden()
-                                    .child(ClientSurfaces::element(&surfaces.transcript, cx)),
+                                    .child(ClientSurfaces::element(&surfaces.transcript, cx))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .child(surfaces.scrollbar.clone()),
+                                    ),
                             )
                             .when_some(self.overlay.as_ref(), |view, overlay| {
                                 view.child(overlay.clone())
@@ -10711,11 +10797,7 @@ fn client_frame(root: AnyElement, window: &mut Window, dark: bool) -> AnyElement
     // painted those corners square even when its inner child was rounded.
     window.set_background_appearance(WindowBackgroundAppearance::Transparent);
     window.set_client_inset(px(0.));
-    let tiling = if window.is_maximized() || window.is_fullscreen() {
-        Tiling::tiled()
-    } else {
-        tiling
-    };
+    let tiling = client_tiling(tiling, window.is_maximized(), window.is_fullscreen());
     let floating = !tiling.is_tiled();
     let frame_color = rgb(if dark { 0x34393d } else { 0xb7b2aa });
     let size = window.viewport_size();
@@ -10922,6 +11004,38 @@ mod tests {
             scroll_offset: point(px(0.), px(0.)),
             logical_top: (0, px(0.)),
             copied: None,
+        }
+    }
+
+    #[test]
+    fn scrollbar_notifications_forward_position_changes_not_animation_ticks() {
+        let scroll = gpui_kit::ScrollHandle::new();
+        let mut bar = super::TranscriptScrollbar {
+            scroll: scroll.clone(),
+            key: "session-a".into(),
+            seen_offset: scroll.offset(),
+        };
+        assert!(!bar.take_scroll_change());
+        scroll.set_offset(point(px(0.), px(-80.)));
+        assert!(bar.take_scroll_change());
+        assert!(!bar.take_scroll_change());
+        scroll.set_offset(point(px(0.), px(-120.)));
+        assert!(bar.take_scroll_change());
+        // Rebinding presents the new session's position; an old idle/fade
+        // notification must not forward an old handle's subsequent movement.
+        let other = gpui_kit::ScrollHandle::new();
+        bar.seen_offset = other.offset();
+        bar.scroll = other;
+        scroll.set_offset(point(px(0.), px(-200.)));
+        assert!(!bar.take_scroll_change());
+    }
+
+    #[test]
+    fn row_width_and_client_frame_share_maximized_fullscreen_tiling() {
+        for (maximized, fullscreen) in [(false, false), (true, false), (false, true)] {
+            let tiling = super::client_tiling(Tiling::default(), maximized, fullscreen);
+            assert_eq!(tiling.left, maximized || fullscreen);
+            assert_eq!(tiling.right, maximized || fullscreen);
         }
     }
 
