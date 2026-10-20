@@ -12,4 +12,5 @@ pub mod pending;
 pub mod persist;
 pub mod preview;
 pub mod protocol;
+pub mod tab_drag;
 pub mod tray;

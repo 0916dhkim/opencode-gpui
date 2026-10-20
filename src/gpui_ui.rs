@@ -1,5 +1,5 @@
 //! GPUI Kit shell backed by the v2 transport, or its deterministic preview fixture.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -34,7 +34,9 @@ use opencode_gpui::{
     notifications::{DesktopNotifications, notification_id, play_session_ready_sound},
     pending::{self, Forms, PendingRequest},
     persist::{self, ConnectionSettings, PersistedState, PersistedTab},
-    preview, protocol, tray,
+    preview, protocol,
+    tab_drag::TabDragState,
+    tray,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
@@ -945,10 +947,11 @@ struct Client {
     sidebar_toggle_focus: FocusHandle,
     tab_focus: HashMap<String, [FocusHandle; 3]>,
     tab_shortcut_hint: bool,
-    tab_drop_target: Option<(String, bool)>,
-    tab_drop_outgoing: HashMap<(String, bool), u64>,
-    next_tab_drop_token: u64,
-    tab_drop_anchor: Option<(String, Pixels)>,
+    tab_drag: Option<TabDragState>,
+    tab_list_bounds: Rc<Cell<Bounds<Pixels>>>,
+    tab_viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
+    tab_scroll: ScrollHandle,
+    tab_layout_scroll_offset: Rc<Cell<Point<Pixels>>>,
     bootstrapped: bool,
     projects: Vec<Project>,
     active: String,
@@ -2634,10 +2637,11 @@ impl Client {
             sidebar_toggle_focus: cx.focus_handle().tab_stop(true),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
-            tab_drop_target: None,
-            tab_drop_outgoing: HashMap::new(),
-            next_tab_drop_token: 0,
-            tab_drop_anchor: None,
+            tab_drag: None,
+            tab_list_bounds: Default::default(),
+            tab_viewport_bounds: Default::default(),
+            tab_scroll: ScrollHandle::new(),
+            tab_layout_scroll_offset: Default::default(),
             bootstrapped: false,
             projects: Vec::new(),
             active: String::new(),
@@ -3164,47 +3168,86 @@ impl Client {
         }
     }
 
-    fn set_tab_drop_target(&mut self, destination: Option<(String, bool)>, cx: &mut Context<Self>) {
-        if self.tab_drop_target == destination {
-            return;
-        }
-        if let Some(previous) = self.tab_drop_target.take() {
-            self.next_tab_drop_token = self.next_tab_drop_token.wrapping_add(1);
-            let token = self.next_tab_drop_token;
-            self.tab_drop_outgoing.insert(previous.clone(), token);
-            cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(150))
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.tab_drop_outgoing.get(&previous) == Some(&token) {
-                        this.tab_drop_outgoing.remove(&previous);
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
-        if let Some(destination) = &destination {
-            self.tab_drop_outgoing.remove(destination);
-        }
-        self.tab_drop_target = destination;
-        cx.notify();
+    fn visible_tab_ids(&self) -> Vec<String> {
+        self.open_tabs
+            .iter()
+            .filter(|id| self.sessions.iter().any(|s| &s.id == *id))
+            .cloned()
+            .collect()
     }
 
-    fn drop_tab(&mut self, source: &str, target: &str, cx: &mut Context<Self>) {
-        self.tab_drop_anchor = None;
-        let Some((destination, after)) = self.tab_drop_target.clone() else {
-            return;
-        };
-        self.set_tab_drop_target(None, cx);
-        if self.tab_shortcut_hint || destination != target {
+    fn clear_tab_drag(&mut self, cx: &mut Context<Self>) {
+        if self.tab_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn move_tab_drag(
+        &mut self,
+        source: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.visible_tab_ids();
+        if self.tab_shortcut_hint
+            || self
+                .tab_drag
+                .as_ref()
+                .is_none_or(|s| s.source() != source || !s.matches(&ids))
+        {
+            cx.stop_active_drag(window);
+            self.clear_tab_drag(cx);
             return;
         }
-        if reorder_tab_ids(&mut self.open_tabs, source, target, after) {
+        // Native scrolling may already have changed its offset before the next
+        // prepaint updates the stored bounds (e.g. wheel immediately followed by
+        // release). Account for that exact delta, never estimated row geometry.
+        // Wheel offsets are temporarily unbounded until native prepaint. Use
+        // the same effective range so attempted overscroll cannot move a drop.
+        let effective_offset = self
+            .tab_scroll
+            .offset()
+            .y
+            .max(-self.tab_scroll.max_offset().y)
+            .min(px(0.));
+        let origin = self.tab_list_bounds.get().origin.y + effective_offset
+            - self.tab_layout_scroll_offset.get().y;
+        let y = (position.y - origin).as_f32();
+        let height = self.scaled(34.).as_f32();
+        let gap = self.scaled(5.).as_f32();
+        let inside = self.tab_viewport_bounds.get().contains(&position);
+        if self
+            .tab_drag
+            .as_mut()
+            .unwrap()
+            .update(y, height, gap, inside)
+        {
+            cx.notify();
+        }
+    }
+
+    fn drop_tab(
+        &mut self,
+        source: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // One release authority; use fresh pointer coordinates, never an animated
+        // child hitbox or a target selected by another global drag listener.
+        self.move_tab_drag(source, position, window, cx);
+        let destination = self
+            .tab_drag
+            .as_ref()
+            .and_then(|s| s.destination())
+            .map(|(target, after)| (target.to_owned(), after));
+        self.clear_tab_drag(cx);
+        if let Some((target, after)) = destination
+            && reorder_tab_ids(&mut self.open_tabs, source, &target, after)
+        {
             self.persist_tabs();
         }
-        cx.notify();
     }
 
     fn update_tab_status(&mut self, id: String, status: RunStatus) {
@@ -3410,8 +3453,7 @@ impl Client {
     }
 
     fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.tab_drop_target = None;
-        self.tab_drop_anchor = None;
+        self.tab_drag = None;
         let index = self.open_tabs.iter().position(|tab| tab == id);
         self.open_tabs.retain(|tab| tab != id);
         self.tab_focus.remove(id);
@@ -3833,8 +3875,7 @@ impl Client {
             .get(&key)
             .map(|saved| saved.tabs.iter().map(|tab| tab.id.clone()).collect())
             .unwrap_or_default();
-        self.tab_drop_target = None;
-        self.tab_drop_anchor = None;
+        self.tab_drag = None;
         self.bootstrapped = false;
         self.bootstrap_in_flight = false;
         self.bootstrap_after_load = false;
@@ -4169,6 +4210,12 @@ impl Client {
             && !modifiers.platform
             && !modifiers.shift
         {
+            if self.tab_drag.is_some() || cx.has_active_drag() {
+                cx.stop_active_drag(window);
+                self.clear_tab_drag(cx);
+                cx.stop_propagation();
+                return;
+            }
             if self.modal == Some(Modal::Rename) && self.rename_pending.is_some() {
                 cx.stop_propagation();
                 return;
@@ -6163,10 +6210,11 @@ impl Client {
             sidebar_toggle_focus: cx.focus_handle().tab_stop(true),
             tab_focus: HashMap::new(),
             tab_shortcut_hint: false,
-            tab_drop_target: None,
-            tab_drop_outgoing: HashMap::new(),
-            next_tab_drop_token: 0,
-            tab_drop_anchor: None,
+            tab_drag: None,
+            tab_list_bounds: Default::default(),
+            tab_viewport_bounds: Default::default(),
+            tab_scroll: ScrollHandle::new(),
+            tab_layout_scroll_offset: Default::default(),
             bootstrapped: true,
             projects,
             active: active.clone(),
@@ -6484,8 +6532,8 @@ impl Client {
         let close_id = id.clone();
         let close_key_id = id.clone();
         let activate_id = id.clone();
-        let drop_id = id.clone();
-        let motion_id = id.clone();
+        let drag_owner = cx.entity().downgrade();
+        let drag_source = id.clone();
         let drag_title = title.clone();
         let dark = self.dark;
         let indicator: AnyElement = if self.tab_shortcut_hint && index < 9 {
@@ -6534,41 +6582,6 @@ impl Client {
                 self.tone(0xf4f1eb, 0x0d0f11)
             })
             .cursor_pointer()
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                    let bounds = event.bounds;
-                    if !bounds.contains(&event.event.position) {
-                        return;
-                    }
-                    let destination = if !this.tab_shortcut_hint && event.drag(cx).0 != motion_id {
-                        let origin = this
-                            .tab_drop_anchor
-                            .as_ref()
-                            .filter(|(target, _)| target == &motion_id)
-                            .map(|(_, origin)| *origin)
-                            .unwrap_or(bounds.origin.y);
-                        Some((
-                            motion_id.clone(),
-                            event.event.position.y >= origin + bounds.size.height / 2.,
-                        ))
-                    } else {
-                        None
-                    };
-                    if this.tab_drop_target != destination {
-                        if destination.as_ref().map(|(target, _)| target)
-                            != this.tab_drop_anchor.as_ref().map(|(target, _)| target)
-                        {
-                            this.tab_drop_anchor = destination
-                                .as_ref()
-                                .map(|(target, _)| (target.clone(), bounds.origin.y));
-                        }
-                        this.set_tab_drop_target(destination, cx);
-                    }
-                }),
-            )
-            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
-                this.drop_tab(&drag.0, &drop_id, cx);
-            }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_session(id.clone());
                 this.focus_selected_composer(window, cx);
@@ -6600,10 +6613,16 @@ impl Client {
                     .flex()
                     .flex_1()
                     .min_w_0()
+                    .h_full()
                     .items_center()
                     .gap(px(7.))
                     .when(!self.tab_shortcut_hint, |handle| {
                         handle.on_drag(TabDrag(session.id.clone()), move |_, _, _, cx| {
+                            let _ = drag_owner.update(cx, |this, cx| {
+                                this.tab_drag =
+                                    TabDragState::new(this.visible_tab_ids(), &drag_source);
+                                cx.notify();
+                            });
                             cx.new(|_| TabDragPreview {
                                 title: drag_title.clone(),
                                 dark,
@@ -6727,100 +6746,6 @@ impl Client {
                             .data(include_bytes!("icons/close.svg"))
                             .with_size(self.scaled(16.)),
                     ),
-            )
-            .into_any_element()
-    }
-
-    fn tab_drop_slot(&self, target: &str, after: bool, cx: &Context<Self>) -> AnyElement {
-        let target = target.to_owned();
-        let motion_target = target.clone();
-        let position = if after { "after" } else { "before" };
-        let animation_id = format!("tab-drop-slot-expand-{target}-{position}");
-        let midpoint = self.scaled(17.);
-        let slot_height = self.scaled(36.);
-        div()
-            .id(format!("tab-drop-slot-{target}-{position}"))
-            .test_support()
-            .w_full()
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                    if this.tab_shortcut_hint || event.drag(cx).0 == motion_target {
-                        return;
-                    }
-                    let Some((_, origin)) = this
-                        .tab_drop_anchor
-                        .as_ref()
-                        .filter(|(id, _)| id == &motion_target)
-                    else {
-                        return;
-                    };
-                    let destination = Some((
-                        motion_target.clone(),
-                        event.event.position.y >= *origin + midpoint,
-                    ));
-                    if this.tab_drop_target != destination {
-                        this.set_tab_drop_target(destination, cx);
-                    }
-                }),
-            )
-            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
-                this.drop_tab(&drag.0, &target, cx);
-            }))
-            .with_animation(
-                animation_id,
-                Animation::new(Duration::from_millis(150)),
-                move |slot, progress| slot.h(px(slot_height.as_f32() * progress)),
-            )
-            .into_any_element()
-    }
-
-    fn tab_drop_closing_slot(
-        &self,
-        target: &str,
-        after: bool,
-        token: u64,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let target = target.to_owned();
-        let drag_target = target.clone();
-        let drop_target = target.clone();
-        let position = if after { "after" } else { "before" };
-        let slot_height = self.scaled(36.);
-        div()
-            .id(format!("tab-drop-slot-{target}-{position}"))
-            .test_support()
-            .w_full()
-            // An outgoing slot still occupies layout while shrinking. Let a
-            // rapid subsequent drag select it rather than swallowing the drop.
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                    if event.drag(cx).0 != drag_target {
-                        let side = this
-                            .tab_drop_anchor
-                            .as_ref()
-                            .filter(|(id, _)| id == &drag_target)
-                            .map_or(after, |(_, origin)| {
-                                event.event.position.y >= *origin + this.scaled(17.)
-                            });
-                        this.set_tab_drop_target(Some((drag_target.clone(), side)), cx);
-                    }
-                }),
-            )
-            .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
-                let side = this
-                    .tab_drop_anchor
-                    .as_ref()
-                    .filter(|(id, _)| id == &drop_target)
-                    .map_or(after, |(_, origin)| {
-                        window.mouse_position().y >= *origin + this.scaled(17.)
-                    });
-                this.set_tab_drop_target(Some((drop_target.clone(), side)), cx);
-                this.drop_tab(&drag.0, &drop_target, cx);
-            }))
-            .with_animation(
-                format!("tab-drop-slot-collapse-{target}-{position}-{token}"),
-                Animation::new(Duration::from_millis(150)),
-                move |slot, progress| slot.h(collapsing_slot_height(slot_height, progress)),
             )
             .into_any_element()
     }
@@ -6987,47 +6912,140 @@ impl Client {
     }
 
     fn sidebar(&self, floating: bool, cx: &Context<Self>) -> AnyElement {
-        let mut tabs = div()
-            .flex()
-            .flex_col()
-            .p(self.scaled(8.))
-            .gap(self.scaled(5.))
-            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _, cx| {
-                if !event.bounds.contains(&event.event.position) && this.tab_drop_target.is_some() {
-                    this.tab_drop_anchor = None;
-                    this.set_tab_drop_target(None, cx);
-                }
-            }))
-            .on_drop(cx.listener(|this, drag: &TabDrag, _, cx| {
-                if let Some((target, _)) = this.tab_drop_target.clone() {
-                    this.drop_tab(&drag.0, &target, cx);
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.tab_drop_anchor = None;
-                    this.set_tab_drop_target(None, cx);
-                }),
+        let ids = self.visible_tab_ids();
+        let drag = self.tab_drag.as_ref().filter(|s| s.matches(&ids));
+        let height = self.scaled(34.);
+        let pitch = self.scaled(39.);
+        // Absolute rows share one fixed coordinate system and one conserved
+        // extent. Native retargetable springs preserve position AND velocity;
+        // no outgoing slots, cleanup timers or flex-layout inflation.
+        let spring = SpringAnimation::new(SpringConfig::new(3025., 110., 1.))
+            .with_epsilon(self.scaled(0.1).as_f32());
+        let content_bounds = self.tab_list_bounds.clone();
+        let scroll = self.tab_scroll.clone();
+        let layout_offset = self.tab_layout_scroll_offset.clone();
+        let drag_owner = cx.entity().downgrade();
+        let refresh_drag = drag.is_some();
+        let mut rows = div()
+            .id("tab-list-content")
+            .relative()
+            .w_full()
+            .h(px((ids.len() as f32 * pitch.as_f32()
+                - self.scaled(5.).as_f32())
+            .max(0.)))
+            .flex_shrink_0()
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        let previous = content_bounds.replace(bounds);
+                        layout_offset.set(scroll.offset());
+                        if refresh_drag && previous.origin != bounds.origin {
+                            let owner = drag_owner.clone();
+                            // Scrolling/resizing under a stationary pointer must
+                            // retarget the displayed hole, not just the release.
+                            window.defer(cx, move |window, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    if let Some(source) =
+                                        this.tab_drag.as_ref().map(|s| s.source().to_owned())
+                                    {
+                                        this.move_tab_drag(
+                                            &source,
+                                            window.mouse_position(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                });
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
             );
+        if let Some(state) = drag
+            && let Some(hole) = state.hole()
+        {
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .h(height)
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(self.tone(0x8caaa0, 0x497967))
+                    .bg(self.tone(0xe7ede8, 0x13241c))
+                    .with_spring(
+                        "tab-drop-hole",
+                        spring.clone().to(pitch * hole as f32),
+                        |slot, y| slot.top(y),
+                    ),
+            );
+        }
         let mut previous_inactive = false;
-        for (index, id) in self.open_tabs.iter().enumerate() {
+        for (index, id) in ids.iter().enumerate() {
             if let Some(session) = self.sessions.iter().find(|session| &session.id == id) {
                 let active = session.id == self.active;
-                if self.tab_drop_target.as_ref() == Some(&(id.clone(), false)) {
-                    tabs = tabs.child(self.tab_drop_slot(id, false, cx));
-                } else if let Some(&token) = self.tab_drop_outgoing.get(&(id.clone(), false)) {
-                    tabs = tabs.child(self.tab_drop_closing_slot(id, false, token, cx));
-                }
-                tabs = tabs.child(self.tab(session, index, !active && previous_inactive, cx));
-                if self.tab_drop_target.as_ref() == Some(&(id.clone(), true)) {
-                    tabs = tabs.child(self.tab_drop_slot(id, true, cx));
-                } else if let Some(&token) = self.tab_drop_outgoing.get(&(id.clone(), true)) {
-                    tabs = tabs.child(self.tab_drop_closing_slot(id, true, token, cx));
-                }
+                let slot = drag.map_or(index, |s| s.projected_index(index));
+                let hidden = drag.is_some_and(|s| s.hole().is_some() && s.source() == id);
+                // Shortcut dispatch indexes open_tabs, including restored tabs
+                // whose metadata has not arrived. Keep its labels in that space.
+                let shortcut_index = self
+                    .open_tabs
+                    .iter()
+                    .position(|open| open == id)
+                    .unwrap_or(index);
+                rows = rows.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .h(height)
+                        .opacity(if hidden { 0. } else { 1. })
+                        .child(self.tab(session, shortcut_index, !active && previous_inactive, cx))
+                        .with_spring(
+                            format!("tab-row-position-{id}"),
+                            spring.clone().to(pitch * slot as f32),
+                            |row, y| row.top(y),
+                        ),
+                );
                 previous_inactive = !active;
             }
         }
+        let viewport_bounds = self.tab_viewport_bounds.clone();
+        let tabs = div()
+            .id("tab-list-viewport")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<TabDrag>, window, cx| {
+                    let source = event.drag(cx).0.clone();
+                    this.move_tab_drag(&source, event.event.position, window, cx);
+                }),
+            )
+            .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                this.drop_tab(&drag.0, window.mouse_position(), window, cx);
+            }))
+            .child(
+                canvas(
+                    move |bounds, _, _| viewport_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .id("tab-list-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.tab_scroll)
+                    .p(self.scaled(8.))
+                    .child(rows),
+            );
         let mut jobs_panel = div()
             .id("background-jobs")
             .test_support()
@@ -7173,6 +7191,7 @@ impl Client {
                 BaseButton::new("new-session")
                     .accessibility_label("New session")
                     .h(self.scaled(39.))
+                    .flex_shrink_0()
                     .px(self.scaled(16.))
                     .line_height(self.scaled(16.))
                     .justify_start()
@@ -7183,11 +7202,11 @@ impl Client {
                     .child("⊞  New session"),
             )
             .child(tabs)
-            .child(div().flex_1())
             .when(show_jobs, |sidebar| sidebar.child(jobs_panel))
             .child(
                 div()
                     .p(self.scaled(14.))
+                    .flex_shrink_0()
                     .border_t_1()
                     .border_color(self.tone(0xded8cb, 0x2b3034))
                     .flex()
@@ -10519,6 +10538,15 @@ impl Render for Client {
                                 // Window-wide capture also covers release outside
                                 // the transcript or over an opaque child.
                                 if matches!(event.button, MouseButton::Left | MouseButton::Middle) {
+                                    if event.button == MouseButton::Left {
+                                        let client = client.clone();
+                                        // Clear cancelled/outside releases after native drop
+                                        // dispatch has had a chance to commit the target.
+                                        cx.defer(move |cx| {
+                                            let _ = client
+                                                .update(cx, |this, cx| this.clear_tab_drag(cx));
+                                        });
+                                    }
                                     let stopped = client
                                         .update(cx, |this, cx| {
                                             let released_pointer = event.button
@@ -10832,10 +10860,6 @@ fn client_window_options() -> WindowOptions {
 }
 
 const FLOATING_CORNER_RADIUS: f32 = 9.;
-
-fn collapsing_slot_height(slot_height: Pixels, progress: f32) -> Pixels {
-    px(slot_height.as_f32() * (1. - progress))
-}
 
 fn frame_resize_edge(
     position: Point<Pixels>,

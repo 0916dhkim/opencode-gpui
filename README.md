@@ -28,6 +28,12 @@ The latency report's legacy `measured_rows` field is always zero with this rende
 
 `--preview --drawer layout-profile` supplies a fixed 102-row, 357-rich-paragraph document with inline code, links, code blocks and tables, with busy jobs/animations disabled. This uses the real renderer. The manual capture helper's `INTERACTION=layout-profile` runs normal Record lag collection around a repeatable wheel sequence; compare scroll-input-paired draws separately from the post-scroll scrollbar fade. Software-container timings are not native desktop FPS or GPU measurements.
 
+### Tab reordering
+
+Drag a tab's label to reorder it. One outlined insertion space follows the target while neighboring rows slide into place; the source row is represented by the floating preview rather than duplicated in the list. The list keeps its total extent, so dragging cannot expand gaps or displace the footer. Long lists scroll inside the sidebar.
+
+Target selection uses the unanimated list coordinates, zoom-scaled row midpoints and a small hysteresis band. The list alone owns drops and recomputes the target on release. Escape or releasing outside the tab region cancels without changing order or activation. Public GPUI critically damped springs retain row position/velocity across reversals and stop requesting frames when settled; reduced-motion settings resolve directly to the target. This is fixed-height tab geometry, not a transcript height cache or toolkit patch.
+
 ### View ownership and redraw
 
 Repeating gear and pending-background spinner animations have persistent, keyed view entities; their frame requests notify the icon rather than the application controller. Definite-size transcript, sidebar, editor and modal-layer views use GPUI's native retained-view API. Message rows, attachment strips, notices and other naturally sized content do not have application geometry/height caches.
