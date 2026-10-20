@@ -446,6 +446,23 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == latency-* ]]; then
   fi
   xdotool mousemove --window "$win" 140 400
 fi
+if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == layout-profile ]]; then
+  # Bounded manual performance capture, not a retained GUI regression test.
+  # Use the normal recorder (including whole-draw timings), not solver probes.
+  xdotool mousemove --window "$win" 65 "$((window_h - 90))" click 1
+  sleep 1
+  xdotool mousemove --window "$win" "$((window_w - 80))" 350
+  xdotool click --repeat 16 --delay 160 4
+  sleep 2
+  xdotool click --repeat 16 --delay 160 5
+  sleep 5
+  xdotool key ctrl+shift+l
+  for ((attempt = 0; attempt < ${CACHE_REPORT_TIMEOUT_SECONDS:-90}; attempt++)); do
+    if compgen -G "$XDG_DATA_HOME/opencode-gpui/diagnostics/lag-*.jsonl" >/dev/null; then break; fi
+    sleep 1
+  done
+  xdotool mousemove 1100 850
+fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == cache-profile ]]; then
   # Agent-directed render-count inspection, not an automated GUI regression.
   # Record an otherwise unchanged busy-icon/caret window, optionally editing.

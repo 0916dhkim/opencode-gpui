@@ -47,6 +47,21 @@ pub fn long_transcript_messages() -> Vec<protocol::SessionMessage> {
         .collect()
 }
 
+/// Fixed heavy-document fixture for matched manual performance captures.
+/// Uses the real transcript renderer; never reads native conversation content.
+pub fn layout_profile_messages() -> Vec<protocol::SessionMessage> {
+    let paragraph = "A diagnostic paragraph with **bold text**, a [reference link](https://example.com/docs), and `inline_code` among ordinary words. This keeps natural wrapping and the rich-text measurement paths active at a fixed width.\n\n";
+    (1..=51)
+        .flat_map(|index| {
+            let body = format!("## Diagnostic answer {index}\n\n{}- First measured item\n- Second measured item\n\n```rust\nfn diagnostic_{index}() -> usize {{ {index} }}\n```\n\n| Key | Value |\n| --- | --- |\n| Frame | {index} |\n", paragraph.repeat(7));
+            [
+                user_text(&format!("probe_user_{index}"), CREATED, &format!("Diagnostic question {index}")),
+                entry(json!({"id":format!("probe_answer_{index}"),"type":"assistant","agent":"build","time":{"created":CREATED},"content":[{"type":"text","text":body}]})),
+            ]
+        })
+        .collect()
+}
+
 pub fn server_state() -> ServerState {
     ServerState {
         tabs: vec![

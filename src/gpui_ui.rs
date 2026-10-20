@@ -5985,9 +5985,15 @@ impl Client {
                 conversations.insert(session.id.clone(), conversation);
             }
         }
-        if overlay.as_deref() == Some("long-transcript") {
+        let layout_profile = overlay.as_deref() == Some("layout-profile");
+        if overlay.as_deref() == Some("long-transcript") || layout_profile {
             let conversation = conversations.get_mut(&active).unwrap();
-            conversation.replace_from_api(&preview::long_transcript_messages(), None);
+            let messages = if layout_profile {
+                preview::layout_profile_messages()
+            } else {
+                preview::long_transcript_messages()
+            };
+            conversation.replace_from_api(&messages, None);
             update_session_projection(
                 &active,
                 conversation,
@@ -6288,6 +6294,17 @@ impl Client {
             }
         }
         let initial_session = client.active.clone();
+        if layout_profile {
+            client
+                .statuses
+                .values_mut()
+                .for_each(|status| *status = RunStatus::Idle);
+            client.jobs.clear();
+            client.running_jobs = Jobs::default();
+            client.forms.clear();
+            client.permissions.clear();
+            client.overlay = None;
+        }
         cx.subscribe(&client.composer, move |this, _, event: &InputEvent, _| {
             if matches!(event, InputEvent::Change) {
                 latency::global().edited();
