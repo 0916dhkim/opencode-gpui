@@ -146,7 +146,13 @@ if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == link-hover ]]; then
       xdotool mousemove --window "$win" "$((window_w / 2))" "$((window_h - 130))" click 1
       xdotool key ctrl+v
       sleep 0.5
+    elif [[ "${LINK_OPEN:-0}" == 1 ]]; then
+      xdotool key Return
+      sleep 1
     fi
+  elif [[ "${LINK_OPEN:-0}" == 1 ]]; then
+    xdotool click 1
+    sleep 1
   fi
 fi
 if [[ "$CLIENT" == gpui && "${INTERACTION:-}" == zoom-in ]]; then

@@ -817,7 +817,8 @@ fn wall_clock_millis() -> u64 {
 }
 
 fn may_open_link(url: &str) -> bool {
-    url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto"))
+    url::Url::parse(url)
+        .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "mailto" | "obsidian"))
 }
 
 #[derive(Default)]
@@ -11027,6 +11028,30 @@ mod tests {
     use opencode_gpui::persist::PersistedState;
     use opencode_gpui::protocol;
     use serde_json::json;
+
+    #[test]
+    fn link_opening_allows_obsidian_without_relaxing_other_schemes() {
+        for url in [
+            "https://example.com/path?q=value#section",
+            "http://localhost:4096",
+            "mailto:user@example.com",
+            "obsidian://open?vault=obsidian&file=opencode%2Fsample.md&paneType=tab",
+            "OBSIDIAN://open?vault=My%20Vault&file=Notes%2Fsome%20note.md#Heading",
+        ] {
+            assert!(super::may_open_link(url), "should open {url}");
+        }
+        for url in [
+            "javascript:alert(1)",
+            "data:text/html,content",
+            "file:///tmp/note.md",
+            "unknown-app://open",
+            "./relative-note.md",
+            "not a URL",
+            "",
+        ] {
+            assert!(!super::may_open_link(url), "should not open {url}");
+        }
+    }
 
     fn transcript_presentation() -> super::TranscriptPresentation {
         super::TranscriptPresentation {

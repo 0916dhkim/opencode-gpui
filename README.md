@@ -42,6 +42,8 @@ Latency reports include `transcript_build`, `sidebar_build` and `editor_build` o
 
 Right-click a rendered Markdown link to inspect its underlying URL, including its query and fragment, then choose **Open link** or **Copy link**. Long destinations wrap in a bounded, scrollable menu header rather than being abbreviated. Labels retain native text wrapping/selection and the existing opening policy. Destination-on-hover is intentionally replaced by this explicit menu; ordinary button tooltips remain.
 
+Normal clicks and **Open link** support HTTP, HTTPS, mailto and Obsidian (`obsidian://`) destinations through the operating system's registered handler. The original URL, including percent-encoded vault/file names, query and fragment, is passed unchanged. Obsidian must be installed and registered on that computer. Other schemes remain blocked; **Copy link** is available regardless of scheme.
+
 GPUI Kit **0.8.0**, Base and Component are published Cargo packages, pinned by the lockfile with no local source overrides or vendored toolkit copies. They use the standard **gpui-pre 0.3.9** backend; the optional GPUI Fast backend is not enabled. The app owns its raw GPUI window root and client frame rather than mounting Component's default window-border plugin.
 
 The small app-owned host supplies selection lifecycle, keyboard Copy/Tab traversal and input context-menu presentation. Component's native editor, focus, paste handling, themes, title bar and scrolling widgets remain in use through public APIs. The composer uses stock editor insets, not a private padding extension. Input edit menus explicitly route actions to their original editor and keep masked/read-only capabilities. The app does not use Component's root-dependent dialog/sheet APIs.
