@@ -100,8 +100,9 @@ pub struct ModelOption {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelCatalog {
     pub models: Vec<ModelOption>,
-    /// The server's default model (`GET /api/model/default`), else the first
-    /// model. Display only: it is never sent to the server.
+    /// The location's default agent model (with variant) when available, else
+    /// `GET /api/model/default`, else the first model. Display fallback for
+    /// sessions that do not have a saved `session.model`.
     pub preferred: Option<ModelSelection>,
 }
 
@@ -116,6 +117,16 @@ impl ModelCatalog {
     pub fn from_models(
         models: &[protocol::ModelInfo],
         default: Option<&protocol::ModelInfo>,
+    ) -> Self {
+        Self::from_models_with_agent(models, default, None)
+    }
+
+    /// Same as [`Self::from_models`], preferring the default agent's configured
+    /// model and variant when that model is present in the enabled catalog.
+    pub fn from_models_with_agent(
+        models: &[protocol::ModelInfo],
+        default: Option<&protocol::ModelInfo>,
+        agent_model: Option<&protocol::ModelRef>,
     ) -> Self {
         let mut options: Vec<ModelOption> = models
             .iter()
@@ -148,13 +159,26 @@ impl ModelCatalog {
             })
             .collect();
         options.sort_by_key(|left| left.label.to_lowercase());
-        let preferred = default
-            .map(|model| ModelSelection {
-                provider_id: model.provider_id.clone(),
-                model_id: model.id.clone(),
-                variant: None,
+        let preferred = agent_model
+            .and_then(|model| {
+                let option = options.iter().find(|option| {
+                    option.provider_id == model.provider_id && option.model_id == model.id
+                })?;
+                Some(ModelSelection {
+                    provider_id: option.provider_id.clone(),
+                    model_id: option.model_id.clone(),
+                    variant: preserved_variant(model.variant.as_deref(), &option.variants),
+                })
             })
-            .filter(|selection| contains_model(&options, selection))
+            .or_else(|| {
+                default
+                    .map(|model| ModelSelection {
+                        provider_id: model.provider_id.clone(),
+                        model_id: model.id.clone(),
+                        variant: None,
+                    })
+                    .filter(|selection| contains_model(&options, selection))
+            })
             .or_else(|| {
                 options.first().map(|model| ModelSelection {
                     provider_id: model.provider_id.clone(),
@@ -194,6 +218,39 @@ pub fn displayed_model(
         .cloned()
         .or_else(|| session.and_then(Session::model_selection))
         .or_else(|| catalog.preferred.clone())
+}
+
+/// Keeps `current` when `variants` supports it verbatim; otherwise `None`
+/// (the target model's default level).
+pub fn preserved_variant(current: Option<&str>, variants: &[String]) -> Option<String> {
+    let current = current?;
+    variants
+        .iter()
+        .find(|variant| variant.as_str() == current)
+        .cloned()
+}
+
+/// Builds the model ref for picking `option` in the model picker while
+/// preserving the current level when `option` supports it.
+pub fn model_pick_ref(
+    current: Option<&ModelSelection>,
+    option: &ModelOption,
+) -> protocol::ModelRef {
+    let variant = match current {
+        Some(selection)
+            if selection.provider_id == option.provider_id
+                && selection.model_id == option.model_id =>
+        {
+            selection.variant.clone()
+        }
+        Some(selection) => preserved_variant(selection.variant.as_deref(), &option.variants),
+        None => None,
+    };
+    protocol::ModelRef {
+        id: option.model_id.clone(),
+        provider_id: option.provider_id.clone(),
+        variant,
+    }
 }
 
 /// The switch an explicit pick requests, or `None` when it matches what is
@@ -2801,6 +2858,88 @@ mod tests {
         assert_eq!(
             ModelCatalog::from_models(&[], None),
             ModelCatalog::default()
+        );
+
+        let agent_model = protocol::ModelRef {
+            id: "gpt-6-fast".into(),
+            provider_id: "openai".into(),
+            variant: Some("xhigh".into()),
+        };
+        let with_agent =
+            ModelCatalog::from_models_with_agent(&models, Some(&models[0]), Some(&agent_model));
+        assert_eq!(
+            with_agent.preferred,
+            Some(selection("openai", "gpt-6-fast", Some("xhigh"))),
+            "default agent model and supported variant take precedence over /api/model/default"
+        );
+        let invalid_variant = protocol::ModelRef {
+            variant: Some("bogus".into()),
+            ..agent_model.clone()
+        };
+        assert_eq!(
+            ModelCatalog::from_models_with_agent(&models, Some(&models[0]), Some(&invalid_variant))
+                .preferred,
+            Some(selection("openai", "gpt-6-fast", None)),
+            "unknown agent variant falls back to None while keeping the model"
+        );
+        let disabled_agent_model = protocol::ModelRef {
+            id: "off".into(),
+            provider_id: "openai".into(),
+            variant: Some("high".into()),
+        };
+        assert_eq!(
+            ModelCatalog::from_models_with_agent(
+                &models,
+                Some(&models[0]),
+                Some(&disabled_agent_model)
+            )
+            .preferred,
+            Some(selection("openai", "gpt-6-fast", None)),
+            "disabled or missing agent model falls back to /api/model/default"
+        );
+    }
+
+    #[test]
+    fn model_pick_ref_preserves_supported_variant_across_models() {
+        let neon = ModelOption {
+            provider_id: "openrouter".into(),
+            model_id: "google/gemini-4-neon".into(),
+            label: "openrouter / Gemini 4 Neon".into(),
+            variants: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            supports_attachments: true,
+            context_limit: Some(1_048_576),
+        };
+        let carbon = ModelOption {
+            provider_id: "openrouter".into(),
+            model_id: "google/gemini-4-carbon".into(),
+            label: "openrouter / Gemini 4 Carbon".into(),
+            variants: vec!["low".into(), "medium".into(), "high".into()],
+            supports_attachments: true,
+            context_limit: Some(1_048_576),
+        };
+        let high = selection("openrouter", "google/gemini-4-neon", Some("high"));
+        assert_eq!(
+            model_pick_ref(Some(&high), &carbon),
+            protocol::ModelRef {
+                id: "google/gemini-4-carbon".into(),
+                provider_id: "openrouter".into(),
+                variant: Some("high".into()),
+            }
+        );
+        let xhigh = selection("openrouter", "google/gemini-4-neon", Some("xhigh"));
+        assert_eq!(
+            model_pick_ref(Some(&xhigh), &carbon),
+            protocol::ModelRef {
+                id: "google/gemini-4-carbon".into(),
+                provider_id: "openrouter".into(),
+                variant: None,
+            },
+            "unsupported variant on target model clears to default"
+        );
+        assert_eq!(
+            model_pick_ref(Some(&high), &neon),
+            high.to_ref(),
+            "re-picking the current model keeps its variant"
         );
     }
 

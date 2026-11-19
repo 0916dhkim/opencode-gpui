@@ -717,6 +717,26 @@ class Server:
                 threading.Timer(self.args.model_ready_ms / 1000, ready).start()
             return self.catalog_empty
 
+    def list_agents(self, directory):
+        return {
+            "location": {"directory": directory},
+            "data": [
+                {
+                    "id": "build",
+                    "name": "Build",
+                    "mode": "primary",
+                    "hidden": False,
+                    "model": {
+                        "id": MODEL_CATALOG[0]["id"],
+                        "providerID": MODEL_CATALOG[0]["providerID"],
+                        "variant": "high",
+                    },
+                },
+                {"id": "plan", "name": "Plan", "mode": "primary", "hidden": False},
+                {"id": "explore", "name": "Explore", "mode": "subagent", "hidden": False},
+            ],
+        }
+
     def list_models(self, directory):
         if self.catalog_is_empty(directory):
             return {"location": {"directory": directory}, "data": []}
@@ -734,9 +754,21 @@ class Server:
         title = body.get("title")
         if title is not None and not isinstance(title, str):
             raise invalid_request('Expected string\n  at ["title"]')
+        agent = body.get("agent")
+        if agent is not None and not isinstance(agent, str):
+            raise invalid_request('Expected string\n  at ["agent"]')
+        model = body.get("model")
+        model_ref = None
+        if model is not None:
+            if not isinstance(model, dict) or not model.get("id") or not model.get("providerID"):
+                raise invalid_request('Expected { providerID, id, variant? }\n  at ["model"]')
+            model_ref = {"id": model["id"], "providerID": model["providerID"]}
+            if model.get("variant"):
+                model_ref["variant"] = model["variant"]
         created = now_ms()
         with self.lock:
-            session = Session(self.ids.descending("ses"), directory, created, title=title or None)
+            session = Session(self.ids.descending("ses"), directory, created, title=title or None, agent=agent or None)
+            session.model = model_ref
             self.sessions[session.id] = session
             self._add_project(directory, created, vcs="git")
         data = {
@@ -749,6 +781,10 @@ class Server:
         }
         if session.title:
             data["title"] = session.title
+        if session.agent:
+            data["agent"] = session.agent
+        if session.model:
+            data["model"] = dict(session.model)
         self.emit("session.created", data, session=session)
         return session
 
@@ -2151,6 +2187,7 @@ ROUTES = [
     ("PATCH", r"/api/session/(?P<sessionID>[^/]+)/inbox/(?P<inboxID>[^/]+)", "session.inbox.update"),
     ("DELETE", r"/api/session/(?P<sessionID>[^/]+)/inbox/(?P<inboxID>[^/]+)", "session.inbox.cancel"),
     ("GET", r"/api/session/(?P<sessionID>[^/]+)/message", "message.list"),
+    ("GET", r"/api/agent", "agent.list"),
     ("GET", r"/api/model", "model.list"),
     ("GET", r"/api/model/default", "model.default"),
     ("GET", r"/api/permission/request", "permission.request.list"),
@@ -2385,8 +2422,10 @@ class Handler(BaseHTTPRequestHandler):
             value = app.list_messages(session, query)
             app.run_race(route, session)
             return 200, value
-        if route in ("model.list", "model.default"):
+        if route in ("agent.list", "model.list", "model.default"):
             directory = app.location_directory(query, self.headers)
+            if route == "agent.list":
+                return 200, app.list_agents(directory)
             if route == "model.list":
                 return 200, app.list_models(directory)
             return 200, app.default_model(directory)

@@ -957,7 +957,7 @@ impl Api {
         })
     }
 
-    /// Both routes are location-scoped, so they take `location[directory]`;
+    /// All three routes are location-scoped, so they take `location[directory]`;
     /// a plain `directory` would be ignored.
     fn load_models(&self, directory: &str) -> Result<ModelCatalog> {
         let location = [protocol::location_query(directory)];
@@ -967,10 +967,34 @@ impl Api {
         let default: protocol::ModelDefaultResponse = self
             .get(&protocol::model_default_path(), &location)
             .context("failed to load the default model")?;
-        Ok(ModelCatalog::from_models(
+        let agent_model = self
+            .load_default_agent(directory)
+            .and_then(|agent| agent.model);
+        Ok(ModelCatalog::from_models_with_agent(
             &models.data,
             default.data.as_ref(),
+            agent_model.as_ref(),
         ))
+    }
+
+    /// Best-effort lookup of the location's default primary agent (`GET /api/agent`).
+    /// OpenCode V2 orders the resolved default agent first among visible primary agents.
+    fn load_default_agent(&self, directory: &str) -> Option<protocol::AgentInfo> {
+        let location = [protocol::location_query(directory)];
+        let agents: protocol::AgentListResponse =
+            self.get(&protocol::agents_path(), &location).ok()?;
+        protocol::default_agent(&agents.data).cloned()
+    }
+
+    fn load_default_model_ref(&self, directory: &str) -> Option<protocol::ModelRef> {
+        let location = [protocol::location_query(directory)];
+        let default: protocol::ModelDefaultResponse =
+            self.get(&protocol::model_default_path(), &location).ok()?;
+        default.data.map(|model| protocol::ModelRef {
+            id: model.id,
+            provider_id: model.provider_id,
+            variant: None,
+        })
     }
 
     fn select_model(&self, session_id: &str, model: &protocol::ModelRef) -> Result<()> {
@@ -985,7 +1009,17 @@ impl Api {
     }
 
     fn create_session(&self, directory: &str, title: Option<&str>) -> Result<Session> {
-        let body = protocol::CreateSessionBody::new(directory, title.map(|t| t.trim().to_owned()));
+        let (agent, model) = match self.load_default_agent(directory) {
+            Some(default_agent) => {
+                let model = default_agent
+                    .model
+                    .or_else(|| self.load_default_model_ref(directory));
+                (Some(default_agent.id), model)
+            }
+            None => (None, None),
+        };
+        let body = protocol::CreateSessionBody::new(directory, title.map(|t| t.trim().to_owned()))
+            .with_agent_model(agent, model);
         let created: protocol::SessionResponse =
             self.send_json(Method::POST, &protocol::sessions_path(), &body)?;
         Ok(Session::from_info(&created.data))
@@ -2915,9 +2949,36 @@ mod tests {
     }
 
     #[test]
-    fn create_session_posts_location_and_title_only() {
-        let (base, requests, server) = serve(1, |_| {
-            ok(json!({ "data": session_json("ses_new", "/a", "Scratch", 7) }))
+    fn create_session_pins_default_agent_model_and_variant() {
+        let (base, requests, server) = serve(2, |request| match request.path() {
+            "/api/agent" => ok(json!({
+                "location": { "directory": "/a" },
+                "data": [
+                    {
+                        "id": "build",
+                        "name": "Build",
+                        "mode": "primary",
+                        "hidden": false,
+                        "model": {
+                            "id": "google/gemini-4-neon",
+                            "providerID": "openrouter",
+                            "variant": "high"
+                        }
+                    },
+                    { "id": "plan", "name": "Plan", "mode": "primary", "hidden": false }
+                ]
+            })),
+            "/api/session" => {
+                let mut created = session_json("ses_new", "/a", "Scratch", 7);
+                created["agent"] = json!("build");
+                created["model"] = json!({
+                    "id": "google/gemini-4-neon",
+                    "providerID": "openrouter",
+                    "variant": "high"
+                });
+                ok(json!({ "data": created }))
+            }
+            _ => panic!("unexpected request: {}", request.line),
         });
         let api = Api::new(config(base, None)).unwrap();
         let session = api.create_session("/a", Some("  Scratch  ")).unwrap();
@@ -2926,11 +2987,71 @@ mod tests {
         assert_eq!(session.id, "ses_new");
         assert_eq!(session.directory, "/a");
         assert_eq!(session.title, "Scratch");
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].line, "POST /api/session HTTP/1.1");
         assert_eq!(
-            requests[0].json(),
-            json!({ "location": { "directory": "/a" }, "title": "Scratch" })
+            session.model,
+            Some(crate::model::SessionModel {
+                id: "google/gemini-4-neon".into(),
+                provider_id: "openrouter".into(),
+                variant: Some("high".into()),
+            })
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].path(), "/api/agent");
+        assert_eq!(
+            requests[0]
+                .query()
+                .get("location[directory]")
+                .map(String::as_str),
+            Some("/a")
+        );
+        assert_eq!(requests[1].line, "POST /api/session HTTP/1.1");
+        assert_eq!(
+            requests[1].json(),
+            json!({
+                "location": { "directory": "/a" },
+                "title": "Scratch",
+                "agent": "build",
+                "model": {
+                    "id": "google/gemini-4-neon",
+                    "providerID": "openrouter",
+                    "variant": "high"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn create_session_falls_back_to_default_model_when_agent_has_no_model() {
+        let default = fixture("model.default");
+        let (base, requests, server) = serve(3, move |request| match request.path() {
+            "/api/agent" => ok(json!({
+                "location": { "directory": "/a" },
+                "data": [
+                    { "id": "build", "name": "Build", "mode": "primary", "hidden": false }
+                ]
+            })),
+            "/api/model/default" => ok(default.clone()),
+            "/api/session" => ok(json!({ "data": session_json("ses_new", "/a", "Scratch", 7) })),
+            _ => panic!("unexpected request: {}", request.line),
+        });
+        let api = Api::new(config(base, None)).unwrap();
+        let _ = api.create_session("/a", None).unwrap();
+        server.join().unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].path(), "/api/agent");
+        assert_eq!(requests[1].path(), "/api/model/default");
+        assert_eq!(requests[2].line, "POST /api/session HTTP/1.1");
+        assert_eq!(
+            requests[2].json(),
+            json!({
+                "location": { "directory": "/a" },
+                "agent": "build",
+                "model": {
+                    "id": "mock-model",
+                    "providerID": "mock"
+                }
+            })
         );
     }
 
@@ -2938,9 +3059,25 @@ mod tests {
     fn model_routes_send_the_location_query() {
         let list = fixture("model.list");
         let default = fixture("model.default");
-        let (base, requests, server) = serve(2, move |request| match request.path() {
+        let (base, requests, server) = serve(3, move |request| match request.path() {
             "/api/model" => ok(list.clone()),
             "/api/model/default" => ok(default.clone()),
+            "/api/agent" => ok(json!({
+                "location": { "directory": "/Users/me/my repo" },
+                "data": [
+                    {
+                        "id": "build",
+                        "name": "Build",
+                        "mode": "primary",
+                        "hidden": false,
+                        "model": {
+                            "id": "mock-model",
+                            "providerID": "mock",
+                            "variant": "high"
+                        }
+                    }
+                ]
+            })),
             _ => panic!("unexpected request: {}", request.line),
         });
         let api = Api::new(config(base, None)).unwrap();
@@ -2949,14 +3086,15 @@ mod tests {
 
         assert_eq!(catalog.models.len(), 2);
         assert_eq!(
-            catalog
-                .preferred
-                .as_ref()
-                .map(|model| model.model_id.as_str()),
-            Some("mock-model")
+            catalog.preferred,
+            Some(crate::model::ModelSelection {
+                provider_id: "mock".into(),
+                model_id: "mock-model".into(),
+                variant: Some("high".into()),
+            })
         );
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         for request in requests.iter() {
             assert!(request.line.starts_with("GET "), "{}", request.line);
             let query = request.query();
@@ -2971,9 +3109,10 @@ mod tests {
 
     #[test]
     fn missing_default_model_falls_back_to_the_first_model() {
-        let (base, _, server) = serve(2, |request| match request.path() {
+        let (base, _, server) = serve(3, |request| match request.path() {
             "/api/model" => ok(fixture("model.list")),
             "/api/model/default" => ok(json!({ "location": { "directory": "/repo" } })),
+            "/api/agent" => ok(json!({ "location": { "directory": "/repo" }, "data": [] })),
             _ => panic!("unexpected request: {}", request.line),
         });
         let api = Api::new(config(base, None)).unwrap();
@@ -3103,7 +3242,7 @@ mod tests {
 
     #[test]
     fn error_bodies_surface_the_server_message() {
-        let (base, _, server) = serve(2, |request| match request.line.split(' ').next() {
+        let (base, _, server) = serve(3, |request| match request.line.split(' ').next() {
             Some("PATCH") => (
                 404,
                 json!({

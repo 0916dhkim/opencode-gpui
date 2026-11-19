@@ -527,9 +527,7 @@ impl State {
         let id = format!("ses_new_{}", self.next_id);
         self.next_id += 1;
         let created = CREATED + self.next_id * 1_000;
-        let mut session = session_info(&id, &directory, title.as_deref(), created, created);
-        // New sessions follow the server default until a model is picked.
-        session.model = None;
+        let session = session_info(&id, &directory, title.as_deref(), created, created);
         self.messages.insert(id, Vec::new());
         self.sessions.insert(0, session.clone());
         session

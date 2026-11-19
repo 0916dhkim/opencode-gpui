@@ -23,6 +23,7 @@
 //! | `PATCH /api/session/{id}/inbox/{inboxID}` | 204 | — |
 //! | `DELETE /api/session/{id}/inbox/{inboxID}` | 204 | — |
 //! | `GET /api/session/{id}/message` | 200 | [`Page`]`<`[`SessionMessage`]`>` |
+//! | `GET /api/agent` | 200 | [`AgentListResponse`] |
 //! | `GET /api/model` | 200 | [`Located`]`<Vec<`[`ModelInfo`]`>>` |
 //! | `GET /api/model/default` | 200 | [`ModelDefaultResponse`] |
 //! | `GET /api/permission/request` | 200 | [`Located`]`<Vec<`[`PermissionRequest`]`>>` |
@@ -36,8 +37,8 @@
 //!
 //! Declared failures carry an [`ApiError`] body (`{"_tag", "message", ...}`).
 //!
-//! Location-scoped routes (`/api/model`, `/api/model/default`, `/api/form`,
-//! `/api/permission/request`, and the `"global"` form owner) read the
+//! Location-scoped routes (`/api/agent`, `/api/model`, `/api/model/default`,
+//! `/api/form`, `/api/permission/request`, and the `"global"` form owner) read the
 //! directory from the deepObject query key `location[directory]`, falling back
 //! to the `x-opencode-directory` header and then the server's cwd. A plain
 //! `?directory=` is silently ignored there. Use [`location_query`].
@@ -133,6 +134,7 @@ pub type PromptResponse = Data<InboxUser>;
 pub type InterruptResponse = Interrupted;
 pub type InboxListResponse = Data<Vec<InboxEntry>>;
 pub type MessageListResponse = Page<SessionMessage>;
+pub type AgentListResponse = Located<Vec<AgentInfo>>;
 pub type ModelListResponse = Located<Vec<ModelInfo>>;
 pub type PermissionRequestListResponse = Located<Vec<PermissionRequest>>;
 pub type FormListResponse = Located<Vec<FormInfo>>;
@@ -1083,6 +1085,32 @@ impl ModelInfo {
 
 fn default_true() -> bool {
     true
+}
+
+/// One entry from `GET /api/agent`. OpenCode V2 orders the location's resolved
+/// default agent first among visible primary agents.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AgentInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+}
+
+impl AgentInfo {
+    pub fn is_selectable_primary(&self) -> bool {
+        self.mode != "subagent" && !self.hidden
+    }
+}
+
+/// The location's default primary agent from `GET /api/agent`.
+pub fn default_agent(agents: &[AgentInfo]) -> Option<&AgentInfo> {
+    agents.iter().find(|agent| agent.is_selectable_primary())
 }
 
 // ---------------------------------------------------------------------------
@@ -2113,13 +2141,17 @@ impl EventKind {
 // Request bodies
 // ---------------------------------------------------------------------------
 
-/// `POST /api/session`. Never carries `agent`; `model` is left to the server.
+/// `POST /api/session`.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct CreateSessionBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<LocationPublicRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
 }
 
 impl CreateSessionBody {
@@ -2129,7 +2161,20 @@ impl CreateSessionBody {
                 directory: directory.into(),
             }),
             title: title.filter(|title| !title.trim().is_empty()),
+            agent: None,
+            model: None,
         }
+    }
+
+    pub fn with_agent_model(mut self, agent: Option<String>, model: Option<ModelRef>) -> Self {
+        self.agent = agent.filter(|agent| !agent.trim().is_empty());
+        self.model = model.map(|mut model| {
+            model.variant = model
+                .variant
+                .filter(|variant| !variant.trim().is_empty() && variant != "default");
+            model
+        });
+        self
     }
 }
 
@@ -2345,6 +2390,7 @@ pub const ENDPOINTS: &[EndpointSpec] = &[
         "/api/session/{sessionID}/message",
         200,
     ),
+    endpoint("agent.list", "GET", "/api/agent", 200),
     endpoint("model.list", "GET", "/api/model", 200),
     endpoint("model.default", "GET", "/api/model/default", 200),
     endpoint(
@@ -2494,6 +2540,10 @@ pub fn session_form_path(session_id: &str, form_id: &str) -> String {
 /// Running shell commands of one location (`location[directory]`).
 pub fn shells_path() -> String {
     format!("{API_PREFIX}/shell")
+}
+
+pub fn agents_path() -> String {
+    format!("{API_PREFIX}/agent")
 }
 
 pub fn models_path() -> String {
@@ -3605,6 +3655,47 @@ mod tests {
             json!({ "location": { "directory": "/repo" } })
         );
         assert_eq!(
+            body(&CreateSessionBody::new("/repo", None).with_agent_model(
+                Some("build".into()),
+                Some(ModelRef {
+                    id: "google/gemini-4-neon".into(),
+                    provider_id: "openrouter".into(),
+                    variant: Some("high".into()),
+                }),
+            )),
+            json!({
+                "location": { "directory": "/repo" },
+                "agent": "build",
+                "model": {
+                    "id": "google/gemini-4-neon",
+                    "providerID": "openrouter",
+                    "variant": "high"
+                }
+            })
+        );
+        assert_eq!(
+            body(&CreateSessionBody::new("/repo", None).with_agent_model(Some("   ".into()), None)),
+            json!({ "location": { "directory": "/repo" } })
+        );
+        assert_eq!(
+            body(&CreateSessionBody::new("/repo", None).with_agent_model(
+                Some("build".into()),
+                Some(ModelRef {
+                    id: "google/gemini-4-neon".into(),
+                    provider_id: "openrouter".into(),
+                    variant: Some("default".into()),
+                }),
+            )),
+            json!({
+                "location": { "directory": "/repo" },
+                "agent": "build",
+                "model": {
+                    "id": "google/gemini-4-neon",
+                    "providerID": "openrouter"
+                }
+            })
+        );
+        assert_eq!(
             body(&RenameSessionBody::new(" New name ").unwrap()),
             json!({ "title": "New name" })
         );
@@ -3711,6 +3802,7 @@ mod tests {
             session_form_path("global", "frm_1"),
             "/api/session/global/form/frm_1"
         );
+        assert_eq!(agents_path(), "/api/agent");
         assert_eq!(models_path(), "/api/model");
         assert_eq!(model_default_path(), "/api/model/default");
         assert_eq!(permission_requests_path(), "/api/permission/request");
@@ -3737,9 +3829,40 @@ mod tests {
                 "session.form.cancel"
             ]
         );
+        assert_eq!(endpoint_spec("agent.list").unwrap().path, "/api/agent");
         assert_eq!(endpoint_spec("session.prompt").unwrap().success_status, 200);
         assert_eq!(endpoint_spec("session.update").unwrap().method, "PATCH");
         assert!(ENDPOINTS.iter().all(|spec| spec.path.starts_with("/api/")));
+    }
+
+    #[test]
+    fn default_agent_skips_hidden_and_subagents() {
+        let response: AgentListResponse = serde_json::from_value(json!({
+            "location": { "directory": "/repo" },
+            "data": [
+                { "id": "explore", "name": "Explore", "mode": "subagent", "hidden": false },
+                { "id": "compaction", "name": "Compaction", "mode": "primary", "hidden": true },
+                {
+                    "id": "build",
+                    "name": "Build",
+                    "mode": "primary",
+                    "hidden": false,
+                    "model": { "id": "google/gemini-4-neon", "providerID": "openrouter", "variant": "high" }
+                },
+                { "id": "plan", "name": "Plan", "mode": "primary", "hidden": false }
+            ]
+        }))
+        .unwrap();
+        let chosen = default_agent(&response.data).unwrap();
+        assert_eq!(chosen.id, "build");
+        assert_eq!(
+            chosen.model,
+            Some(ModelRef {
+                id: "google/gemini-4-neon".into(),
+                provider_id: "openrouter".into(),
+                variant: Some("high".into()),
+            })
+        );
     }
 
     #[test]

@@ -550,6 +550,14 @@ def test_models(h):
     check(models["location"] == {"directory": WORKSPACE}, "x-opencode-directory header selects location")
     status, _, default, _ = h.client.get("/api/model/default", {"location[directory]": WORKSPACE})
     check_shape(default, fixture_bodies("model.default"), "model default")
+    status, _, agents, _ = h.client.get("/api/agent", {"location[directory]": WORKSPACE})
+    check(
+        status == 200
+        and agents["location"] == {"directory": WORKSPACE}
+        and agents["data"][0]["id"] == "build"
+        and agents["data"][0]["model"] == {"id": "mock-model", "providerID": "mock", "variant": "high"},
+        "agent list returns default build agent with model and variant",
+    )
 
 
 def test_lifecycle(h, reader):
@@ -561,6 +569,20 @@ def test_lifecycle(h, reader):
     session_id = created["data"]["id"]
     status, _, titled, _ = h.client.post("/api/session", {"location": {"directory": WORKSPACE}, "title": "Titled harness session"})
     check_shape(titled, fixture_bodies("session.create.titled"), "titled create")
+    status, _, pinned, _ = h.client.post(
+        "/api/session",
+        {
+            "location": {"directory": WORKSPACE},
+            "agent": "build",
+            "model": {"providerID": "mock", "id": "mock-model", "variant": "high"},
+        },
+    )
+    check(
+        status == 200
+        and pinned["data"].get("agent") == "build"
+        and pinned["data"].get("model") == {"id": "mock-model", "providerID": "mock", "variant": "high"},
+        "create with agent and model persists both on session",
+    )
     status, _, body, raw = h.client.request("PATCH", f"/api/session/{session_id}", body={"title": "Renamed by harness"})
     check(status == 204 and raw == b"", "rename -> 204 empty")
     status, _, body, _ = h.client.request("PATCH", f"/api/session/{session_id}", body={"title": "   "})
@@ -1034,6 +1056,13 @@ def test_event_schemas(h, reader):
             check(not bad, f"{event_type} (not in fixtures) has a valid envelope")
             continue
         schema = infer(samples)
+        if event_type == "session.created":
+            # v2-2.0.8 captures created sessions without `model`; OpenCode v2 includes `model`
+            # on `session.created` whenever `POST /api/session` pins one.
+            schema["keys"]["data"]["keys"].setdefault(
+                "model",
+                infer([{"id": "m", "providerID": "p"}, {"id": "m", "providerID": "p", "variant": "high"}]),
+            )
         errors = []
         for event in events:
             validate(event, schema, event_type, errors)

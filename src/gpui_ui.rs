@@ -4189,13 +4189,10 @@ impl Client {
                 }
             }
             Some(Modal::Model) => {
+                let current = self.selected_model();
                 let choice = filter_models(&self.catalog.models, &query)
                     .get(index)
-                    .map(|option| protocol::ModelRef {
-                        id: option.model_id.clone(),
-                        provider_id: option.provider_id.clone(),
-                        variant: None,
-                    });
+                    .map(|option| model::model_pick_ref(current.as_ref(), option));
                 if let Some(choice) = choice {
                     self.choose_model(choice, cx);
                 }
@@ -4448,18 +4445,17 @@ impl Client {
                 return;
             }
             let focused_model = match self.modal {
-                Some(Modal::Model) => filter_models(&self.catalog.models, &query)
-                    .into_iter()
-                    .find(|option| {
-                        self.picker_choice_focus
-                            .get(&format!("model:{}:{}", option.provider_id, option.model_id))
-                            .is_some_and(|focus| focus.is_focused(window))
-                    })
-                    .map(|option| protocol::ModelRef {
-                        id: option.model_id.clone(),
-                        provider_id: option.provider_id.clone(),
-                        variant: None,
-                    }),
+                Some(Modal::Model) => {
+                    let current = self.selected_model();
+                    filter_models(&self.catalog.models, &query)
+                        .into_iter()
+                        .find(|option| {
+                            self.picker_choice_focus
+                                .get(&format!("model:{}:{}", option.provider_id, option.model_id))
+                                .is_some_and(|focus| focus.is_focused(window))
+                        })
+                        .map(|option| model::model_pick_ref(current.as_ref(), option))
+                }
                 Some(Modal::Level) => self.selected_model().and_then(|selection| {
                     let variants = self.catalog.find(&selection)?.variants.clone();
                     filter_levels(&variants, &query)
@@ -5638,6 +5634,9 @@ impl Client {
                             && existing.time.updated <= session.time.updated
                         {
                             existing.title = session.title;
+                        }
+                        if existing.model.is_none() && session.model.is_some() {
+                            existing.model = session.model;
                         }
                     } else {
                         model::SessionChange::Created(session).apply(&mut self.sessions);
@@ -10053,16 +10052,13 @@ impl Client {
                     if choices.is_empty() {
                         rows = rows.child(div().my(self.scaled(16.)).child("No matching models"));
                     }
+                    let current = self.selected_model();
                     for (index, option) in choices.into_iter().enumerate() {
-                        let selected = self.selected_model().as_ref().is_some_and(|preferred| {
+                        let selected = current.as_ref().is_some_and(|preferred| {
                             preferred.provider_id == option.provider_id
                                 && preferred.model_id == option.model_id
                         });
-                        let selection = protocol::ModelRef {
-                            id: option.model_id.clone(),
-                            provider_id: option.provider_id.clone(),
-                            variant: None,
-                        };
+                        let selection = model::model_pick_ref(current.as_ref(), option);
                         rows = rows.child(
                             div()
                                 .id(format!(
