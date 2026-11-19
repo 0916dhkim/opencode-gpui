@@ -10,10 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use gpui_kit::base::{
     Button as BaseButton, Checkbox, CheckboxIndicator, CheckboxState, FocusTrapElement,
+    GlobalState, Theme as BaseTheme,
+    text::{TextView, TextViewStyle},
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable, TITLE_BAR_HEIGHT, TitleBar};
@@ -974,9 +975,11 @@ struct Client {
     projects: Vec<Project>,
     active: String,
     transcript: HashMap<String, Vec<TranscriptRow>>,
+    transcript_row_cache: HashMap<String, Vec<CachedRowPresentation>>,
     transcript_revisions: HashMap<String, u64>,
     transcript_scrolls: HashMap<String, ScrollHandle>,
     transcript_spans: HashMap<String, Vec<MessageSpan>>,
+    text_view_style: Option<(bool, TextViewStyle)>,
     attachments: ImageCache,
     catalog: ModelCatalog,
     composer: Entity<TextareaState>,
@@ -1188,30 +1191,25 @@ enum SettingsTab {
     Sessions,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum MarkdownBlock {
-    Heading(u8, String),
-    Paragraph(String),
-    List(Vec<String>),
-    Code(String, String),
-    NestedCode {
-        language: String,
-        content: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MarkdownSegment {
+    Markdown(SharedString),
+    Code {
+        language: SharedString,
+        content: SharedString,
         list_depth: usize,
         quote_depth: usize,
     },
-    Structured {
-        content: String,
-        marker: Option<String>,
-        list_depth: usize,
-        quote_depth: usize,
-        heading: Option<u8>,
-    },
-    Table {
-        header: Vec<String>,
-        rows: Vec<Vec<String>>,
-    },
-    Rule,
+}
+
+#[derive(Clone)]
+struct CachedRowPresentation {
+    key: TranscriptRowKey,
+    render_revision: u64,
+    time: u64,
+    body: SharedString,
+    timestamp: SharedString,
+    segments: Arc<Vec<MarkdownSegment>>,
 }
 
 const COMPLEX_MARKDOWN_PREVIEW: &str = "> A quoted explanation of the clip alignment.\n\n| Part | Size |\n| --- | ---: |\n| paperclip | 22px |\n| send | 22px |\n\n1. Keep the inner wire visible\n   - Check at both theme settings\n2. Match the composer actions\n\n- [x] Measure the icon\n- [ ] Verify the layout\n\n```rust\npaperclip_icon(COMPOSER_ICON_PX)\n```";
@@ -1630,91 +1628,61 @@ fn permission_metadata(text: String, dark: bool) -> AnyElement {
         .into_any_element()
 }
 
-fn markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
+fn trim_quote_prefix_on_current_line(buf: &mut String) {
+    let line_start = buf.rfind('\n').map_or(0, |index| index + 1);
+    if buf[line_start..]
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'>'))
+    {
+        buf.truncate(line_start);
+    }
+}
+
+fn flush_markdown_segment(segments: &mut Vec<MarkdownSegment>, buf: &mut String) {
+    let trimmed = buf.trim_matches('\n');
+    let has_content = trimmed.lines().any(|line| {
+        line.bytes()
+            .any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'>'))
+    });
+    if has_content {
+        segments.push(MarkdownSegment::Markdown(SharedString::from(
+            trimmed.to_owned(),
+        )));
+    }
+    buf.clear();
+}
+
+/// Split Markdown only around fenced/indented code blocks (rendered by our
+/// custom code card with Copy button) while keeping contiguous prose, headings,
+/// lists, blockquotes, rules and tables in a single `TextView::markdown`.
+/// Markdown images are replaced with plain `Image: <alt>` text so remote URLs
+/// are never fetched automatically.
+fn markdown_segments(source: &str) -> Vec<MarkdownSegment> {
     let _latency = latency::global().span(TraceOperation::MarkdownParse, source.len());
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let mut list_depth = 0;
-    let complex = source.lines().any(|line| {
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
-        line.trim_start().starts_with("~~~")
-            || (indent > 0 && indent <= 3 && trimmed.starts_with("```"))
-    }) || Parser::new_ext(source, options).any(|event| match event {
-        Event::Start(Tag::List(start)) => {
-            list_depth += 1;
-            start.is_some() || list_depth > 1
-        }
-        Event::End(TagEnd::List(_)) => {
-            list_depth -= 1;
-            false
-        }
-        Event::Start(Tag::BlockQuote(_) | Tag::Table(_))
-        | Event::Start(Tag::Image { .. })
-        | Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))
-        | Event::TaskListMarker(_)
-        | Event::Rule => true,
-        Event::Start(Tag::CodeBlock(_)) if list_depth > 0 => true,
-        _ => false,
-    });
-    if complex {
-        return complex_markdown_blocks(source, options);
-    }
-    simple_markdown_blocks(source)
-}
+    let mut segments = Vec::new();
+    let mut markdown_buf = String::new();
+    let mut cursor = 0usize;
+    let mut list_depth = 0usize;
+    let mut quote_depth = 0usize;
+    let mut code: Option<(String, String, usize, usize, usize)> = None;
+    let mut image: Option<(String, usize)> = None;
 
-struct InlineMarkdownBlock {
-    content: String,
-    marker: Option<String>,
-    list_depth: usize,
-    quote_depth: usize,
-    heading: Option<u8>,
-}
-
-#[derive(Default)]
-struct MarkdownTableBuilder {
-    header: Vec<String>,
-    rows: Vec<Vec<String>>,
-    current_row: Vec<String>,
-}
-
-fn flush_inline(blocks: &mut Vec<MarkdownBlock>, current: &mut Option<InlineMarkdownBlock>) {
-    if let Some(block) = current.take().filter(|block| !block.content.is_empty()) {
-        blocks.push(MarkdownBlock::Structured {
-            content: block.content,
-            marker: block.marker,
-            list_depth: block.list_depth,
-            quote_depth: block.quote_depth,
-            heading: block.heading,
-        });
-    }
-}
-
-fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock> {
-    let mut blocks = Vec::new();
-    let mut current: Option<InlineMarkdownBlock> = None;
-    let mut code: Option<(String, String, usize, usize)> = None;
-    let mut table: Option<MarkdownTableBuilder> = None;
-    let mut lists: Vec<Option<u64>> = Vec::new();
-    let mut marker: Option<String> = None;
-    let mut quote_depth = 0;
-    let mut links: Vec<String> = Vec::new();
-    for event in Parser::new_ext(source, options) {
-        if let Some((_, content, _, _)) = code.as_mut() {
+    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+        if let Some((_, content, _, _, _)) = code.as_mut() {
             match event {
                 Event::End(TagEnd::CodeBlock) => {
-                    let (language, content, list_depth, quote_depth) = code.take().unwrap();
+                    let (language, content, list_depth, quote_depth, end_offset) =
+                        code.take().unwrap();
                     let content = content.trim_end_matches('\n').to_owned();
-                    blocks.push(if list_depth > 0 || quote_depth > 0 {
-                        MarkdownBlock::NestedCode {
-                            language,
-                            content,
-                            list_depth,
-                            quote_depth,
-                        }
-                    } else {
-                        MarkdownBlock::Code(language, content)
+                    segments.push(MarkdownSegment::Code {
+                        language: SharedString::from(language),
+                        content: SharedString::from(content),
+                        list_depth,
+                        quote_depth,
                     });
+                    cursor = cursor.max(end_offset.max(range.end));
                 }
                 Event::Text(text) | Event::Code(text) => content.push_str(&text),
                 Event::SoftBreak | Event::HardBreak => content.push('\n'),
@@ -1722,220 +1690,171 @@ fn complex_markdown_blocks(source: &str, options: Options) -> Vec<MarkdownBlock>
             }
             continue;
         }
-        match event {
-            Event::Start(Tag::BlockQuote(_)) => {
-                flush_inline(&mut blocks, &mut current);
-                quote_depth += 1;
-            }
-            Event::End(TagEnd::BlockQuote(_)) => {
-                flush_inline(&mut blocks, &mut current);
-                quote_depth -= 1;
-            }
-            Event::Start(Tag::List(start)) => {
-                flush_inline(&mut blocks, &mut current);
-                lists.push(start);
-            }
-            Event::End(TagEnd::List(_)) => {
-                flush_inline(&mut blocks, &mut current);
-                lists.pop();
-            }
-            Event::Start(Tag::Item) => {
-                flush_inline(&mut blocks, &mut current);
-                marker = Some(match lists.last_mut() {
-                    Some(Some(number)) => {
-                        let text = format!("{number}.");
-                        *number += 1;
-                        text
+        if let Some((alt, _)) = image.as_mut() {
+            match event {
+                Event::End(TagEnd::Image) => {
+                    let (alt, end_offset) = image.take().unwrap();
+                    let alt = alt.trim();
+                    if alt.is_empty() {
+                        markdown_buf.push_str("Image");
+                    } else {
+                        markdown_buf.push_str("Image: ");
+                        markdown_buf.push_str(alt);
                     }
-                    _ => "•".into(),
-                });
+                    cursor = cursor.max(end_offset.max(range.end));
+                }
+                Event::Text(text) | Event::Code(text) => alt.push_str(&text),
+                Event::SoftBreak | Event::HardBreak => alt.push(' '),
+                _ => {}
             }
-            Event::End(TagEnd::Item) => {
-                flush_inline(&mut blocks, &mut current);
-                marker = None;
-            }
+            continue;
+        }
+        match event {
+            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
+            Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
+            Event::End(TagEnd::BlockQuote(_)) => quote_depth = quote_depth.saturating_sub(1),
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush_inline(&mut blocks, &mut current);
+                if range.start > cursor {
+                    markdown_buf.push_str(&source[cursor..range.start]);
+                }
+                if quote_depth > 0 {
+                    trim_quote_prefix_on_current_line(&mut markdown_buf);
+                }
+                flush_markdown_segment(&mut segments, &mut markdown_buf);
                 let language = match kind {
                     CodeBlockKind::Fenced(language) => language
                         .split_whitespace()
                         .next()
                         .unwrap_or_default()
-                        .into(),
+                        .to_owned(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                code = Some((language, String::new(), lists.len(), quote_depth));
-            }
-            Event::Start(Tag::Table(_)) => {
-                flush_inline(&mut blocks, &mut current);
-                table = Some(MarkdownTableBuilder::default());
-            }
-            Event::Start(Tag::TableCell) => {
-                current = Some(InlineMarkdownBlock {
-                    content: String::new(),
-                    marker: None,
-                    list_depth: 0,
-                    quote_depth: 0,
-                    heading: None,
-                });
-            }
-            Event::End(TagEnd::TableCell) => {
-                if let Some(table) = table.as_mut() {
-                    table
-                        .current_row
-                        .push(current.take().map_or_else(String::new, |cell| cell.content));
-                }
-            }
-            Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
-                if let Some(table) = table.as_mut() {
-                    if table.header.is_empty() {
-                        table.header = std::mem::take(&mut table.current_row);
-                    } else {
-                        table.rows.push(std::mem::take(&mut table.current_row));
-                    }
-                }
-            }
-            Event::End(TagEnd::Table) => {
-                if let Some(table) = table.take() {
-                    blocks.push(MarkdownBlock::Table {
-                        header: table.header,
-                        rows: table.rows,
-                    });
-                }
-            }
-            Event::Start(Tag::Paragraph) => {
-                flush_inline(&mut blocks, &mut current);
-                current = Some(InlineMarkdownBlock {
-                    content: String::new(),
-                    marker: marker.take(),
-                    list_depth: lists.len(),
-                    quote_depth,
-                    heading: None,
-                });
-            }
-            Event::Start(Tag::Heading { level, .. }) => {
-                flush_inline(&mut blocks, &mut current);
-                current = Some(InlineMarkdownBlock {
-                    content: String::new(),
-                    marker: marker.take(),
-                    list_depth: lists.len(),
-                    quote_depth,
-                    heading: Some(level as u8),
-                });
-            }
-            Event::End(TagEnd::Paragraph | TagEnd::Heading(_)) => {
-                flush_inline(&mut blocks, &mut current)
-            }
-            Event::Start(Tag::Strong) | Event::End(TagEnd::Strong) => {
-                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "**");
-            }
-            Event::Start(Tag::Emphasis) | Event::End(TagEnd::Emphasis) => {
-                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "*");
-            }
-            Event::Start(Tag::Strikethrough) | Event::End(TagEnd::Strikethrough) => {
-                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "~~");
-            }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                links.push(dest_url.into_string());
-                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "[");
-            }
-            Event::End(TagEnd::Link) => {
-                let destination = links.pop().unwrap_or_default();
-                append_inline(
-                    &mut current,
-                    &mut marker,
-                    lists.len(),
-                    quote_depth,
-                    &format!("]({destination})"),
-                );
+                code = Some((language, String::new(), list_depth, quote_depth, range.end));
             }
             Event::Start(Tag::Image { .. }) => {
-                append_inline(
-                    &mut current,
-                    &mut marker,
-                    lists.len(),
-                    quote_depth,
-                    "Image: ",
-                );
-            }
-            Event::Text(text) => {
-                append_inline(
-                    &mut current,
-                    &mut marker,
-                    lists.len(),
-                    quote_depth,
-                    &escape_markdown_literal(&text),
-                );
-            }
-            Event::Html(text) | Event::InlineHtml(text) => {
-                append_inline(&mut current, &mut marker, lists.len(), quote_depth, &text);
-            }
-            Event::Code(text) => {
-                append_inline(
-                    &mut current,
-                    &mut marker,
-                    lists.len(),
-                    quote_depth,
-                    &format!("`{text}`"),
-                );
-            }
-            Event::SoftBreak | Event::HardBreak => {
-                append_inline(&mut current, &mut marker, lists.len(), quote_depth, "\n")
-            }
-            Event::TaskListMarker(checked) => append_inline(
-                &mut current,
-                &mut marker,
-                lists.len(),
-                quote_depth,
-                if checked { "[x] " } else { "[ ] " },
-            ),
-            Event::Rule => {
-                flush_inline(&mut blocks, &mut current);
-                blocks.push(MarkdownBlock::Rule);
+                if range.start > cursor {
+                    markdown_buf.push_str(&source[cursor..range.start]);
+                }
+                image = Some((String::new(), range.end));
             }
             _ => {}
         }
     }
-    flush_inline(&mut blocks, &mut current);
-    blocks
+
+    if cursor < source.len() {
+        markdown_buf.push_str(&source[cursor..]);
+    }
+    flush_markdown_segment(&mut segments, &mut markdown_buf);
+    segments
 }
 
-fn append_inline(
-    current: &mut Option<InlineMarkdownBlock>,
-    marker: &mut Option<String>,
-    list_depth: usize,
-    quote_depth: usize,
-    text: &str,
-) {
-    let block = current.get_or_insert_with(|| InlineMarkdownBlock {
-        content: String::new(),
-        marker: marker.take(),
-        list_depth,
-        quote_depth,
-        heading: None,
-    });
-    block.content.push_str(text);
+fn empty_markdown_segments() -> Arc<Vec<MarkdownSegment>> {
+    static EMPTY: OnceLock<Arc<Vec<MarkdownSegment>>> = OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(Vec::new())).clone()
 }
 
-/// Text events are already decoded by pulldown-cmark. Escape literal Markdown
-/// punctuation before handing the reconstructed fragment to GPUI Kit's
-/// renderer; otherwise an escaped `\*literal\*` becomes new emphasis.
-fn escape_markdown_literal(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        if character == '&' {
-            escaped.push_str("&amp;");
+fn build_cached_row(row: &TranscriptRow) -> CachedRowPresentation {
+    let is_assistant_markdown = row.kind == TranscriptRowKind::Normal && row.role.label() != "YOU";
+    let segments = if is_assistant_markdown {
+        Arc::new(markdown_segments(&row.body))
+    } else {
+        empty_markdown_segments()
+    };
+    CachedRowPresentation {
+        key: row.key.clone(),
+        render_revision: row.render_revision,
+        time: row.time,
+        body: SharedString::from(row.body.clone()),
+        timestamp: SharedString::from(timestamp(row.time)),
+        segments,
+    }
+}
+
+fn reconcile_row_cache(rows: &[TranscriptRow], cached: &mut Vec<CachedRowPresentation>) {
+    if rows.is_empty() {
+        cached.clear();
+        return;
+    }
+    let mut previous: HashMap<TranscriptRowKey, CachedRowPresentation> = cached
+        .drain(..)
+        .map(|entry| (entry.key.clone(), entry))
+        .collect();
+    cached.reserve(rows.len());
+    for row in rows {
+        if let Some(existing) = previous.remove(&row.key)
+            && existing.render_revision == row.render_revision
+            && existing.time == row.time
+        {
+            cached.push(existing);
             continue;
         }
-        if matches!(
-            character,
-            '\\' | '*' | '_' | '`' | '[' | ']' | '~' | '<' | '>' | '#' | '!' | '|'
-        ) {
-            escaped.push('\\');
-        }
-        escaped.push(character);
+        cached.push(build_cached_row(row));
     }
-    escaped
+}
+
+fn transcript_text_view_style(dark: bool, cx: &App) -> TextViewStyle {
+    let fg: Hsla = rgb(if dark { 0xe8e5df } else { 0x252829 }).into();
+    let muted: Hsla = rgb(if dark { 0xb5b9bb } else { 0x555b5c }).into();
+    let border: Hsla = rgb(if dark { 0x30353a } else { 0xd2cdc5 }).into();
+    let code_bg: Hsla = rgb(if dark { 0x202429 } else { 0xece9e2 }).into();
+    let mut table = StyleRefinement::default();
+    table.corner_radii.top_left = Some(px(5.).into());
+    table.corner_radii.top_right = Some(px(5.).into());
+    table.corner_radii.bottom_left = Some(px(5.).into());
+    table.corner_radii.bottom_right = Some(px(5.).into());
+    let mut table_head = StyleRefinement::default();
+    table_head.text.font_weight = Some(FontWeight::BOLD);
+    TextViewStyle::from_theme(&BaseTheme::global(cx))
+        .with_foreground(fg)
+        .with_muted_foreground(muted)
+        .with_border(border)
+        .with_code_background(code_bg)
+        .with_paragraph_gap(rems(10. / 16.))
+        .with_heading(|level| {
+            let mut style = StyleRefinement::default();
+            style.text.font_weight = Some(FontWeight::BOLD);
+            style.text.font_size = Some(
+                rems(match level {
+                    1 => 18. / 16.,
+                    2 => 1.,
+                    _ => 14. / 16.,
+                })
+                .into(),
+            );
+            style
+        })
+        .with_table(table)
+        .with_table_head(table_head)
+        .with_inline_code(HighlightStyle {
+            background_color: Some(code_bg),
+            ..Default::default()
+        })
+}
+
+/// Suppress window-level text selection on chrome, modals, and the transcript's
+/// scrollbar gutter so pressing UI controls does not put `WindowSelectionLayer`
+/// into an active drag state.
+fn should_suppress_window_selection(
+    modal_open: bool,
+    scroll_bounds: Bounds<Pixels>,
+    scrollbar_gutter: Pixels,
+    position: Point<Pixels>,
+) -> bool {
+    if modal_open || !scroll_bounds.contains(&position) {
+        return true;
+    }
+    position.x >= scroll_bounds.right() - scrollbar_gutter
+}
+
+fn should_notify_after_transcript_prepaint(
+    request_bottom: bool,
+    was_following: bool,
+    is_following: bool,
+    rendered_sticky: Option<usize>,
+    current_sticky: Option<usize>,
+) -> bool {
+    request_bottom || was_following != is_following || rendered_sticky != current_sticky
 }
 
 fn markdown_view_id(
@@ -1948,77 +1867,6 @@ fn markdown_view_id(
         "markdown-{session}-{}-{:?}-{block_index}-{item_index}",
         row.message_id, row.slot
     )
-}
-
-fn heading_is_block_marker(title: &str) -> bool {
-    let title = title.trim_start();
-    title.starts_with("- ")
-        || title.starts_with("* ")
-        || title.starts_with("+ ")
-        || title.starts_with("> ")
-        || title.starts_with("# ")
-        || title.starts_with("```")
-        || title.starts_with("~~~")
-        || title
-            .split_once('.')
-            .is_some_and(|(number, rest)| number.parse::<u64>().is_ok() && rest.starts_with(' '))
-}
-
-fn simple_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
-    let mut lines = source.lines().peekable();
-    let mut blocks = Vec::new();
-    while let Some(line) = lines.next() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(language) = line.strip_prefix("```") {
-            let mut code = String::new();
-            for next in lines.by_ref() {
-                if next.starts_with("```") {
-                    break;
-                }
-                if !code.is_empty() {
-                    code.push('\n');
-                }
-                code.push_str(next);
-            }
-            blocks.push(MarkdownBlock::Code(language.to_owned(), code));
-            continue;
-        }
-        if let Some((level, title)) = line
-            .split_once(' ')
-            .filter(|(marks, _)| !marks.is_empty() && marks.bytes().all(|c| c == b'#'))
-        {
-            blocks.push(MarkdownBlock::Heading(level.len() as u8, title.to_owned()));
-            continue;
-        }
-        if line.starts_with("- ") || line.starts_with("* ") {
-            let mut items = vec![line[2..].to_owned()];
-            while let Some(next) = lines
-                .peek()
-                .filter(|next| next.starts_with("- ") || next.starts_with("* "))
-            {
-                items.push(next[2..].to_owned());
-                lines.next();
-            }
-            blocks.push(MarkdownBlock::List(items));
-            continue;
-        }
-        let mut text = line.to_owned();
-        while let Some(next) = lines.peek().filter(|next| {
-            !next.trim().is_empty()
-                && !next.starts_with("```")
-                && !next.starts_with("# ")
-                && !next.starts_with("- ")
-                && !next.starts_with("* ")
-        }) {
-            text.push('\n');
-            text.push_str(next);
-            lines.next();
-        }
-        blocks.push(MarkdownBlock::Paragraph(text));
-    }
-    blocks
 }
 
 fn inline_image(url: &str) -> Option<Arc<Image>> {
@@ -2280,8 +2128,8 @@ impl Client {
 
     fn markdown_code_block(
         &self,
-        language: String,
-        code: String,
+        language: SharedString,
+        code: SharedString,
         row_index: usize,
         block_index: usize,
         row_key: &TranscriptRowKey,
@@ -2303,6 +2151,7 @@ impl Client {
                     .px(self.scaled(12.))
                     .flex()
                     .items_center()
+                    .justify_between()
                     .bg(self.tone(0xece9e2, 0x14171a))
                     .border_b_1()
                     .border_color(self.tone(0xd2cdc5, 0x282c30))
@@ -2310,15 +2159,17 @@ impl Client {
                     .font_weight(FontWeight::BOLD)
                     .text_color(self.tone(0x777e7d, 0x899198))
                     .child(language)
-                    .child(div().flex_1())
                     .child(
                         BaseButton::new(format!("copy-code-{row_index}-{block_index}"))
                             .accessibility_label(if copied { "Code copied" } else { "Copy code" })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                GlobalState::suppress_text_selection(cx);
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.copy_with_feedback(
                                     feedback_key.clone(),
                                     "Code copied",
-                                    copy.clone(),
+                                    copy.to_string(),
                                     cx,
                                 );
                             }))
@@ -2353,191 +2204,88 @@ impl Client {
     fn markdown_body(
         &self,
         row: &TranscriptRow,
+        segments: &[MarkdownSegment],
         row_index: usize,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let mut content = div().w_full().flex().flex_col().gap(self.scaled(10.));
-        for (block_index, block) in markdown_blocks(&row.body).into_iter().enumerate() {
-            // The stateless markdown() helper identifies views by its caller
-            // location. Repeated items at one call site then share parser
-            // state and can remain stuck as blank loading placeholders.
-            let owner = cx.entity().downgrade();
-            let markdown_view = |item_index, text| {
-                let owner = owner.clone();
-                TextView::markdown(
-                    markdown_view_id(&self.active, &row.key, block_index, item_index),
-                    text,
-                )
-                .on_link_click(move |url, event, window, app| {
-                    if event.is_secondary() {
-                        let position = event.position();
-                        let url = url.to_string();
-                        let _ = owner.update(app, |this, cx| {
-                            this.link_menu = Some(LinkMenu { url, position });
-                            let focus = this.link_menu_focus[0].clone();
-                            window.on_next_frame(move |window, cx| focus.focus(window, cx));
-                            cx.notify();
-                        });
-                    } else if !event.is_middle_click() && may_open_link(url) {
-                        app.open_url(url);
-                    }
-                })
-                .w_full()
-                .min_w_0()
-            };
-            let element: AnyElement = match block {
-                MarkdownBlock::Heading(level, title) => {
-                    let heading = div()
-                        .text_size(self.scaled(match level {
-                            1 => 18.,
-                            2 => 16.,
-                            _ => 14.,
-                        }))
-                        .font_weight(FontWeight::BOLD);
-                    if heading_is_block_marker(&title) || !title.contains(['*', '_', '`', '[']) {
-                        heading.child(title).into_any_element()
-                    } else {
-                        heading.child(markdown_view(0, title)).into_any_element()
-                    }
-                }
-                MarkdownBlock::Paragraph(text) => div()
-                    .line_height(self.scaled(22.))
-                    .child(markdown_view(0, text))
-                    .into_any_element(),
-                MarkdownBlock::Structured {
-                    content,
-                    marker,
-                    list_depth,
-                    quote_depth,
-                    heading,
-                } => {
-                    let mut line = div().w_full().flex().items_start();
-                    if let Some(marker) = marker {
-                        line = line.child(
-                            div()
-                                .w(self.scaled(24.))
-                                .flex_shrink_0()
-                                .text_color(self.tone(0x777e7d, 0xaeb4b9))
-                                .child(marker),
-                        );
-                    }
-                    line = line.child(div().flex_1().min_w_0().child(markdown_view(0, content)));
-                    let mut block = div()
-                        .w_full()
-                        .pl(self.scaled(16. * list_depth.saturating_sub(1) as f32))
-                        .when(heading.is_none(), |view| view.line_height(self.scaled(22.)))
-                        .when_some(heading, |view, level| {
-                            view.text_size(self.scaled(if level == 1 {
-                                18.
-                            } else if level == 2 {
-                                16.
-                            } else {
-                                14.
-                            }))
-                            .font_weight(FontWeight::BOLD)
-                        });
-                    if quote_depth > 0 {
-                        block = block
-                            .border_l_1()
-                            .border_color(self.tone(0xb7b3ac, 0x50565b))
-                            .py(self.scaled(7.))
-                            .pr(self.scaled(12.))
-                            .pl(self.scaled(12. + 14. * (quote_depth - 1) as f32))
-                            .text_color(self.tone(0x555b5c, 0xb5b9bb));
-                    }
-                    block.child(line).into_any_element()
-                }
-                MarkdownBlock::Table { header, rows } => {
-                    let mut table = div()
-                        .w_full()
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(self.tone(0xd2cdc5, 0x30353a));
-                    let mut cell_index = 0;
-                    for (index, row) in std::iter::once(header).chain(rows).enumerate() {
-                        let mut line = div().w_full().flex().when(index == 0, |line| {
-                            line.font_weight(FontWeight::BOLD)
-                                .bg(self.tone(0xece9e2, 0x202429))
-                        });
-                        for cell in row {
-                            line = line.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .p(px(7.))
-                                    .border_r_1()
-                                    .border_color(self.tone(0xd2cdc5, 0x30353a))
-                                    .child(markdown_view(cell_index, cell)),
-                            );
-                            cell_index += 1;
+        let style = self
+            .text_view_style
+            .as_ref()
+            .filter(|(dark, _)| *dark == self.dark)
+            .map(|(_, style)| style.clone())
+            .unwrap_or_else(|| transcript_text_view_style(self.dark, cx));
+        let render_segment = |segment_index: usize, segment: &MarkdownSegment| -> AnyElement {
+            match segment {
+                MarkdownSegment::Markdown(text) => {
+                    let owner = cx.entity().downgrade();
+                    TextView::markdown(
+                        markdown_view_id(&self.active, &row.key, segment_index, 0),
+                        text.clone(),
+                    )
+                    .style(style.clone())
+                    .on_link_click(move |url, event, window, app| {
+                        if event.is_secondary() {
+                            let position = event.position();
+                            let url = url.to_string();
+                            let _ = owner.update(app, |this, cx| {
+                                this.link_menu = Some(LinkMenu { url, position });
+                                let focus = this.link_menu_focus[0].clone();
+                                window.on_next_frame(move |window, cx| focus.focus(window, cx));
+                                cx.notify();
+                            });
+                        } else if !event.is_middle_click() && may_open_link(url) {
+                            app.open_url(url);
                         }
-                        table = table.child(line);
-                    }
-                    table.into_any_element()
-                }
-                MarkdownBlock::Rule => div()
-                    .h(px(1.))
+                    })
                     .w_full()
-                    .bg(self.tone(0xc8c3ba, 0x343a3f))
-                    .into_any_element(),
-                MarkdownBlock::List(items) => {
-                    let mut list = div().flex().flex_col().gap(self.scaled(10.));
-                    for (item_index, item) in items.into_iter().enumerate() {
-                        list = list.child(
-                            div()
-                                .flex()
-                                .line_height(self.scaled(22.))
-                                .gap(self.scaled(9.))
-                                .child(
-                                    div()
-                                        .w(self.scaled(17.))
-                                        .text_right()
-                                        .text_color(self.tone(0x777e7d, 0xaeb4b9))
-                                        .child("•"),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .child(markdown_view(item_index, item)),
-                                ),
-                        );
-                    }
-                    list.into_any_element()
+                    .min_w_0()
+                    .line_height(self.scaled(22.))
+                    .into_any_element()
                 }
-                MarkdownBlock::Code(language, code) => {
-                    self.markdown_code_block(language, code, row_index, block_index, &row.key, cx)
-                }
-                MarkdownBlock::NestedCode {
+                MarkdownSegment::Code {
                     language,
                     content,
                     list_depth,
                     quote_depth,
                 } => {
-                    let mut wrapper = div()
-                        .w_full()
-                        .pl(px(16. * list_depth.saturating_sub(1) as f32));
-                    if quote_depth > 0 {
-                        wrapper = wrapper
-                            .border_l_1()
-                            .border_color(self.tone(0xb7b3ac, 0x50565b))
-                            .py(px(7.))
-                            .pr(px(12.))
-                            .pl(px(12. + 14. * (quote_depth - 1) as f32));
+                    let card = self.markdown_code_block(
+                        language.clone(),
+                        content.clone(),
+                        row_index,
+                        segment_index,
+                        &row.key,
+                        cx,
+                    );
+                    if *list_depth == 0 && *quote_depth == 0 {
+                        card
+                    } else {
+                        let mut wrapper = div()
+                            .w_full()
+                            .pl(px(16. * list_depth.saturating_sub(1) as f32));
+                        if *quote_depth > 0 {
+                            wrapper = wrapper
+                                .border_l_1()
+                                .border_color(self.tone(0xb7b3ac, 0x50565b))
+                                .py(px(7.))
+                                .pr(px(12.))
+                                .pl(px(12. + 14. * (quote_depth - 1) as f32));
+                        }
+                        wrapper.child(card).into_any_element()
                     }
-                    wrapper
-                        .child(self.markdown_code_block(
-                            language,
-                            content,
-                            row_index,
-                            block_index,
-                            &row.key,
-                            cx,
-                        ))
-                        .into_any_element()
                 }
-            };
-            content = content.child(element);
+            }
+        };
+        if segments.len() == 1 {
+            return render_segment(0, &segments[0]);
+        }
+        let mut content = div().w_full().block();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let element = render_segment(segment_index, segment);
+            if segment_index == 0 {
+                content = content.child(element);
+            } else {
+                content = content.child(div().w_full().mt(self.scaled(10.)).child(element));
+            }
         }
         content.into_any_element()
     }
@@ -2668,9 +2416,11 @@ impl Client {
             projects: Vec::new(),
             active: String::new(),
             transcript: HashMap::new(),
+            transcript_row_cache: HashMap::new(),
             transcript_revisions: HashMap::new(),
             transcript_spans: HashMap::new(),
             transcript_scrolls: HashMap::new(),
+            text_view_style: None,
             attachments: ImageCache::default(),
             catalog: ModelCatalog::default(),
             composer: cx.new(|cx| {
@@ -3514,6 +3264,7 @@ impl Client {
         self.message_events_during_load.remove(id);
         self.reload_after_load.remove(id);
         self.transcript.remove(id);
+        self.transcript_row_cache.remove(id);
         self.transcript_revisions.remove(id);
         self.transcript_spans.remove(id);
         self.attachments.remove_session(id);
@@ -3953,6 +3704,7 @@ impl Client {
         self.deferred_abort.clear();
         self.abort_timeout_tokens.clear();
         self.transcript.clear();
+        self.transcript_row_cache.clear();
         self.transcript_revisions.clear();
         self.transcript_spans.clear();
         self.attachments = ImageCache::default();
@@ -5244,6 +4996,11 @@ impl Client {
             tail_delta,
         );
         if change.is_some() {
+            let cached = self
+                .transcript_row_cache
+                .entry(session_id.to_owned())
+                .or_default();
+            reconcile_row_cache(rows, cached);
             let revision = self
                 .transcript_revisions
                 .entry(session_id.to_owned())
@@ -5978,6 +5735,7 @@ impl Client {
                             self.conversations.remove(&id);
                             self.background_requests.remove(&id);
                             self.transcript.remove(&id);
+                            self.transcript_row_cache.remove(&id);
                             self.transcript_revisions.remove(&id);
                             self.transcript_spans.remove(&id);
                             self.attachments.remove_session(&id);
@@ -6312,10 +6070,19 @@ impl Client {
             bootstrapped: true,
             projects,
             active: active.clone(),
+            transcript_row_cache: transcript
+                .iter()
+                .map(|(session_id, rows)| {
+                    let mut cached = Vec::new();
+                    reconcile_row_cache(rows, &mut cached);
+                    (session_id.clone(), cached)
+                })
+                .collect(),
             transcript,
             transcript_revisions: HashMap::new(),
             transcript_spans,
             transcript_scrolls: HashMap::from([(active, scroll.clone())]),
+            text_view_style: None,
             attachments,
             catalog,
             composer: cx.new(|cx| {
@@ -6547,6 +6314,7 @@ impl Client {
         client.saved_active = Some(client.active.clone());
         client.sessions.clear();
         client.transcript.clear();
+        client.transcript_row_cache.clear();
         client.transcript_revisions.clear();
         client.transcript_spans.clear();
         client.attachments = ImageCache::default();
@@ -7348,7 +7116,13 @@ impl Client {
 
     // Natural-height rows; give the solver the already-known viewport width
     // rather than resolving percentages repeatedly in intrinsic-size passes.
-    fn message_row(&self, row: &TranscriptRow, index: usize, cx: &Context<Self>) -> Stateful<Div> {
+    fn message_row(
+        &self,
+        row: &TranscriptRow,
+        cached: Option<&CachedRowPresentation>,
+        index: usize,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let user = row.role.label() == "YOU";
         let last = self
             .transcript
@@ -7360,99 +7134,105 @@ impl Client {
         } else {
             self.tone(0xf4f1eb, 0x101214)
         };
-        let mut body = div().flex().flex_col().gap(self.scaled(10.));
-        let mut direct_body = None;
-        match row.kind {
-            TranscriptRowKind::Tool => {
-                body = body.child(div().font_family(MONO_FONT_FAMILY).child(row.body.clone()))
-            }
-            TranscriptRowKind::Error => {
-                body = body.child(
+        let body_text = cached
+            .map(|entry| entry.body.clone())
+            .unwrap_or_else(|| SharedString::from(row.body.clone()));
+        let timestamp_text = cached
+            .map(|entry| entry.timestamp.clone())
+            .unwrap_or_else(|| SharedString::from(timestamp(row.time)));
+        let primary_body: AnyElement = match row.kind {
+            TranscriptRowKind::Tool => div()
+                .font_family(MONO_FONT_FAMILY)
+                .child(body_text)
+                .into_any_element(),
+            TranscriptRowKind::Error => div()
+                .mt(px(4.))
+                .flex()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(self.tone(0xe8b8b8, 0x664547))
+                .bg(self.tone(0xf3e7e4, 0x271a1b))
+                .child(
                     div()
-                        .mt(px(4.))
-                        .flex()
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(self.tone(0xe8b8b8, 0x664547))
-                        .bg(self.tone(0xf3e7e4, 0x271a1b))
-                        .child(
-                            div()
-                                .w(px(3.))
-                                .flex_shrink_0()
-                                .bg(self.tone(0xcf222e, 0xf85149)),
-                        )
-                        .child(
-                            div()
-                                .px(px(14.))
-                                .py(px(11.))
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_size(px(11.))
-                                        .text_color(self.tone(0xcf222e, 0xf85149))
-                                        .child("⚠")
-                                        .child("Error"),
-                                )
-                                .child(row.body.clone()),
-                        ),
+                        .w(px(3.))
+                        .flex_shrink_0()
+                        .bg(self.tone(0xcf222e, 0xf85149)),
                 )
-            }
+                .child(
+                    div()
+                        .px(px(14.))
+                        .py(px(11.))
+                        .block()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .mb(px(4.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(11.))
+                                .text_color(self.tone(0xcf222e, 0xf85149))
+                                .child("⚠")
+                                .child("Error"),
+                        )
+                        .child(body_text),
+                )
+                .into_any_element(),
             TranscriptRowKind::Normal if !user => {
-                let markdown = self.markdown_body(row, index, cx);
-                if row.images.is_empty() {
-                    // One child has no inter-child gap. Avoid an additional
-                    // nested flex formatting context around every document.
-                    direct_body = Some(markdown);
+                if let Some(entry) = cached {
+                    self.markdown_body(row, &entry.segments, index, cx)
                 } else {
-                    body = body.child(markdown);
+                    let segments = markdown_segments(&row.body);
+                    self.markdown_body(row, &segments, index, cx)
                 }
             }
-            _ => body = body.child(row.body.clone()),
-        }
-        for (image_index, image) in row.images.iter().enumerate() {
-            let source = self.attachments.get(&self.active, row, image_index);
-            let (width, height) = source
-                .and_then(|source| imagesize::blob_size(source.bytes()).ok())
-                .map_or_else(
-                    || image_display_size(200, 120, self.transcript_content_width.as_f32()),
-                    |size| {
-                        image_display_size(
-                            size.width,
-                            size.height,
-                            self.transcript_content_width.as_f32(),
+            _ => body_text.into_any_element(),
+        };
+        let body_element = if row.images.is_empty() {
+            primary_body
+        } else {
+            let mut body = div().block().child(primary_body);
+            for (image_index, image) in row.images.iter().enumerate() {
+                let source = self.attachments.get(&self.active, row, image_index);
+                let (width, height) = source
+                    .and_then(|source| imagesize::blob_size(source.bytes()).ok())
+                    .map_or_else(
+                        || image_display_size(200, 120, self.transcript_content_width.as_f32()),
+                        |size| {
+                            image_display_size(
+                                size.width,
+                                size.height,
+                                self.transcript_content_width.as_f32(),
+                            )
+                        },
+                    );
+                let thumbnail = div()
+                    .mt(self.scaled(10.))
+                    .h(px(height))
+                    .w(px(width))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(self.tone(0xd8d1c6, 0x343a40))
+                    .overflow_hidden();
+                body = body.child(match source {
+                    Some(source) => thumbnail
+                        .child(
+                            img(source.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
                         )
-                    },
-                );
-            let thumbnail = div()
-                .h(px(height))
-                .w(px(width))
-                .rounded(px(5.))
-                .border_1()
-                .border_color(self.tone(0xd8d1c6, 0x343a40))
-                .overflow_hidden();
-            body = body.child(match source {
-                Some(source) => thumbnail
-                    .child(
-                        img(source.clone())
-                            .size_full()
-                            .object_fit(ObjectFit::Contain),
-                    )
-                    .into_any_element(),
-                None => thumbnail
-                    .child(if image.starts_with("data:") {
-                        "Image unavailable".to_owned()
-                    } else {
-                        image.clone()
-                    })
-                    .into_any_element(),
-            });
-        }
+                        .into_any_element(),
+                    None => thumbnail
+                        .child(if image.starts_with("data:") {
+                            "Image unavailable".to_owned()
+                        } else {
+                            image.clone()
+                        })
+                        .into_any_element(),
+                });
+            }
+            body.into_any_element()
+        };
         div()
             .id(("message", index))
             .w(self.transcript_content_width + self.scaled(56.))
@@ -7481,6 +7261,7 @@ impl Client {
                 div()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .mb(self.scaled(if user { 10. } else { 6. }))
                     .text_size(self.scaled(11.))
                     .font_weight(FontWeight::BOLD)
@@ -7489,16 +7270,15 @@ impl Client {
                     } else {
                         self.tone(0x666f76, 0x8d959d)
                     })
-                    .child(row.role.label().to_owned())
-                    .child(div().flex_1())
+                    .child(SharedString::new_static(row.role.label()))
                     .child(
                         div()
                             .font_weight(FontWeight::NORMAL)
                             .text_color(self.tone(0x9da5a4, 0x6a7279))
-                            .child(timestamp(row.time)),
+                            .child(timestamp_text),
                     ),
             )
-            .child(direct_body.unwrap_or_else(|| body.into_any_element()))
+            .child(body_element)
     }
 
     fn load_earlier_row(&self, cursor: String, loading: bool, cx: &Context<Self>) -> Stateful<Div> {
@@ -7525,6 +7305,9 @@ impl Client {
                     .aria_label("Load earlier messages")
                     .track_focus(&self.history_focus)
                     .focus_visible(|style| style.border_color(self.tone(0x2356a8, 0x78baff)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        GlobalState::suppress_text_selection(cx);
+                    })
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                             this.load_earlier(&key_id, &key_cursor, cx);
@@ -7946,7 +7729,8 @@ impl Client {
         let session = self.active.clone();
         let following = self.follow_bottom;
         let generation = self.connection_generation;
-        let rendered_top = scroll.top_item();
+        let rendered_logical_top = scroll.logical_scroll_top();
+        let rendered_sticky = self.sticky_user_index();
         // GTK reserves a permanent 14px gutter for the transcript scrollbar.
         let mut rows = div()
             .on_children_prepainted(move |_, window, cx| {
@@ -7954,7 +7738,7 @@ impl Client {
                 // or content extents. A late Markdown/image layout can grow the
                 // content after the one-shot bottom request was consumed.
                 let at_bottom = scroll.offset().y <= -scroll.max_offset().y;
-                if following != at_bottom || scroll.top_item() != rendered_top {
+                if following != at_bottom || scroll.logical_scroll_top() != rendered_logical_top {
                     let client = client.clone();
                     let session = session.clone();
                     window.defer(cx, move |_, cx| {
@@ -7973,10 +7757,14 @@ impl Client {
                             {
                                 this.follow_bottom = true;
                             }
-                            if request_bottom
-                                || was_following != this.follow_bottom
-                                || this.scroll.top_item() != rendered_top
-                            {
+                            let current_sticky = this.sticky_user_index();
+                            if should_notify_after_transcript_prepaint(
+                                request_bottom,
+                                was_following,
+                                this.follow_bottom,
+                                rendered_sticky,
+                                current_sticky,
+                            ) {
                                 // Only render may issue the native bottom request,
                                 // using the latest follow flag immediately before
                                 // prepaint. Never leave one queued across input.
@@ -7999,50 +7787,65 @@ impl Client {
             // Overflow itself establishes the block formatting context. Rows
             // have natural heights and do not need flex size distribution.
             .block();
-        let sticky = self.sticky_user_row().map(|row| {
-            div()
-                .id("sticky-user")
-                .test_support()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
-                .min_h(px(106.))
-                .max_h(px(226.))
-                .px(px(28.))
-                .pt(px(18.))
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .bg(self.tone(0xf4f1eb, 0x101214))
-                .border_b_1()
-                .border_color(self.tone(0xc8c3ba, 0x343a3f))
-                .shadow_sm()
-                .child(
-                    div()
-                        .flex()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(self.tone(0x666f76, 0x8d959d))
-                        .child("YOU")
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(self.tone(0x9da5a4, 0x6a7279))
-                                .child(timestamp(row.time)),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("sticky-body")
-                        .test_support()
-                        .max_h(px(180.))
-                        .overflow_y_scroll()
-                        .child(row.body.clone()),
-                )
-                .into_any_element()
-        });
+        let sticky = rendered_sticky
+            .and_then(|index| {
+                let row = self.transcript.get(&self.active)?.get(index)?;
+                let cached = self
+                    .transcript_row_cache
+                    .get(&self.active)
+                    .and_then(|entries| entries.get(index));
+                Some((row, cached))
+            })
+            .map(|(row, cached)| {
+                let body_text = cached
+                    .map(|entry| entry.body.clone())
+                    .unwrap_or_else(|| SharedString::from(row.body.clone()));
+                let timestamp_text = cached
+                    .map(|entry| entry.timestamp.clone())
+                    .unwrap_or_else(|| SharedString::from(timestamp(row.time)));
+                div()
+                    .id("sticky-user")
+                    .test_support()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right(self.scaled(TRANSCRIPT_SCROLLBAR_GUTTER))
+                    .min_h(px(106.))
+                    .max_h(px(226.))
+                    .px(px(28.))
+                    .pt(px(18.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .bg(self.tone(0xf4f1eb, 0x101214))
+                    .border_b_1()
+                    .border_color(self.tone(0xc8c3ba, 0x343a3f))
+                    .shadow_sm()
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(self.tone(0x666f76, 0x8d959d))
+                            .child("YOU")
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(self.tone(0x9da5a4, 0x6a7279))
+                                    .child(timestamp_text),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("sticky-body")
+                            .test_support()
+                            .max_h(px(180.))
+                            .overflow_y_scroll()
+                            .child(body_text),
+                    )
+                    .into_any_element()
+            });
         let has_load = self
             .conversations
             .get(&self.active)
@@ -8056,8 +7859,10 @@ impl Client {
             rows = rows.child(self.load_earlier_element(cursor, loading, cx));
         }
         if let Some(transcript) = self.transcript.get(&self.active) {
+            let cached_rows = self.transcript_row_cache.get(&self.active);
             for (index, row) in transcript.iter().enumerate() {
-                rows = rows.child(self.message_row(row, index, cx));
+                let cached = cached_rows.and_then(|entries| entries.get(index));
+                rows = rows.child(self.message_row(row, cached, index, cx));
             }
         }
         div()
@@ -8071,7 +7876,7 @@ impl Client {
             .into_any_element()
     }
 
-    fn sticky_user_row(&self) -> Option<&TranscriptRow> {
+    fn sticky_user_index(&self) -> Option<usize> {
         let transcript = self.transcript.get(&self.active)?;
         let has_load = self
             .conversations
@@ -8079,7 +7884,6 @@ impl Client {
             .is_some_and(|conversation| conversation.next_cursor.is_some());
         let (top, displacement) = self.scroll.logical_scroll_top();
         sticky_user_index(transcript, top, has_load, displacement == px(0.))
-            .and_then(|index| transcript.get(index))
     }
 
     fn resume_warning(&self, cx: &Context<Self>) -> Option<String> {
@@ -10344,6 +10148,13 @@ impl Render for Client {
             });
         }
         self.dark = Theme::global(cx).is_dark();
+        if self
+            .text_view_style
+            .as_ref()
+            .is_none_or(|(dark, _)| *dark != self.dark)
+        {
+            self.text_view_style = Some((self.dark, transcript_text_view_style(self.dark, cx)));
+        }
         if !self.sidebar_zoom_initialized || self.sidebar_zoom_width != window.viewport_size().width
         {
             self.reconcile_zoom_sidebar(window);
@@ -10701,6 +10512,16 @@ impl Render for Client {
                 }
             }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if event.button == MouseButton::Left
+                    && should_suppress_window_selection(
+                        this.modal.is_some(),
+                        this.scroll.bounds(),
+                        this.scaled(TRANSCRIPT_SCROLLBAR_GUTTER),
+                        event.position,
+                    )
+                {
+                    GlobalState::suppress_text_selection(cx);
+                }
                 if this.modal.is_none() && this.scroll.bounds().contains(&event.position) {
                     // Yield to scrollbar dragging and selection before the
                     // next render can issue another follow-bottom request.
@@ -11198,15 +11019,16 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        COMPLEX_MARKDOWN_PREVIEW, LONG_ORDERED_LIST_PREVIEW, MarkdownBlock, SESSION_PICKER_LIMIT,
+        COMPLEX_MARKDOWN_PREVIEW, LONG_ORDERED_LIST_PREVIEW, MarkdownSegment, SESSION_PICKER_LIMIT,
         TabAttention, filter_all_sessions, filter_levels, filter_models,
         filter_new_session_projects, filter_tab_sessions, frame_resize_edge, fuzzy_score,
-        markdown_blocks, markdown_view_id, model, needs_new_connection, new_session_choice,
-        picker_list_height, reorder_tab_ids, safe_connection_error, splice_transcript,
-        sticky_user_index, tab_indicator, tab_number_key, unread_on_server_switch,
-        update_session_projection,
+        markdown_segments, markdown_view_id, model, needs_new_connection, new_session_choice,
+        picker_list_height, reconcile_row_cache, reorder_tab_ids, safe_connection_error,
+        should_notify_after_transcript_prepaint, should_suppress_window_selection,
+        splice_transcript, sticky_user_index, tab_indicator, tab_number_key,
+        unread_on_server_switch, update_session_projection,
     };
-    use gpui_kit::{ResizeEdge, Tiling, WindowBackgroundAppearance, point, px, size};
+    use gpui_kit::{Bounds, ResizeEdge, Tiling, WindowBackgroundAppearance, point, px, size};
     use opencode_gpui::model::RunStatus;
     use opencode_gpui::persist::PersistedState;
     use opencode_gpui::protocol;
@@ -12366,102 +12188,215 @@ mod tests {
     }
 
     #[test]
-    fn heading_list_and_fenced_code_keep_their_content() {
+    fn heading_list_and_fenced_code_consolidate_contiguous_markdown() {
         assert_eq!(
-            markdown_blocks(
+            markdown_segments(
                 "# Padding\n\nDraw it at **22px**.\n\n- inner\n- outer\n\n```rust\npaperclip_icon(22)\n```"
             ),
             vec![
-                MarkdownBlock::Heading(1, "Padding".into()),
-                MarkdownBlock::Paragraph("Draw it at **22px**.".into()),
-                MarkdownBlock::List(vec!["inner".into(), "outer".into()]),
-                MarkdownBlock::Code("rust".into(), "paperclip_icon(22)".into()),
+                MarkdownSegment::Markdown(
+                    "# Padding\n\nDraw it at **22px**.\n\n- inner\n- outer".into()
+                ),
+                MarkdownSegment::Code {
+                    language: "rust".into(),
+                    content: "paperclip_icon(22)".into(),
+                    list_depth: 0,
+                    quote_depth: 0,
+                },
             ]
         );
     }
 
     #[test]
-    fn complex_markdown_preserves_structure_and_copy_code() {
+    fn complex_markdown_preserves_structure_copy_code_and_offline_images() {
         let source = "> A quoted line\n\n1. Ordered item\n   - Nested item\n\n| Name | Value |\n| --- | --- |\n| clip | 22px |\n\n```rust\nlet x = 22;\n```\n\n- [x] done";
-        let blocks = markdown_blocks(source);
-        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, quote_depth: 1, .. } if content == "A quoted line")));
-        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, marker: Some(marker), list_depth: 1, .. } if content == "Ordered item" && marker == "1.")));
-        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, marker: Some(marker), list_depth: 2, .. } if content == "Nested item" && marker == "•")));
-        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Table { header, rows } if header == &["Name", "Value"] && rows == &[vec!["clip", "22px"]])));
-        assert!(blocks.contains(&MarkdownBlock::Code("rust".into(), "let x = 22;".into())));
-        assert!(blocks.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "[x] done")));
-        assert!(markdown_blocks(COMPLEX_MARKDOWN_PREVIEW)
-            .iter()
-            .any(|block| matches!(block, MarkdownBlock::Code(language, code) if language == "rust" && code.contains("paperclip_icon"))));
-        assert!(
-            markdown_blocks("   ```rust\nlet x = 22;\n   ```")
-                .contains(&MarkdownBlock::Code("rust".into(), "let x = 22;".into()))
-        );
-        assert!(
-            markdown_blocks("~~~sh\necho ok\n~~~")
-                .contains(&MarkdownBlock::Code("sh".into(), "echo ok".into()))
-        );
-        assert!(markdown_blocks("- parent\n\n      code line").iter().any(
-            |block| matches!(block, MarkdownBlock::NestedCode { content, list_depth: 1, .. } if content.contains("code line"))
-        ));
-        let nested = markdown_blocks(
-            "> ```rust\n> let x = 22;\n> ```\n\n![clip](https://example.com/clip.png)",
-        );
-        assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::NestedCode { language, content, quote_depth: 1, .. } if language == "rust" && content == "let x = 22;")));
-        assert!(nested.iter().any(|block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "Image: clip")));
-        assert!(markdown_blocks("> \\*literal\\* and **strong**")
-            .iter()
-            .any(|block| matches!(block, MarkdownBlock::Structured { content, quote_depth: 1, .. } if content == "\\*literal\\* and **strong**")));
-        assert!(markdown_blocks("> &amp;copy;").iter().any(
-            |block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "&amp;copy;")
-        ));
-        assert!(markdown_blocks("> <b>bold</b>").iter().any(
-            |block| matches!(block, MarkdownBlock::Structured { content, .. } if content == "<b>bold</b>")
+        let segments = markdown_segments(source);
+        assert_eq!(segments.len(), 3);
+        assert!(matches!(
+            &segments[0],
+            MarkdownSegment::Markdown(text)
+                if text.contains("> A quoted line")
+                    && text.contains("1. Ordered item")
+                    && text.contains("- Nested item")
+                    && text.contains("| Name | Value |")
         ));
         assert_eq!(
-            super::escape_markdown_literal("*literal* [bracket]"),
-            "\\*literal\\* \\[bracket\\]"
+            segments[1],
+            MarkdownSegment::Code {
+                language: "rust".into(),
+                content: "let x = 22;".into(),
+                list_depth: 0,
+                quote_depth: 0,
+            }
         );
-        assert!(super::heading_is_block_marker("- item"));
-        assert!(super::heading_is_block_marker("# Heading"));
-        assert!(!super::heading_is_block_marker("**Important**"));
+        assert_eq!(segments[2], MarkdownSegment::Markdown("- [x] done".into()));
+
+        assert!(markdown_segments(COMPLEX_MARKDOWN_PREVIEW).iter().any(
+            |segment| matches!(segment, MarkdownSegment::Code { language, content, .. } if language == "rust" && content.contains("paperclip_icon"))
+        ));
+        assert_eq!(
+            markdown_segments("   ```rust\nlet x = 22;\n   ```"),
+            vec![MarkdownSegment::Code {
+                language: "rust".into(),
+                content: "let x = 22;".into(),
+                list_depth: 0,
+                quote_depth: 0,
+            }]
+        );
+        assert_eq!(
+            markdown_segments("~~~sh\necho ok\n~~~"),
+            vec![MarkdownSegment::Code {
+                language: "sh".into(),
+                content: "echo ok".into(),
+                list_depth: 0,
+                quote_depth: 0,
+            }]
+        );
+        assert!(markdown_segments("- parent\n\n      code line").iter().any(
+            |segment| matches!(segment, MarkdownSegment::Code { content, list_depth: 1, quote_depth: 0, .. } if content.contains("code line"))
+        ));
+        let nested = markdown_segments(
+            "> ```rust\n> let x = 22;\n> ```\n\n![clip](https://example.com/clip.png)",
+        );
+        assert!(nested.iter().any(|segment| matches!(
+            segment,
+            MarkdownSegment::Code {
+                language,
+                content,
+                list_depth: 0,
+                quote_depth: 1,
+            } if language == "rust" && content == "let x = 22;"
+        )));
+        assert!(nested.iter().any(|segment| matches!(
+            segment,
+            MarkdownSegment::Markdown(text) if text.as_ref() == "Image: clip"
+        )));
+        assert_eq!(
+            markdown_segments("> \\*literal\\* and **strong**"),
+            vec![MarkdownSegment::Markdown(
+                "> \\*literal\\* and **strong**".into()
+            )]
+        );
+        assert_eq!(
+            markdown_segments("> &amp;copy;"),
+            vec![MarkdownSegment::Markdown("> &amp;copy;".into())]
+        );
+        assert_eq!(
+            markdown_segments("> <b>bold</b>"),
+            vec![MarkdownSegment::Markdown("> <b>bold</b>".into())]
+        );
     }
 
     #[test]
-    fn linked_ordered_list_items_have_distinct_stable_markdown_views() {
+    fn linked_ordered_list_consolidates_into_one_stable_markdown_view() {
         let row = cache_row("long_list", LONG_ORDERED_LIST_PREVIEW);
-        let blocks = markdown_blocks(LONG_ORDERED_LIST_PREVIEW);
-        let list_items = blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, block)| {
-                if let MarkdownBlock::Structured {
-                    marker: Some(marker),
-                    content,
-                    ..
-                } = block
-                {
-                    Some((index, marker, content))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(list_items.len(), 4);
-        let ids = list_items
-            .iter()
-            .map(|(index, _, _)| markdown_view_id("ses_one", &row.key, *index, 0))
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            ids.len(),
-            list_items.len(),
-            "each list item needs its own parser state"
+        let segments = markdown_segments(LONG_ORDERED_LIST_PREVIEW);
+        assert_eq!(segments.len(), 1);
+        assert!(
+            matches!(&segments[0], MarkdownSegment::Markdown(text) if text.contains("1. **User-row") && text.contains("4. **Header"))
         );
-        assert!(list_items.iter().all(|(_, _, content)| !content.is_empty()));
         assert_ne!(
-            markdown_view_id("ses_one", &row.key, list_items[0].0, 0),
-            markdown_view_id("ses_two", &row.key, list_items[0].0, 0)
+            markdown_view_id("ses_one", &row.key, 0, 0),
+            markdown_view_id("ses_two", &row.key, 0, 0)
         );
+    }
+
+    #[test]
+    fn row_cache_reuses_unchanged_rows_and_reparses_only_mutated_rows() {
+        let mut rows = vec![
+            cache_row("m1", "First **paragraph**"),
+            cache_row("m2", "Second paragraph\n\n```rust\nlet a = 1;\n```"),
+        ];
+        for row in &mut rows {
+            row.role = model::Role::Assistant;
+            row.render_revision = 1;
+        }
+        let mut cache = Vec::new();
+        reconcile_row_cache(&rows, &mut cache);
+        assert_eq!(cache.len(), 2);
+        let first_arc = std::sync::Arc::clone(&cache[0].segments);
+        let second_arc = std::sync::Arc::clone(&cache[1].segments);
+        assert_eq!(first_arc.len(), 1);
+        assert_eq!(second_arc.len(), 2);
+
+        // Mutate only the tail row (streaming update) and prepend an older row.
+        rows[1].body.push_str("\n\nTail");
+        rows[1].render_revision = 2;
+        let mut older = cache_row("m0", "Older");
+        older.role = model::Role::Assistant;
+        older.render_revision = 1;
+        rows.insert(0, older);
+
+        reconcile_row_cache(&rows, &mut cache);
+        assert_eq!(cache.len(), 3);
+        assert!(std::sync::Arc::ptr_eq(&cache[1].segments, &first_arc));
+        assert!(!std::sync::Arc::ptr_eq(&cache[2].segments, &second_arc));
+        assert_eq!(cache[2].segments.len(), 3);
+    }
+
+    #[test]
+    fn window_selection_suppression_covers_chrome_modals_and_scrollbar_gutter() {
+        let scroll = Bounds {
+            origin: point(px(240.), px(46.)),
+            size: size(px(540.), px(700.)),
+        };
+        let gutter = px(14.);
+        // Inside selectable transcript text.
+        assert!(!should_suppress_window_selection(
+            false,
+            scroll,
+            gutter,
+            point(px(300.), px(200.))
+        ));
+        // Over the scrollbar gutter at the right edge of the transcript.
+        assert!(should_suppress_window_selection(
+            false,
+            scroll,
+            gutter,
+            point(px(770.), px(200.))
+        ));
+        // Sidebar / chrome outside transcript bounds.
+        assert!(should_suppress_window_selection(
+            false,
+            scroll,
+            gutter,
+            point(px(80.), px(650.))
+        ));
+        // Any click while a modal is open.
+        assert!(should_suppress_window_selection(
+            true,
+            scroll,
+            gutter,
+            point(px(300.), px(200.))
+        ));
+    }
+
+    #[test]
+    fn prepaint_notify_skips_redundant_redraw_when_sticky_and_follow_unchanged() {
+        assert!(!should_notify_after_transcript_prepaint(
+            false,
+            true,
+            true,
+            Some(0),
+            Some(0)
+        ));
+        assert!(should_notify_after_transcript_prepaint(
+            false,
+            true,
+            true,
+            Some(0),
+            Some(3)
+        ));
+        assert!(should_notify_after_transcript_prepaint(
+            true,
+            true,
+            true,
+            Some(0),
+            Some(0)
+        ));
+        assert!(should_notify_after_transcript_prepaint(
+            false, false, true, None, None
+        ));
     }
 
     #[test]
