@@ -1234,6 +1234,8 @@ pub enum ApiErrorKind {
     Forbidden,
     /// 404.
     SessionNotFound,
+    /// 404; directory no longer exists on the server host.
+    LocationNotFound,
     /// 404.
     MessageNotFound,
     /// 404; also when the request belongs to another session.
@@ -1263,6 +1265,7 @@ impl ApiError {
             Some("UnauthorizedError") => ApiErrorKind::Unauthorized,
             Some("ForbiddenError") => ApiErrorKind::Forbidden,
             Some("SessionNotFoundError") => ApiErrorKind::SessionNotFound,
+            Some("LocationNotFoundError") => ApiErrorKind::LocationNotFound,
             Some("MessageNotFoundError") => ApiErrorKind::MessageNotFound,
             Some("PermissionNotFoundError") => ApiErrorKind::PermissionNotFound,
             Some("FormNotFoundError") => ApiErrorKind::FormNotFound,
@@ -3201,6 +3204,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unauthorized.kind(), ApiErrorKind::Unauthorized);
+        let missing_location = decode_error_body(
+            br#"{"_tag":"LocationNotFoundError","location":{"directory":"/tmp/gone"},"message":"Location not found: /tmp/gone"}"#,
+        )
+        .unwrap();
+        assert_eq!(missing_location.kind(), ApiErrorKind::LocationNotFound);
         assert_eq!(
             decode_error_body(br#"{"_tag":"BrandNewError"}"#)
                 .unwrap()

@@ -21,7 +21,10 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use gpui_kit::{Animation, Transformation, percentage};
 use opencode_gpui::{
-    api::{ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ServerEnvelope, UiEvent},
+    api::{
+        ApiConfig, ApiHandle, Command, InboxRequest, MessageLoadError, ModelLoadError,
+        ServerEnvelope, UiEvent,
+    },
     background, cpu_profile,
     credentials::{self, CloudflareAccessCredentials, PasswordTarget, SystemKeyring},
     fonts::{self, MONO_FONT_FAMILY, UI_FONT_FAMILY},
@@ -116,6 +119,12 @@ fn unread_on_server_switch(
         .get(next_key)
         .map(|saved| saved.unread.clone())
         .unwrap_or_default()
+}
+
+fn merge_sessions_created_during_bootstrap(sessions: &mut Vec<Session>, created: Vec<Session>) {
+    for session in created {
+        model::SessionChange::Created(session).apply(sessions);
+    }
 }
 
 fn apply_missed_idle(
@@ -917,6 +926,9 @@ struct Client {
     bootstrap_retry_scheduled: bool,
     bootstrap_retry_count: u8,
     bootstrap_events: Vec<ServerEnvelope>,
+    /// Root sessions created locally via `POST /api/session` while a bootstrap
+    /// snapshot was already in flight, so a stale snapshot cannot drop the tab.
+    created_during_bootstrap: Vec<Session>,
     bootstrap_directories: Vec<String>,
     refresh_open_tabs: bool,
     settings: SettingsFields,
@@ -2612,6 +2624,7 @@ impl Client {
             bootstrap_retry_scheduled: false,
             bootstrap_retry_count: 0,
             bootstrap_events: Vec::new(),
+            created_during_bootstrap: Vec::new(),
             bootstrap_directories: Vec::new(),
             refresh_open_tabs: false,
             settings: SettingsFields::new(window, cx, state.clone(), config.clone()),
@@ -3919,6 +3932,7 @@ impl Client {
         self.bootstrap_retry_scheduled = false;
         self.bootstrap_retry_count = 0;
         self.bootstrap_events.clear();
+        self.created_during_bootstrap.clear();
         self.refresh_open_tabs = false;
         self.projects.clear();
         self.active.clear();
@@ -4718,6 +4732,7 @@ impl Client {
         let Some(api) = &self.api else { return };
         self.bootstrap_in_flight = true;
         self.bootstrap_events.clear();
+        self.created_during_bootstrap.clear();
         let mut directories = self.bootstrap_directories.clone();
         directories.extend(self.active_directories());
         directories.sort();
@@ -5285,8 +5300,13 @@ impl Client {
                         self.settings.warning.is_some(),
                     );
                 }
+                let created_during_bootstrap = std::mem::take(&mut self.created_during_bootstrap);
                 if data.sessions_complete {
                     self.sessions = data.sessions;
+                    merge_sessions_created_during_bootstrap(
+                        &mut self.sessions,
+                        created_during_bootstrap,
+                    );
                     let removed: Vec<String> = self
                         .open_tabs
                         .iter()
@@ -5311,6 +5331,10 @@ impl Client {
                             self.sessions.push(session);
                         }
                     }
+                    merge_sessions_created_during_bootstrap(
+                        &mut self.sessions,
+                        created_during_bootstrap,
+                    );
                 }
                 let observed_busy: Vec<_> = data
                     .statuses
@@ -5485,6 +5509,7 @@ impl Client {
                 }
             }
             UiEvent::Bootstrap(Err(_)) => {
+                self.created_during_bootstrap.clear();
                 self.connection_status = "Refresh failed · retrying".into();
                 self.replay_bootstrap_events(cx);
                 self.schedule_bootstrap_retry(cx);
@@ -5613,18 +5638,47 @@ impl Client {
                     .any(|session| session.id == self.active && session.directory == directory)
                 {
                     self.catalog = catalog;
+                    if !self.disconnected && self.connection_status.starts_with("Models failed:") {
+                        self.connection_status = connected_status(
+                            self.server_version.as_deref(),
+                            false,
+                            self.settings.warning.is_some(),
+                        );
+                    }
                 }
             }
             UiEvent::ModelsLoaded {
                 directory,
                 result: Err(error),
             } => {
-                self.connection_status = format!("Models failed: {error}");
-                self.schedule_empty_catalog_retry(directory, cx);
+                let is_active_dir = self
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == self.active && session.directory == directory);
+                if is_active_dir {
+                    self.connection_status = format!("Models failed: {error}");
+                }
+                match error {
+                    ModelLoadError::LocationNotFound(_) => {
+                        self.model_retry_count.remove(&directory);
+                        self.model_retry_scheduled.remove(&directory);
+                    }
+                    ModelLoadError::Failed(_) => {
+                        self.schedule_empty_catalog_retry(directory, cx);
+                    }
+                }
             }
             UiEvent::SessionCreated { request_id, result } => match result {
                 Ok(session) => {
                     let id = session.id.clone();
+                    if self.bootstrap_in_flight
+                        && !self
+                            .created_during_bootstrap
+                            .iter()
+                            .any(|existing| existing.id == id)
+                    {
+                        self.created_during_bootstrap.push(session.clone());
+                    }
                     // The SSE creation can arrive before the POST response;
                     // fill an SSE placeholder from the response without
                     // replacing a title already changed by a later event.
@@ -6205,6 +6259,7 @@ impl Client {
             bootstrap_retry_scheduled: false,
             bootstrap_retry_count: 0,
             bootstrap_events: Vec::new(),
+            created_during_bootstrap: Vec::new(),
             bootstrap_directories: Vec::new(),
             refresh_open_tabs: false,
             settings: SettingsFields::new(
@@ -12091,6 +12146,36 @@ mod tests {
         );
         assert_eq!(selected.provider_id, "openrouter");
         assert_eq!(selected.model_id, "google/gemini-preview");
+    }
+
+    #[test]
+    fn bootstrap_merge_keeps_sessions_created_while_snapshot_was_in_flight() {
+        let session = |id: &str, title: &str, updated: u64| model::Session {
+            id: id.into(),
+            directory: "/repo".into(),
+            title: title.into(),
+            time: model::SessionTime {
+                created: updated,
+                updated,
+                archived: None,
+            },
+            parent_id: None,
+            model: None,
+        };
+        let existing = session("ses_old", "Old", 10);
+        let created = session("ses_new", "Untitled session", 20);
+        let mut sessions = vec![existing];
+        let mut open_tabs = vec!["ses_old".to_owned(), "ses_new".to_owned()];
+
+        super::merge_sessions_created_during_bootstrap(&mut sessions, vec![created.clone()]);
+        open_tabs.retain(|id| sessions.iter().any(|session| &session.id == id));
+
+        assert_eq!(open_tabs, vec!["ses_old", "ses_new"]);
+        assert_eq!(sessions.len(), 2);
+
+        // If the snapshot already contained the new session, merging does not duplicate it.
+        super::merge_sessions_created_during_bootstrap(&mut sessions, vec![created]);
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]

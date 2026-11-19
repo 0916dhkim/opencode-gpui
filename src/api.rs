@@ -233,6 +233,32 @@ impl std::fmt::Display for MessageLoadError {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModelLoadError {
+    /// The location directory no longer exists on the server host, so retrying
+    /// will not help.
+    LocationNotFound(String),
+    Failed(String),
+}
+
+impl ModelLoadError {
+    fn from_error(error: anyhow::Error) -> Self {
+        if is_location_not_found(&error) {
+            Self::LocationNotFound(format_error(error))
+        } else {
+            Self::Failed(format_error(error))
+        }
+    }
+}
+
+impl std::fmt::Display for ModelLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocationNotFound(message) | Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ServerEnvelope {
     pub directory: Option<String>,
@@ -253,7 +279,7 @@ pub enum UiEvent {
     },
     ModelsLoaded {
         directory: String,
-        result: Result<ModelCatalog, String>,
+        result: Result<ModelCatalog, ModelLoadError>,
     },
     SessionCreated {
         request_id: u64,
@@ -759,6 +785,9 @@ impl Api {
                         }
                     }
                 }
+                Err(error) if is_location_not_found(&error) => {
+                    snapshot.covered.insert(directory.clone());
+                }
                 Err(error) => snapshot.warnings.push(format!(
                     "Could not list running shell commands in {directory}: {error:#}"
                 )),
@@ -821,6 +850,9 @@ impl Api {
                         }
                     }
                 }
+                Err(error) if is_location_not_found(&error) => {
+                    listed += 1;
+                }
                 Err(error) => {
                     snapshot.complete = false;
                     snapshot.warnings.push(format!(
@@ -841,6 +873,9 @@ impl Api {
                             }));
                         }
                     }
+                }
+                Err(error) if is_location_not_found(&error) => {
+                    listed += 1;
                 }
                 Err(error) => {
                     snapshot.complete = false;
@@ -1259,7 +1294,9 @@ fn spawn_command_worker(api: Api, commands: Receiver<Command>, ui: Sender<UiEven
                     }
                 }
                 Command::LoadModels { directory } => {
-                    let result = api.load_models(&directory).map_err(format_error);
+                    let result = api
+                        .load_models(&directory)
+                        .map_err(ModelLoadError::from_error);
                     UiEvent::ModelsLoaded { directory, result }
                 }
                 Command::CreateSession {
@@ -1623,12 +1660,28 @@ fn is_stale_inbox_item(error: &anyhow::Error) -> bool {
         })
 }
 
+/// A declared `LocationNotFoundError`: the directory does not exist on the
+/// server host. A bare 404 (a proxy, a missing route) is still an error.
+fn is_location_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<ApiFailure>())
+        .any(ApiFailure::is_location_not_found)
+}
+
 impl ApiFailure {
     /// A declared `SessionNotFoundError`; a bare 404 (e.g. from a proxy) is not.
     pub fn is_session_not_found(&self) -> bool {
         self.error
             .as_ref()
             .is_some_and(|error| error.kind() == protocol::ApiErrorKind::SessionNotFound)
+    }
+
+    /// A declared `LocationNotFoundError`; a bare 404 (e.g. from a proxy) is not.
+    pub fn is_location_not_found(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(|error| error.kind() == protocol::ApiErrorKind::LocationNotFound)
     }
 }
 
@@ -3269,6 +3322,58 @@ mod tests {
         assert_eq!(
             format_error(error),
             "server returned 502 Bad Gateway: bad gateway"
+        );
+    }
+
+    #[test]
+    fn location_not_found_is_treated_as_empty_for_pending_shells_and_non_retryable_for_models() {
+        let missing = |directory: &str| {
+            (
+                404,
+                json!({
+                    "_tag": "LocationNotFoundError",
+                    "location": { "directory": directory },
+                    "message": format!("Location not found: {directory}")
+                })
+                .to_string(),
+            )
+        };
+        let (base, _, server) = serve(4, move |request| {
+            let dir = request
+                .query()
+                .get("location[directory]")
+                .cloned()
+                .unwrap_or_default();
+            match request.path() {
+                "/api/permission/request" | "/api/form" | "/api/shell" | "/api/model" => {
+                    missing(&dir)
+                }
+                _ => panic!("unexpected request: {}", request.line),
+            }
+        });
+        let api = Api::new(config(base, None)).unwrap();
+        let dirs = vec!["/private/var/gone".to_owned()];
+
+        let pending = api.load_pending(&dirs);
+        assert!(
+            pending.complete,
+            "missing location must not force bootstrap retries"
+        );
+        assert!(pending.warnings.is_empty(), "{:?}", pending.warnings);
+        assert!(pending.covered.contains("/private/var/gone"));
+
+        let shells = api.load_shells(&dirs);
+        assert!(shells.warnings.is_empty(), "{:?}", shells.warnings);
+        assert!(shells.covered.contains("/private/var/gone"));
+
+        let model_error =
+            ModelLoadError::from_error(api.load_models("/private/var/gone").unwrap_err());
+        server.join().unwrap();
+        assert_eq!(
+            model_error,
+            ModelLoadError::LocationNotFound(
+                "failed to load models: Location not found: /private/var/gone".into()
+            )
         );
     }
 
