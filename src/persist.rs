@@ -1,15 +1,24 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ModelSelection;
+
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PersistedState {
@@ -129,7 +138,13 @@ impl PersistedState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let temporary = parent.join(format!(".state.json.{}.{}.tmp", std::process::id(), nonce));
+        let seq = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".state.json.{}.{}.{}.tmp",
+            std::process::id(),
+            nonce,
+            seq
+        ));
         let contents = serde_json::to_vec_pretty(self).context("failed to serialize state")?;
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -148,6 +163,144 @@ impl PersistedState {
         fs::rename(&temporary, path)
             .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
+    }
+}
+
+struct SaveJob {
+    path: PathBuf,
+    state: PersistedState,
+    reply: Option<mpsc::SyncSender<Result<()>>>,
+}
+
+#[derive(Default)]
+struct SaveQueue {
+    jobs: VecDeque<SaveJob>,
+    closed: bool,
+}
+
+/// Serialized off-UI state writer. Keeps `file.sync_all()` and atomic rename
+/// off the GPUI thread, coalesces superseded async snapshots for the same path,
+/// and serializes synchronous Settings saves behind any in-flight write.
+pub struct StateSaver {
+    shared: Arc<(Mutex<SaveQueue>, Condvar)>,
+    errors: Sender<String>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl StateSaver {
+    pub fn start() -> (Self, Receiver<String>) {
+        let shared = Arc::new((Mutex::new(SaveQueue::default()), Condvar::new()));
+        let (errors, receiver) = async_channel::bounded(16);
+        let worker_shared = Arc::clone(&shared);
+        let worker_errors = errors.clone();
+        let worker = thread::Builder::new()
+            .name("opencode-state-save".into())
+            .spawn(move || run_save_worker(worker_shared, worker_errors))
+            .ok();
+        (
+            Self {
+                shared,
+                errors,
+                worker,
+            },
+            receiver,
+        )
+    }
+
+    pub fn enqueue(&self, path: PathBuf, state: PersistedState) {
+        if self.worker.is_none() {
+            if let Err(error) = state.save(&path) {
+                let _ = self.errors.try_send(error.to_string());
+            }
+            return;
+        }
+        let (lock, ready) = &*self.shared;
+        let mut queue = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        if queue.closed {
+            return;
+        }
+        if let Some(existing) = queue
+            .jobs
+            .iter_mut()
+            .rev()
+            .find(|job| job.path == path)
+            .filter(|job| job.reply.is_none())
+        {
+            existing.state = state;
+        } else {
+            queue.jobs.push_back(SaveJob {
+                path,
+                state,
+                reply: None,
+            });
+        }
+        ready.notify_one();
+    }
+
+    pub fn save_sync(&self, path: PathBuf, state: PersistedState) -> Result<()> {
+        if self.worker.is_none() {
+            return state.save(&path);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        {
+            let (lock, ready) = &*self.shared;
+            let mut queue = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+            if queue.closed {
+                drop(queue);
+                return state.save(&path);
+            }
+            // Drop any superseded queued async writes for the same path; any
+            // already-in-flight write finishes on the worker before this job runs.
+            queue
+                .jobs
+                .retain(|job| !(job.path == path && job.reply.is_none()));
+            queue.jobs.push_back(SaveJob {
+                path,
+                state,
+                reply: Some(tx),
+            });
+            ready.notify_one();
+        }
+        rx.recv()
+            .context("state saver worker exited before reply")?
+    }
+}
+
+impl Drop for StateSaver {
+    fn drop(&mut self) {
+        {
+            let (lock, ready) = &*self.shared;
+            let mut queue = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+            queue.closed = true;
+            ready.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_save_worker(shared: Arc<(Mutex<SaveQueue>, Condvar)>, errors: Sender<String>) {
+    let (lock, ready) = &*shared;
+    loop {
+        let job = {
+            let mut queue = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+            while queue.jobs.is_empty() && !queue.closed {
+                queue = ready
+                    .wait(queue)
+                    .unwrap_or_else(|poison| poison.into_inner());
+            }
+            match queue.jobs.pop_front() {
+                Some(job) => job,
+                None => return,
+            }
+        };
+        let result = job.state.save(&job.path);
+        if let Some(reply) = job.reply {
+            let _ = reply.send(result);
+        } else if let Err(error) = result {
+            let _ = errors.try_send(error.to_string());
+        }
     }
 }
 
@@ -433,6 +586,70 @@ mod tests {
         assert_eq!(
             fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
             0o700
+        );
+    }
+
+    #[test]
+    fn state_saver_coalesces_async_writes_and_flushes_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let (saver, errors) = StateSaver::start();
+
+        for step in 1..=25 {
+            let state = PersistedState {
+                zoom_level: 1.0 + step as f64 * 0.05,
+                ..Default::default()
+            };
+            saver.enqueue(path.clone(), state);
+        }
+        drop(saver);
+
+        assert!(errors.try_recv().is_err());
+        let (loaded, warning) = PersistedState::load(&path).unwrap();
+        assert!(warning.is_none());
+        assert!((loaded.zoom_level - 2.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn state_saver_serializes_sync_save_after_queued_async_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let (saver, errors) = StateSaver::start();
+
+        let first = PersistedState {
+            zoom_level: 1.1,
+            ..Default::default()
+        };
+        saver.enqueue(path.clone(), first);
+
+        let second = PersistedState {
+            zoom_level: 1.4,
+            ..Default::default()
+        };
+        saver.save_sync(path.clone(), second).unwrap();
+
+        let (loaded, _) = PersistedState::load(&path).unwrap();
+        assert!((loaded.zoom_level - 1.4).abs() < 1e-9);
+        drop(saver);
+        assert!(errors.try_recv().is_err());
+    }
+
+    #[test]
+    fn state_saver_reports_async_write_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        // Blocking parent creation with a regular file forces save() to fail.
+        let blocker = directory.path().join("not-a-dir");
+        fs::write(&blocker, b"x").unwrap();
+        let bad_path = blocker.join("state.json");
+
+        let (saver, errors) = StateSaver::start();
+        saver.enqueue(bad_path, PersistedState::default());
+        drop(saver);
+
+        let error = errors.try_recv().expect("async error should be reported");
+        assert!(
+            error.contains("failed to create"),
+            "unexpected error: {error}"
         );
     }
 }

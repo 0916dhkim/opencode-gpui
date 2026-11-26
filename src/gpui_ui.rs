@@ -11,7 +11,7 @@ use base64::Engine;
 use gpui_kit::base::{
     Button as BaseButton, Checkbox, CheckboxIndicator, CheckboxState, FocusTrapElement,
     GlobalState, Theme as BaseTheme,
-    text::{TextView, TextViewStyle},
+    text::{TextView, TextViewState, TextViewStyle},
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement;
@@ -37,7 +37,7 @@ use opencode_gpui::{
     },
     notifications::{DesktopNotifications, notification_id, play_session_ready_sound},
     pending::{self, Forms, PendingRequest},
-    persist::{self, ConnectionSettings, PersistedState, PersistedTab},
+    persist::{self, ConnectionSettings, PersistedState, PersistedTab, StateSaver},
     preview, protocol,
     sidebar_motion::SidebarMotion,
     tab_drag::TabDragState,
@@ -510,14 +510,14 @@ impl Render for AnimatedIconView {
 struct TranscriptScrollbar {
     scroll: ScrollHandle,
     key: String,
-    seen_offset: Point<Pixels>,
+    seen_offset: Rc<Cell<Point<Pixels>>>,
 }
 
 impl TranscriptScrollbar {
     fn take_scroll_change(&mut self) -> bool {
         let offset = self.scroll.offset();
-        let changed = offset != self.seen_offset;
-        self.seen_offset = offset;
+        let changed = offset != self.seen_offset.get();
+        self.seen_offset.set(offset);
         changed
     }
 }
@@ -564,7 +564,28 @@ struct TranscriptPresentation {
     autoscrolling: bool,
     scroll_offset: Point<Pixels>,
     logical_top: (usize, Pixels),
+    sticky_user: Option<usize>,
     copied: Option<String>,
+}
+
+impl TranscriptPresentation {
+    /// Record the scroll offset and logical top that GPUI resolved during
+    /// prepaint (e.g. `scroll_to_bottom` clamping on a streaming delta) while
+    /// preserving the `sticky_user` that was actually rendered in that pass.
+    fn record_resolved_scroll(
+        &mut self,
+        session: &str,
+        connection: u64,
+        scroll_offset: Point<Pixels>,
+        logical_top: (usize, Pixels),
+        rendered_sticky: Option<usize>,
+    ) {
+        if self.session == session && self.connection == connection {
+            self.scroll_offset = scroll_offset;
+            self.logical_top = logical_top;
+            self.sticky_user = rendered_sticky;
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -574,32 +595,81 @@ struct EditorPresentation {
     focused: bool,
 }
 
-/// Client remains the shared controller. Sidebar observes it conservatively;
-/// transcript/editor receive only their explicit presentation inputs, so jobs,
-/// dialogs, typing and unrelated tab updates do not invalidate the transcript.
+/// Client remains the shared controller. Surfaces stay permanently mounted with
+/// `.cached(...)` and observe `Client` before `draw()` so dirty updates rebuild
+/// once in place instead of toggling uncached→cached and missing again on the
+/// next frame.
 struct ClientSurface {
     owner: WeakEntity<Client>,
     kind: ClientSurfaceKind,
     environment: Option<SurfaceEnvironment>,
-    transcript: Option<TranscriptPresentation>,
+    transcript: Rc<RefCell<Option<TranscriptPresentation>>>,
     editor: Option<EditorPresentation>,
     sidebar_phase: Option<f32>,
-    fresh: bool,
+    dirty_in_flight: bool,
     _subscription: Option<Subscription>,
 }
 
 impl ClientSurface {
-    fn new(owner: Entity<Client>, kind: ClientSurfaceKind, cx: &mut Context<Self>) -> Self {
-        let subscription = matches!(kind, ClientSurfaceKind::Sidebar | ClientSurfaceKind::Modal)
-            .then(|| cx.observe(&owner, |_, _, cx| cx.notify()));
+    fn new(
+        owner: Entity<Client>,
+        kind: ClientSurfaceKind,
+        transcript: Rc<RefCell<Option<TranscriptPresentation>>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscription = match kind {
+            ClientSurfaceKind::Sidebar | ClientSurfaceKind::Modal => {
+                Some(cx.observe(&owner, |surface, _, cx| {
+                    surface.dirty_in_flight = true;
+                    cx.notify();
+                }))
+            }
+            ClientSurfaceKind::Transcript => Some(cx.observe(&owner, |surface, owner, cx| {
+                let client = owner.read(cx);
+                let env = SurfaceEnvironment {
+                    dark: client.dark,
+                    zoom: client.zoom(),
+                    floating: false,
+                };
+                let next = client.transcript_presentation();
+                let env_changed = surface.environment != Some(env);
+                let transcript_changed = surface.transcript.borrow().as_ref() != Some(&next);
+                if env_changed || transcript_changed {
+                    surface.environment = Some(env);
+                    *surface.transcript.borrow_mut() = Some(next);
+                    surface.dirty_in_flight = true;
+                    cx.notify();
+                }
+            })),
+            ClientSurfaceKind::Editor => Some(cx.observe(&owner, |surface, owner, cx| {
+                let client = owner.read(cx);
+                let env = SurfaceEnvironment {
+                    dark: client.dark,
+                    zoom: client.zoom(),
+                    floating: false,
+                };
+                let next = client.editor_presentation();
+                let transition =
+                    client.composer_session != client.active || !client.draft_actions.is_empty();
+                if surface.environment != Some(env)
+                    || surface.editor.as_ref() != Some(&next)
+                    || transition
+                {
+                    surface.environment = Some(env);
+                    surface.editor = Some(next);
+                    surface.dirty_in_flight = true;
+                    cx.notify();
+                }
+            })),
+        };
         Self {
             owner: owner.downgrade(),
             kind,
             environment: None,
-            transcript: None,
+            transcript,
             editor: None,
             sidebar_phase: None,
-            fresh: true,
+            dirty_in_flight: false,
             _subscription: subscription,
         }
     }
@@ -607,6 +677,7 @@ impl ClientSurface {
 
 impl Render for ClientSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.dirty_in_flight = false;
         let kind = self.kind;
         let environment = self
             .environment
@@ -621,8 +692,8 @@ impl Render for ClientSurface {
                     let _span = latency::global().span(TraceOperation::TranscriptBuild, 1);
                     // The cached subtree is independently laid out; its root
                     // cannot rely on being a flex child of Client's column.
-                    // Preserve the same definite-height flex parent in both
-                    // fresh and retained modes, including scroll hit testing.
+                    // Preserve the same definite-height flex parent including
+                    // scroll hit testing.
                     div()
                         .size_full()
                         .flex()
@@ -653,19 +724,21 @@ impl Render for ClientSurface {
 struct ClientSurfaces {
     sidebar: Entity<ClientSurface>,
     transcript: Entity<ClientSurface>,
+    transcript_state: Rc<RefCell<Option<TranscriptPresentation>>>,
     editor: Entity<ClientSurface>,
     modal: Entity<ClientSurface>,
     scrollbar: Entity<TranscriptScrollbar>,
+    scrollbar_seen_offset: Rc<Cell<Point<Pixels>>>,
     _scrollbar_subscription: Rc<Subscription>,
 }
 
 impl ClientSurfaces {
     fn new(owner: Entity<Client>, scroll: ScrollHandle, cx: &mut App) -> Self {
-        let seen_offset = scroll.offset();
+        let scrollbar_seen_offset = Rc::new(Cell::new(scroll.offset()));
         let scrollbar = cx.new(|_| TranscriptScrollbar {
             scroll,
             key: String::new(),
-            seen_offset,
+            seen_offset: Rc::clone(&scrollbar_seen_offset),
         });
         let controller = owner.downgrade();
         let subscription = cx.observe(&scrollbar, move |scrollbar, cx| {
@@ -676,25 +749,57 @@ impl ClientSurfaces {
                 let _ = controller.update(cx, |_, cx| cx.notify());
             }
         });
+        let transcript_state = Rc::new(RefCell::new(None));
         Self {
-            sidebar: cx.new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Sidebar, cx)),
-            transcript: cx
-                .new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Transcript, cx)),
-            editor: cx.new(|cx| ClientSurface::new(owner.clone(), ClientSurfaceKind::Editor, cx)),
-            modal: cx.new(|cx| ClientSurface::new(owner, ClientSurfaceKind::Modal, cx)),
+            sidebar: cx.new(|cx| {
+                ClientSurface::new(
+                    owner.clone(),
+                    ClientSurfaceKind::Sidebar,
+                    Rc::new(RefCell::new(None)),
+                    cx,
+                )
+            }),
+            transcript: cx.new(|cx| {
+                ClientSurface::new(
+                    owner.clone(),
+                    ClientSurfaceKind::Transcript,
+                    Rc::clone(&transcript_state),
+                    cx,
+                )
+            }),
+            transcript_state,
+            editor: cx.new(|cx| {
+                ClientSurface::new(
+                    owner.clone(),
+                    ClientSurfaceKind::Editor,
+                    Rc::new(RefCell::new(None)),
+                    cx,
+                )
+            }),
+            modal: cx.new(|cx| {
+                ClientSurface::new(
+                    owner,
+                    ClientSurfaceKind::Modal,
+                    Rc::new(RefCell::new(None)),
+                    cx,
+                )
+            }),
             scrollbar,
+            scrollbar_seen_offset,
             _scrollbar_subscription: Rc::new(subscription),
         }
     }
 
-    fn sync(
-        &self,
-        environment: SurfaceEnvironment,
-        transcript: TranscriptPresentation,
-        editor: EditorPresentation,
-        scroll: ScrollHandle,
-        cx: &mut App,
-    ) {
+    fn sync(&self, client: &Client, floating: bool, editor_transition: bool, cx: &mut App) {
+        let environment = SurfaceEnvironment {
+            dark: client.dark,
+            zoom: client.zoom(),
+            floating,
+        };
+        let transcript = client.transcript_presentation();
+        let editor = client.editor_presentation();
+        let sidebar_phase = client.sidebar_motion.position();
+        let scroll = client.scroll.clone();
         self.scrollbar.update(cx, |bar, _| {
             bar.key = format!(
                 "transcript-scrollbar/{}/{}",
@@ -703,43 +808,66 @@ impl ClientSurfaces {
             // Client is presenting this position already. A later notification
             // forwards only a new offset; stale fade timers/session switches
             // cannot manufacture a document update.
-            bar.seen_offset = scroll.offset();
+            bar.seen_offset.set(scroll.offset());
             bar.scroll = scroll;
         });
-        for view in [&self.sidebar, &self.transcript, &self.editor, &self.modal] {
-            view.update(cx, |view, _| {
-                view.fresh = view.environment != Some(environment);
-                view.environment = Some(environment);
-            });
-        }
-        self.transcript.update(cx, |view, _| {
-            view.fresh |= view.transcript.as_ref() != Some(&transcript);
-            view.transcript = Some(transcript);
+        // First mount initializes surface inputs without notifying (an uncached
+        // `.cached(...)` element renders unconditionally on its first frame).
+        // Subsequent frames rely on `Client` observers to mark dirty surfaces
+        // before `draw()`; `sync` only notifies for window-derived changes that
+        // occurred during `Client::render`.
+        self.sidebar.update(cx, |view, cx| {
+            let initialized = view.environment.is_some();
+            let changed =
+                view.environment != Some(environment) || view.sidebar_phase != Some(sidebar_phase);
+            view.environment = Some(environment);
+            view.sidebar_phase = Some(sidebar_phase);
+            if initialized && changed && !view.dirty_in_flight {
+                cx.notify();
+            }
         });
-        self.editor.update(cx, |view, _| {
-            view.fresh |= view.editor.as_ref() != Some(&editor);
+        let content_env = SurfaceEnvironment {
+            floating: false,
+            ..environment
+        };
+        self.transcript.update(cx, |view, cx| {
+            let initialized = view.environment.is_some();
+            let changed = view.environment != Some(content_env)
+                || view.transcript.borrow().as_ref() != Some(&transcript);
+            view.environment = Some(content_env);
+            *view.transcript.borrow_mut() = Some(transcript);
+            if initialized && changed && !view.dirty_in_flight {
+                cx.notify();
+            }
+        });
+        self.editor.update(cx, |view, cx| {
+            let initialized = view.environment.is_some();
+            let changed = view.environment != Some(content_env)
+                || view.editor.as_ref() != Some(&editor)
+                || editor_transition;
+            view.environment = Some(content_env);
             view.editor = Some(editor);
+            if initialized && changed && !view.dirty_in_flight {
+                cx.notify();
+            }
+        });
+        self.modal.update(cx, |view, cx| {
+            let initialized = view.environment.is_some();
+            let changed = view.environment != Some(environment);
+            view.environment = Some(environment);
+            if initialized && changed && !view.dirty_in_flight {
+                cx.notify();
+            }
         });
     }
 
-    fn element(view: &Entity<ClientSurface>, cx: &App) -> AnyElement {
-        // Inputs are transferred during parent render. notify() at that phase
-        // is too late for the current frame's dirty-view snapshot. Render fresh
-        // inputs directly once; subsequent frames use GPUI's retained boundary.
-        // This uses GPUI's supported uncached/cached paths, never stale output.
-        if view.read(cx).fresh {
-            div()
-                .absolute()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(view.clone())
-                .into_any_element()
-        } else {
-            view.clone()
-                .cached(StyleRefinement::default().absolute().size_full())
-                .into_any_element()
-        }
+    fn element(view: &Entity<ClientSurface>) -> AnyElement {
+        // Keep the same `.cached(...)` element identity across dirty and clean
+        // frames so a dirty update populates `ViewElementState` once instead of
+        // forcing a second rebuild on the following retained frame.
+        view.clone()
+            .cached(StyleRefinement::default().absolute().size_full())
+            .into_any_element()
     }
 }
 
@@ -976,6 +1104,8 @@ struct Client {
     active: String,
     transcript: HashMap<String, Vec<TranscriptRow>>,
     transcript_row_cache: HashMap<String, Vec<CachedRowPresentation>>,
+    transcript_markdown_states:
+        HashMap<String, HashMap<(TranscriptRowKey, usize), Entity<TextViewState>>>,
     transcript_revisions: HashMap<String, u64>,
     transcript_scrolls: HashMap<String, ScrollHandle>,
     transcript_spans: HashMap<String, Vec<MessageSpan>>,
@@ -1015,6 +1145,7 @@ struct Client {
     background_focus: FocusHandle,
     terminal_shells: HashMap<String, protocol::ShellExited>,
     desktop_notifications: Option<DesktopNotifications>,
+    state_saver: Option<StateSaver>,
     notification_targets: HashMap<String, String>,
     forms: Forms,
     form_cancel_focus: FocusHandle,
@@ -1771,10 +1902,54 @@ fn build_cached_row(row: &TranscriptRow) -> CachedRowPresentation {
     }
 }
 
-fn reconcile_row_cache(rows: &[TranscriptRow], cached: &mut Vec<CachedRowPresentation>) {
+#[derive(Default)]
+struct RowCacheDiff {
+    structure_changed: bool,
+    updated_markdown: HashSet<(TranscriptRowKey, usize)>,
+}
+
+fn markdown_segment_structure_matches(a: &[MarkdownSegment], b: &[MarkdownSegment]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).all(|(left, right)| match (left, right) {
+        (MarkdownSegment::Markdown(_), MarkdownSegment::Markdown(_)) => true,
+        (
+            MarkdownSegment::Code {
+                language: la,
+                content: ca,
+                list_depth: lda,
+                quote_depth: qda,
+            },
+            MarkdownSegment::Code {
+                language: lb,
+                content: cb,
+                list_depth: ldb,
+                quote_depth: qdb,
+            },
+        ) => la == lb && ca == cb && lda == ldb && qda == qdb,
+        _ => false,
+    })
+}
+
+fn reconcile_row_cache(
+    rows: &[TranscriptRow],
+    cached: &mut Vec<CachedRowPresentation>,
+) -> RowCacheDiff {
+    let mut diff = RowCacheDiff::default();
     if rows.is_empty() {
+        diff.structure_changed = !cached.is_empty();
         cached.clear();
-        return;
+        return diff;
+    }
+    let old_keys: Vec<TranscriptRowKey> = cached.iter().map(|entry| entry.key.clone()).collect();
+    if old_keys.len() != rows.len()
+        || old_keys
+            .iter()
+            .zip(rows)
+            .any(|(old_key, row)| old_key != &row.key)
+    {
+        diff.structure_changed = true;
     }
     let mut previous: HashMap<TranscriptRowKey, CachedRowPresentation> = cached
         .drain(..)
@@ -1782,15 +1957,95 @@ fn reconcile_row_cache(rows: &[TranscriptRow], cached: &mut Vec<CachedRowPresent
         .collect();
     cached.reserve(rows.len());
     for row in rows {
-        if let Some(existing) = previous.remove(&row.key)
-            && existing.render_revision == row.render_revision
-            && existing.time == row.time
-        {
-            cached.push(existing);
+        if let Some(existing) = previous.remove(&row.key) {
+            if existing.render_revision == row.render_revision && existing.time == row.time {
+                cached.push(existing);
+                continue;
+            }
+            let next = build_cached_row(row);
+            let is_markdown_only = row.role == model::Role::Assistant
+                && row.kind == TranscriptRowKind::Normal
+                && row.images.is_empty()
+                && existing.time == row.time
+                && markdown_segment_structure_matches(&existing.segments, &next.segments);
+            if is_markdown_only {
+                for (seg_idx, (old_seg, new_seg)) in existing
+                    .segments
+                    .iter()
+                    .zip(next.segments.iter())
+                    .enumerate()
+                {
+                    if let (
+                        MarkdownSegment::Markdown(old_text),
+                        MarkdownSegment::Markdown(new_text),
+                    ) = (old_seg, new_seg)
+                        && old_text != new_text
+                    {
+                        diff.updated_markdown.insert((row.key.clone(), seg_idx));
+                    }
+                }
+            } else {
+                diff.structure_changed = true;
+            }
+            cached.push(next);
             continue;
         }
+        diff.structure_changed = true;
         cached.push(build_cached_row(row));
     }
+    diff
+}
+
+fn sync_transcript_markdown_states(
+    session_id: &str,
+    cached: &[CachedRowPresentation],
+    all_states: &mut HashMap<String, HashMap<(TranscriptRowKey, usize), Entity<TextViewState>>>,
+    diff: &RowCacheDiff,
+    cx: &mut App,
+) -> bool {
+    let states = all_states.entry(session_id.to_owned()).or_default();
+    if !diff.structure_changed
+        && diff
+            .updated_markdown
+            .iter()
+            .all(|key| states.contains_key(key))
+    {
+        for (row_key, segment_index) in &diff.updated_markdown {
+            if let Some(entry) = cached.iter().rev().find(|entry| &entry.key == row_key)
+                && let Some(MarkdownSegment::Markdown(text)) = entry.segments.get(*segment_index)
+                && let Some(state) = states.get(&(row_key.clone(), *segment_index))
+            {
+                state.update(cx, |state, cx| state.set_text(text.as_str(), cx));
+            }
+        }
+        return false;
+    }
+    let mut structure_changed = false;
+    let mut live_keys = HashSet::new();
+    for entry in cached {
+        for (segment_index, segment) in entry.segments.iter().enumerate() {
+            let MarkdownSegment::Markdown(text) = segment else {
+                continue;
+            };
+            let key = (entry.key.clone(), segment_index);
+            live_keys.insert(key.clone());
+            if let Some(state) = states.get(&key) {
+                if diff.updated_markdown.contains(&key) {
+                    state.update(cx, |state, cx| state.set_text(text.as_str(), cx));
+                }
+            } else {
+                let state = cx.new(|cx| TextViewState::markdown(text.as_str(), cx));
+                states.insert(key, state);
+                structure_changed = true;
+            }
+        }
+    }
+    let before_len = states.len();
+    states.retain(|key, _| live_keys.contains(key));
+    if states.len() != before_len {
+        structure_changed = true;
+    }
+    structure_changed
 }
 
 fn transcript_text_view_style(dark: bool, cx: &App) -> TextViewStyle {
@@ -2218,29 +2473,36 @@ impl Client {
             match segment {
                 MarkdownSegment::Markdown(text) => {
                     let owner = cx.entity().downgrade();
-                    TextView::markdown(
-                        markdown_view_id(&self.active, &row.key, segment_index, 0),
-                        text.clone(),
-                    )
-                    .style(style.clone())
-                    .on_link_click(move |url, event, window, app| {
-                        if event.is_secondary() {
-                            let position = event.position();
-                            let url = url.to_string();
-                            let _ = owner.update(app, |this, cx| {
-                                this.link_menu = Some(LinkMenu { url, position });
-                                let focus = this.link_menu_focus[0].clone();
-                                window.on_next_frame(move |window, cx| focus.focus(window, cx));
-                                cx.notify();
-                            });
-                        } else if !event.is_middle_click() && may_open_link(url) {
-                            app.open_url(url);
-                        }
-                    })
-                    .w_full()
-                    .min_w_0()
-                    .line_height(self.scaled(22.))
-                    .into_any_element()
+                    let view = self
+                        .transcript_markdown_states
+                        .get(&self.active)
+                        .and_then(|states| states.get(&(row.key.clone(), segment_index)))
+                        .map(TextView::new)
+                        .unwrap_or_else(|| {
+                            TextView::markdown(
+                                markdown_view_id(&self.active, &row.key, segment_index, 0),
+                                text.clone(),
+                            )
+                        });
+                    view.style(style.clone())
+                        .on_link_click(move |url, event, window, app| {
+                            if event.is_secondary() {
+                                let position = event.position();
+                                let url = url.to_string();
+                                let _ = owner.update(app, |this, cx| {
+                                    this.link_menu = Some(LinkMenu { url, position });
+                                    let focus = this.link_menu_focus[0].clone();
+                                    window.on_next_frame(move |window, cx| focus.focus(window, cx));
+                                    cx.notify();
+                                });
+                            } else if !event.is_middle_click() && may_open_link(url) {
+                                app.open_url(url);
+                            }
+                        })
+                        .w_full()
+                        .min_w_0()
+                        .line_height(self.scaled(22.))
+                        .into_any_element()
                 }
                 MarkdownSegment::Code {
                     language,
@@ -2417,6 +2679,7 @@ impl Client {
             active: String::new(),
             transcript: HashMap::new(),
             transcript_row_cache: HashMap::new(),
+            transcript_markdown_states: HashMap::new(),
             transcript_revisions: HashMap::new(),
             transcript_spans: HashMap::new(),
             transcript_scrolls: HashMap::new(),
@@ -2461,6 +2724,7 @@ impl Client {
             background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
             desktop_notifications: None,
+            state_saver: None,
             notification_targets: HashMap::new(),
             forms: Forms::default(),
             form_cancel_focus: cx.focus_handle().tab_stop(true),
@@ -2564,6 +2828,22 @@ impl Client {
         .detach();
         let (notifications, actions) = DesktopNotifications::start();
         client.desktop_notifications = Some(notifications);
+        let (state_saver, save_errors) = StateSaver::start();
+        client.state_saver = Some(state_saver);
+        cx.spawn(async move |this, cx| {
+            while let Ok(error) = save_errors.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.connection_status = format!("State save failed: {error}");
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         let notification_window = window.window_handle();
         cx.spawn(async move |this, cx| {
             while let Ok(notification_id) = actions.recv().await {
@@ -2821,11 +3101,8 @@ impl Client {
         // During startup the saved active tab has not been selected yet. Save
         // only the zoom field instead of projecting the still-empty live tab
         // selection over its persisted value.
-        if self.api.is_some()
-            && !self.preview_api
-            && let Err(error) = self.settings.persisted.save(&persist::default_path())
-        {
-            self.connection_status = format!("State save failed: {error}");
+        if self.api.is_some() && !self.preview_api {
+            self.save_persisted_async();
         }
         window.refresh();
         cx.notify();
@@ -2962,7 +3239,13 @@ impl Client {
         if self.api.is_none() || self.preview_api {
             return;
         }
-        if let Err(error) = self.settings.persisted.save(&persist::default_path()) {
+        self.save_persisted_async();
+    }
+
+    fn save_persisted_async(&mut self) {
+        if let Some(saver) = &self.state_saver {
+            saver.enqueue(persist::default_path(), self.settings.persisted.clone());
+        } else if let Err(error) = self.settings.persisted.save(&persist::default_path()) {
             self.connection_status = format!("State save failed: {error}");
         }
     }
@@ -3265,6 +3548,7 @@ impl Client {
         self.reload_after_load.remove(id);
         self.transcript.remove(id);
         self.transcript_row_cache.remove(id);
+        self.transcript_markdown_states.remove(id);
         self.transcript_revisions.remove(id);
         self.transcript_spans.remove(id);
         self.attachments.remove_session(id);
@@ -3649,7 +3933,11 @@ impl Client {
             cloudflare_access: cloudflare_access.is_some(),
             basic_auth_in_keyring: stored,
         };
-        persisted.save(&persist::default_path())?;
+        if let Some(saver) = &self.state_saver {
+            saver.save_sync(persist::default_path(), persisted.clone())?;
+        } else {
+            persisted.save(&persist::default_path())?;
+        }
         self.settings.persisted = persisted.clone();
         self.settings.current = config;
         if next_connection.is_none() {
@@ -3705,6 +3993,7 @@ impl Client {
         self.abort_timeout_tokens.clear();
         self.transcript.clear();
         self.transcript_row_cache.clear();
+        self.transcript_markdown_states.clear();
         self.transcript_revisions.clear();
         self.transcript_spans.clear();
         self.attachments = ImageCache::default();
@@ -4919,7 +5208,7 @@ impl Client {
                 delivery,
             )
         {
-            self.update_transcript(&session);
+            self.update_transcript(&session, cx);
         }
         api.send(Command::SendPrompt {
             request_id,
@@ -4973,11 +5262,16 @@ impl Client {
             })
     }
 
-    fn update_transcript(&mut self, session_id: &str) {
-        self.update_transcript_with_tail_hint(session_id, None);
+    fn update_transcript(&mut self, session_id: &str, cx: &mut App) {
+        self.update_transcript_with_tail_hint(session_id, None, cx);
     }
 
-    fn update_transcript_with_tail_hint(&mut self, session_id: &str, tail_delta: Option<&str>) {
+    fn update_transcript_with_tail_hint(
+        &mut self,
+        session_id: &str,
+        tail_delta: Option<&str>,
+        cx: &mut App,
+    ) {
         let mut latency = latency::global().span(TraceOperation::TranscriptProjection, 0);
         let Some(conversation) = self.conversations.get(session_id) else {
             return;
@@ -4986,6 +5280,9 @@ impl Client {
             .transcript_spans
             .entry(session_id.to_owned())
             .or_default();
+        let epoch_changed = spans
+            .first()
+            .is_some_and(|span| span.epoch != conversation.cache_epoch());
         let rows = self.transcript.entry(session_id.to_owned()).or_default();
         let change = update_session_projection(
             session_id,
@@ -4996,16 +5293,28 @@ impl Client {
             tail_delta,
         );
         if change.is_some() {
+            if epoch_changed {
+                self.transcript_markdown_states.remove(session_id);
+            }
             let cached = self
                 .transcript_row_cache
                 .entry(session_id.to_owned())
                 .or_default();
-            reconcile_row_cache(rows, cached);
-            let revision = self
-                .transcript_revisions
-                .entry(session_id.to_owned())
-                .or_default();
-            *revision = revision.wrapping_add(1);
+            let diff = reconcile_row_cache(rows, cached);
+            let states_structure_changed = sync_transcript_markdown_states(
+                session_id,
+                cached,
+                &mut self.transcript_markdown_states,
+                &diff,
+                cx,
+            );
+            if epoch_changed || diff.structure_changed || states_structure_changed {
+                let revision = self
+                    .transcript_revisions
+                    .entry(session_id.to_owned())
+                    .or_default();
+                *revision = revision.wrapping_add(1);
+            }
         }
         latency.units(rows.len());
     }
@@ -5143,7 +5452,7 @@ impl Client {
                     })
                     .collect();
                 for id in updated {
-                    self.update_transcript(&id);
+                    self.update_transcript(&id, cx);
                 }
                 let directories = self.active_directories();
                 let context = jobs::Context {
@@ -5342,7 +5651,7 @@ impl Client {
                                     self.message_events_during_load.remove(&session_id);
                                 }
                                 conversation.reconcile_shell_exits(&self.terminal_shells);
-                                self.update_transcript(&session_id);
+                                self.update_transcript(&session_id, cx);
                                 if let Some(key) = anchor
                                     && let Some(index) = self.transcript[&session_id]
                                         .iter()
@@ -5581,7 +5890,7 @@ impl Client {
                                             .remove_unconfirmed_local_prompt(&pending.message_id)
                                     },
                                 ) {
-                                    self.update_transcript(&session_id);
+                                    self.update_transcript(&session_id, cx);
                                 }
                                 if pending.delivery.is_none()
                                     && self.local_run_message_ids.get(&session_id)
@@ -5736,6 +6045,7 @@ impl Client {
                             self.background_requests.remove(&id);
                             self.transcript.remove(&id);
                             self.transcript_row_cache.remove(&id);
+                            self.transcript_markdown_states.remove(&id);
                             self.transcript_revisions.remove(&id);
                             self.transcript_spans.remove(&id);
                             self.attachments.remove_session(&id);
@@ -5786,7 +6096,7 @@ impl Client {
                                 }
                                 _ => None,
                             };
-                            self.update_transcript_with_tail_hint(id, tail_delta);
+                            self.update_transcript_with_tail_hint(id, tail_delta, cx);
                             self.maybe_dispatch_deferred_abort(id);
                         }
                     }
@@ -5800,7 +6110,7 @@ impl Client {
                             })
                             .collect();
                         for id in updated {
-                            self.update_transcript(&id);
+                            self.update_transcript(&id, cx);
                         }
                     }
                     if matches!(
@@ -6078,6 +6388,7 @@ impl Client {
                     (session_id.clone(), cached)
                 })
                 .collect(),
+            transcript_markdown_states: HashMap::new(),
             transcript,
             transcript_revisions: HashMap::new(),
             transcript_spans,
@@ -6131,6 +6442,7 @@ impl Client {
             background_focus: cx.focus_handle().tab_stop(true),
             terminal_shells: HashMap::new(),
             desktop_notifications: None,
+            state_saver: None,
             notification_targets: HashMap::new(),
             forms,
             form_cancel_focus: cx.focus_handle().tab_stop(true),
@@ -6200,7 +6512,7 @@ impl Client {
             if let Some(conversation) = client.conversations.get_mut(&active) {
                 conversation.add_local_prompt("msg_working_preview", "continue", &[], None);
             }
-            client.update_transcript(&active);
+            client.update_transcript(&active, cx);
         }
         if preview_many_projects {
             for index in 0..7 {
@@ -6315,6 +6627,7 @@ impl Client {
         client.sessions.clear();
         client.transcript.clear();
         client.transcript_row_cache.clear();
+        client.transcript_markdown_states.clear();
         client.transcript_revisions.clear();
         client.transcript_spans.clear();
         client.attachments = ImageCache::default();
@@ -7720,6 +8033,38 @@ impl Client {
         Some(pill.into_any_element())
     }
 
+    fn transcript_presentation(&self) -> TranscriptPresentation {
+        TranscriptPresentation {
+            session: self.active.clone(),
+            connection: self.connection_generation,
+            revision: self
+                .transcript_revisions
+                .get(&self.active)
+                .copied()
+                .unwrap_or_default(),
+            cursor: self
+                .conversations
+                .get(&self.active)
+                .and_then(|c| c.next_cursor.clone()),
+            loading: self.loading_messages.contains_key(&self.active),
+            following: self.follow_bottom,
+            pointer_down: self.transcript_pointer_down,
+            autoscrolling: self.autoscroll.is_some(),
+            scroll_offset: self.scroll.offset(),
+            logical_top: self.scroll.logical_scroll_top(),
+            sticky_user: self.sticky_user_index(),
+            copied: self.copy_feedback.as_ref().map(|f| f.key.clone()),
+        }
+    }
+
+    fn editor_presentation(&self) -> EditorPresentation {
+        EditorPresentation {
+            session: self.active.clone(),
+            input: self.composer.entity_id(),
+            focused: self.composer_placeholder_focused,
+        }
+    }
+
     fn chat(&self, _window: &Window, cx: &Context<Self>) -> AnyElement {
         if self.follow_bottom {
             self.scroll.scroll_to_bottom();
@@ -7731,14 +8076,38 @@ impl Client {
         let generation = self.connection_generation;
         let rendered_logical_top = scroll.logical_scroll_top();
         let rendered_sticky = self.sticky_user_index();
+        let transcript_state = self
+            .surfaces
+            .as_ref()
+            .map(|surfaces| Rc::clone(&surfaces.transcript_state));
+        let scrollbar_seen_offset = self
+            .surfaces
+            .as_ref()
+            .map(|surfaces| Rc::clone(&surfaces.scrollbar_seen_offset));
         // GTK reserves a permanent 14px gutter for the transcript scrollbar.
         let mut rows = div()
             .on_children_prepainted(move |_, window, cx| {
                 // Read GPUI's resolved scroll state; never calculate row heights
                 // or content extents. A late Markdown/image layout can grow the
                 // content after the one-shot bottom request was consumed.
-                let at_bottom = scroll.offset().y <= -scroll.max_offset().y;
-                if following != at_bottom || scroll.logical_scroll_top() != rendered_logical_top {
+                let resolved_offset = scroll.offset();
+                let resolved_logical_top = scroll.logical_scroll_top();
+                if let Some(state) = &transcript_state
+                    && let Some(presentation) = state.borrow_mut().as_mut()
+                {
+                    presentation.record_resolved_scroll(
+                        &session,
+                        generation,
+                        resolved_offset,
+                        resolved_logical_top,
+                        rendered_sticky,
+                    );
+                }
+                if let Some(seen) = &scrollbar_seen_offset {
+                    seen.set(resolved_offset);
+                }
+                let at_bottom = resolved_offset.y <= -scroll.max_offset().y;
+                if following != at_bottom || resolved_logical_top != rendered_logical_top {
                     let client = client.clone();
                     let session = session.clone();
                     window.defer(cx, move |_, cx| {
@@ -7768,6 +8137,12 @@ impl Client {
                                 // Only render may issue the native bottom request,
                                 // using the latest follow flag immediately before
                                 // prepaint. Never leave one queued across input.
+                                if request_bottom && let Some(surfaces) = this.surfaces.as_ref() {
+                                    surfaces.transcript.update(cx, |surface, cx| {
+                                        surface.dirty_in_flight = true;
+                                        cx.notify();
+                                    });
+                                }
                                 cx.notify();
                             }
                         });
@@ -8195,7 +8570,6 @@ impl Client {
                             .as_ref()
                             .expect("render surfaces initialized")
                             .editor,
-                        cx,
                     )),
             )
             .when(!self.attachments_draft.is_empty(), |composer| {
@@ -10392,51 +10766,7 @@ impl Render for Client {
         }
         // Transfer presentation only after session/draft/focus reconciliation.
         let surfaces = self.surfaces.as_ref().unwrap().clone();
-        surfaces.sync(
-            SurfaceEnvironment {
-                dark: self.dark,
-                zoom: self.zoom(),
-                floating,
-            },
-            TranscriptPresentation {
-                session: self.active.clone(),
-                connection: self.connection_generation,
-                revision: self
-                    .transcript_revisions
-                    .get(&self.active)
-                    .copied()
-                    .unwrap_or_default(),
-                cursor: self
-                    .conversations
-                    .get(&self.active)
-                    .and_then(|c| c.next_cursor.clone()),
-                loading: self.loading_messages.contains_key(&self.active),
-                following: self.follow_bottom,
-                pointer_down: self.transcript_pointer_down,
-                autoscrolling: self.autoscroll.is_some(),
-                scroll_offset: self.scroll.offset(),
-                logical_top: self.scroll.logical_scroll_top(),
-                copied: self.copy_feedback.as_ref().map(|f| f.key.clone()),
-            },
-            EditorPresentation {
-                session: self.active.clone(),
-                input: self.composer.entity_id(),
-                focused: self.composer_placeholder_focused,
-            },
-            self.scroll.clone(),
-            cx,
-        );
-        surfaces.sidebar.update(cx, |view, _| {
-            let phase = self.sidebar_motion.position();
-            // GPUI's retained-paint key omits opacity. Repaint this small
-            // boundary on EVERY changed phase, including final/reduced-motion
-            // and automatic-reopen endpoints, even if snapped before render.
-            view.fresh |= view.sidebar_phase != Some(phase);
-            view.sidebar_phase = Some(phase);
-        });
-        if editor_transition {
-            surfaces.editor.update(cx, |view, _| view.fresh = true);
-        }
+        surfaces.sync(self, floating, editor_transition, cx);
         let composer_slot = self
             .permission_card(cx)
             .unwrap_or_else(|| self.composer(window, cx));
@@ -10691,7 +11021,7 @@ impl Render for Client {
                                         .w(self.scaled(SIDEBAR_WIDTH) - px(1.))
                                         .h_full()
                                         .relative()
-                                        .child(ClientSurfaces::element(&surfaces.sidebar, cx)),
+                                        .child(ClientSurfaces::element(&surfaces.sidebar)),
                                 )
                                 .when(!self.sidebar_visible, |view| {
                                     // A fading visual is not an active sidebar.
@@ -10722,7 +11052,7 @@ impl Render for Client {
                                     .min_h_0()
                                     .relative()
                                     .overflow_hidden()
-                                    .child(ClientSurfaces::element(&surfaces.transcript, cx))
+                                    .child(ClientSurfaces::element(&surfaces.transcript))
                                     .child(
                                         div()
                                             .absolute()
@@ -10769,7 +11099,7 @@ impl Render for Client {
             )
             .when_some(self.autoscroll_marker(), |view, marker| view.child(marker))
             .when_some(self.modal, |view, _| {
-                view.child(ClientSurfaces::element(&surfaces.modal, cx))
+                view.child(ClientSurfaces::element(&surfaces.modal))
             })
             .when_some(self.link_menu_view(window, cx), |view, menu| {
                 view.child(menu)
@@ -11070,6 +11400,7 @@ mod tests {
             autoscrolling: false,
             scroll_offset: point(px(0.), px(0.)),
             logical_top: (0, px(0.)),
+            sticky_user: None,
             copied: None,
         }
     }
@@ -11077,10 +11408,11 @@ mod tests {
     #[test]
     fn scrollbar_notifications_forward_position_changes_not_animation_ticks() {
         let scroll = gpui_kit::ScrollHandle::new();
+        let seen_offset = std::rc::Rc::new(std::cell::Cell::new(scroll.offset()));
         let mut bar = super::TranscriptScrollbar {
             scroll: scroll.clone(),
             key: "session-a".into(),
-            seen_offset: scroll.offset(),
+            seen_offset: std::rc::Rc::clone(&seen_offset),
         };
         assert!(!bar.take_scroll_change());
         scroll.set_offset(point(px(0.), px(-80.)));
@@ -11088,10 +11420,15 @@ mod tests {
         assert!(!bar.take_scroll_change());
         scroll.set_offset(point(px(0.), px(-120.)));
         assert!(bar.take_scroll_change());
+        // Prepaint recording a scroll_to_bottom offset prevents a later fade tick
+        // from mistaking self-driven bottom-follow movement for a user drag.
+        scroll.set_offset(point(px(0.), px(-160.)));
+        seen_offset.set(scroll.offset());
+        assert!(!bar.take_scroll_change());
         // Rebinding presents the new session's position; an old idle/fade
         // notification must not forward an old handle's subsequent movement.
         let other = gpui_kit::ScrollHandle::new();
-        bar.seen_offset = other.offset();
+        bar.seen_offset.set(other.offset());
         bar.scroll = other;
         scroll.set_offset(point(px(0.), px(-200.)));
         assert!(!bar.take_scroll_change());
@@ -11124,7 +11461,7 @@ mod tests {
     #[test]
     fn transcript_boundary_tracks_pagination_scroll_follow_and_copy_transitions() {
         let before = transcript_presentation();
-        let changes: [fn(&mut super::TranscriptPresentation); 9] = [
+        let changes: [fn(&mut super::TranscriptPresentation); 10] = [
             |p| p.session = "ses_b".into(),
             |p| p.cursor = Some("older".into()),
             |p| p.loading = true,
@@ -11133,6 +11470,7 @@ mod tests {
             |p| p.autoscrolling = true,
             |p| p.scroll_offset.y = px(-20.),
             |p| p.logical_top = (1, px(-3.)),
+            |p| p.sticky_user = Some(2),
             |p| p.copied = Some("code-a".into()),
         ];
         for change in changes {
@@ -11140,6 +11478,43 @@ mod tests {
             change(&mut after);
             assert!(after != before);
         }
+    }
+
+    #[test]
+    fn resolved_prepaint_scroll_absorbs_bottom_follow_without_masking_sticky_changes() {
+        let mut recorded = transcript_presentation();
+        recorded.following = true;
+        recorded.sticky_user = Some(4);
+        // Prepaint clamped scroll_to_bottom to a deeper offset while sticky stayed Some(4).
+        recorded.record_resolved_scroll(
+            "ses_a",
+            1,
+            point(px(0.), px(-4820.)),
+            (92, px(-30.)),
+            Some(4),
+        );
+        let mut same_sticky = recorded.clone();
+        same_sticky.scroll_offset = point(px(0.), px(-4820.));
+        same_sticky.logical_top = (92, px(-30.));
+        assert!(same_sticky == recorded);
+
+        // If prepaint scrolled across a user header boundary, the next presentation
+        // carries the new sticky index while `recorded` kept the rendered one.
+        let mut crossed_sticky = same_sticky.clone();
+        crossed_sticky.sticky_user = Some(8);
+        assert!(crossed_sticky != recorded);
+
+        // A stale prepaint callback from another session or connection is ignored.
+        let snapshot = recorded.clone();
+        recorded.record_resolved_scroll(
+            "ses_other",
+            1,
+            point(px(0.), px(-9999.)),
+            (99, px(0.)),
+            None,
+        );
+        recorded.record_resolved_scroll("ses_a", 2, point(px(0.), px(-9999.)), (99, px(0.)), None);
+        assert!(recorded == snapshot);
     }
 
     #[test]
@@ -12332,6 +12707,43 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&cache[1].segments, &first_arc));
         assert!(!std::sync::Arc::ptr_eq(&cache[2].segments, &second_arc));
         assert_eq!(cache[2].segments.len(), 3);
+    }
+
+    #[test]
+    fn row_cache_distinguishes_in_place_markdown_streaming_from_structural_changes() {
+        let mut row = cache_row("m1", "Hello");
+        row.role = model::Role::Assistant;
+        row.render_revision = 1;
+        let mut rows = vec![row];
+        let mut cache = Vec::new();
+
+        // Initial row insertion is structural.
+        let initial = reconcile_row_cache(&rows, &mut cache);
+        assert!(initial.structure_changed);
+
+        // Appending prose to an existing Markdown segment is in-place, not structural.
+        rows[0].body.push_str(" world");
+        rows[0].render_revision = 2;
+        let streamed = reconcile_row_cache(&rows, &mut cache);
+        assert!(!streamed.structure_changed);
+        assert_eq!(streamed.updated_markdown.len(), 1);
+        assert!(
+            streamed
+                .updated_markdown
+                .contains(&(rows[0].key.clone(), 0))
+        );
+
+        // Opening a fenced code block changes segment structure.
+        rows[0].body.push_str("\n\n```rust\nlet x = 1;\n```");
+        rows[0].render_revision = 3;
+        let fenced = reconcile_row_cache(&rows, &mut cache);
+        assert!(fenced.structure_changed);
+
+        // Mutating the fenced code block's content is structural (rendered by custom card).
+        rows[0].body = "Hello world\n\n```rust\nlet x = 2;\n```".into();
+        rows[0].render_revision = 4;
+        let code_edit = reconcile_row_cache(&rows, &mut cache);
+        assert!(code_edit.structure_changed);
     }
 
     #[test]
